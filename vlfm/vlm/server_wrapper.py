@@ -61,6 +61,21 @@ def str_to_image(img_str: str) -> np.ndarray:
     return img_np
 
 
+def ndarray_to_str(arr: np.ndarray, dtype: str = "float16") -> str:
+    """Serializes a float ndarray to a compact base64 string (float16 by default).
+
+    Replaces the slow `v.tolist()` + JSON-text path for large arrays (e.g. point
+    clouds), cutting serialization from hundreds of ms to a few ms.
+    """
+    arr = np.ascontiguousarray(arr.astype(dtype))
+    return base64.b64encode(arr.tobytes()).decode("ascii")
+
+
+def str_to_ndarray(s: str, shape: tuple, dtype: str = "float16") -> np.ndarray:
+    """Deserializes a base64 string back to an ndarray with the given shape/dtype."""
+    return np.frombuffer(base64.b64decode(s), dtype=np.dtype(dtype)).reshape(shape)
+
+
 def send_request(url: str, **kwargs: Any) -> dict:
     response = {}
     for attempt in range(10):

@@ -79,8 +79,8 @@ habitat_baselines:
       near_field_sigma_scale: 0.8
       use_raw_nlp: False
       pcd_window_size: 8
-      fuse_voxel_size: 0.02
-      fuse_max_points: 200000
+      fuse_voxel_size: 0.03
+      fuse_max_points: 50000
       compute_frontiers: True
       dbscan_eps: 0.20
       dbscan_min_samples: 3

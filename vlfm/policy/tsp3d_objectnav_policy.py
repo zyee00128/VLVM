@@ -64,8 +64,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             use_raw_nlp: bool = True,
             # Phase 4.5: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
             pcd_window_size: int = 8,             # Number of frames in the fusion window (recommended 5~10)
-            fuse_voxel_size: float = 0.02,        # Voxel downsample size (m) for window fusion
-            fuse_max_points: int = 200000,        # Cap on the number of fused points
+            fuse_voxel_size: float = 0.03,        # Voxel downsample size (m) for window fusion
+            fuse_max_points: int = 50000,         # Cap on the number of fused points
             # Phase 5: 3D Exploration & Frontier Clustering
             compute_frontiers: bool = True,
             dbscan_eps: float = 0.15,
@@ -843,8 +843,8 @@ class VLVMConfig:
 
     # Phase 4.5: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
     pcd_window_size: int = 8          # Number of frames fused for point-cloud accumulation; larger = more complete geometry but slower/staler.
-    fuse_voxel_size: float = 0.02     # Voxel downsample size (m) for window fusion; larger = fewer points, faster, coarser.
-    fuse_max_points: int = 200000     # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
+    fuse_voxel_size: float = 0.03     # Voxel downsample size (m) for window fusion; larger = fewer points, faster, coarser.
+    fuse_max_points: int = 50000      # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
 
     # Phase 5: 3D Exploration & Frontier Clustering
     compute_frontiers: bool = True    # Compute frontiers from the 3D map for exploration; False disables frontier-based exploration.

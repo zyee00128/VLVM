@@ -8,9 +8,11 @@ from .server_wrapper import (
     ServerMixin,
     bool_arr_to_str,
     host_model,
+    ndarray_to_str,
     send_request,
     str_to_bool_arr,
     str_to_image,
+    str_to_ndarray,
 )
 
 from vlfm.tsp3d_models.bdetr import BeaUTyDETR
@@ -182,9 +184,12 @@ class TSP3DClient:
         tau: float = 0.15,
         use_raw_nlp: bool = True
     ) -> List[Dict[str, Any]]:
-        # Send point cloud array, text, and hyperparameters to the server via HTTP
+        # Send point cloud as compact binary (float16) + base64, replacing the
+        # slow tolist()+JSON-text serialization of the raw float32 array.
         payload = {
-            "pcd": pcd,
+            "pcd_b64": ndarray_to_str(pcd, dtype="float16"),
+            "pcd_shape": list(pcd.shape),
+            "pcd_dtype": "float16",
             "text": text,
             "sigma_sce": sigma_sce,
             "sigma_tar": sigma_tar,
@@ -206,9 +211,13 @@ if __name__ == "__main__":
     class TSP3DServer(ServerMixin, TSP3D):
         def process_payload(self, payload: dict) -> dict:
             """Parse point clouds and text from the client, and call the model to perform 3D visual grounding inference."""
-            # Check route or request type
-            if "pcd" in payload and "text" in payload:
-                pcd = payload["pcd"]  # ServerMixin will automatically deserialize the numpy sequence
+            # Fast route: binary float16 + base64 point cloud (used by TSP3DClient)
+            if "pcd_b64" in payload and "text" in payload:
+                pcd = str_to_ndarray(
+                    payload["pcd_b64"],
+                    tuple(payload["pcd_shape"]),
+                    payload.get("pcd_dtype", "float16"),
+                ).astype(np.float32)
                 text = payload["text"]
                 sigma_sce = payload.get("sigma_sce", 0.7)
                 sigma_tar = payload.get("sigma_tar", 0.3)
@@ -217,11 +226,22 @@ if __name__ == "__main__":
 
                 detections = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_raw_nlp)
                 return {"detections": detections}
-            elif "box_3d" in payload:
-                pcd = payload["pcd"]
-                box_3d = payload["box_3d"]
-                mask = self.segment_bbox(pcd, box_3d)
-                return {"mask": bool_arr_to_str(mask)}
+            # # Legacy route: list-based JSON point cloud (backward compatibility)
+            # if "pcd" in payload and "text" in payload:
+            #     pcd = payload["pcd"]  # ServerMixin will automatically deserialize the numpy sequence
+            #     text = payload["text"]
+            #     sigma_sce = payload.get("sigma_sce", 0.7)
+            #     sigma_tar = payload.get("sigma_tar", 0.3)
+            #     tau = payload.get("tau", 0.15)
+            #     use_raw_nlp = payload.get("use_raw_nlp", True)
+
+            #     detections = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_raw_nlp)
+            #     return {"detections": detections}
+            # elif "box_3d" in payload:
+            #     pcd = payload["pcd"]
+            #     box_3d = payload["box_3d"]
+            #     mask = self.segment_bbox(pcd, box_3d)
+            #     return {"mask": bool_arr_to_str(mask)}
             return {}
 
     tsp3d_server = TSP3DServer()
