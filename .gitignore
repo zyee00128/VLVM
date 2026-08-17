@@ -1,0 +1,20 @@
+# 数据与权重
+data/
+
+# 实验日志 / TensorBoard
+lockfiles/
+md/
+outputs/
+tb/
+
+# Python 缓存与构建产物 / 其他
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+*.pt
+*.pth
+*.log
+.DS_Store

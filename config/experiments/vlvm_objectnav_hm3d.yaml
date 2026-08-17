@@ -1,0 +1,115 @@
+# @package _global_
+
+defaults:
+  - /habitat_baselines: habitat_baselines_rl_config_base
+  - /benchmark/nav/objectnav: objectnav_hm3d
+  - /habitat/task/lab_sensors:
+      - base_explorer
+      - compass_sensor
+      - gps_sensor
+      - heading_sensor
+      - frontier_sensor
+  - /habitat/task/measurements:
+      - frontier_exploration_map
+      - traveled_stairs
+      - cumulative_elevation_change
+  - /habitat_baselines/rl/policy: vlvm_policy
+  - _self_
+
+habitat:
+  environment:
+    iterator_options:
+      max_scene_repeat_steps: 50000
+  task:
+    success_reward: 2.5
+    slack_reward: -1e-3
+    lab_sensors:
+      base_explorer:
+        turn_angle: 30
+    measurements:
+      traveled_stairs:
+        type: "TraveledStairs"
+      cumulative_elevation_change:
+        type: "CumulativeElevationChange"
+
+habitat_baselines:
+  evaluate: True
+  eval_ckpt_path_dir: data/dummy_policy.pth
+  num_environments: 1
+  load_resume_state_config: False
+
+  torch_gpu_id: 0
+  tensorboard_dir: "tb"
+  video_dir: "video_dir"
+  test_episode_count: -1
+  checkpoint_folder: "data/new_checkpoints"
+  trainer_name: "vlvm" 
+  log_interval: 10
+  force_torch_single_threaded: True
+
+  eval:
+    split: "val"
+
+  rl:
+    policy:
+      name: "HabitatITM3DPolicy"
+
+      pointnav_policy_path: "data/pointnav_weights.pth"
+      depth_image_shape: [224, 224]
+      fov_angle: 79.0
+      camera_height: 0.88
+      text_prompt: "Seems like there is a target_object ahead."
+      visualize: False
+      init_turn_steps: 12
+
+      min_depth: 0.5
+      max_depth: 5.0
+      use_octomap: True
+      voxel_size: 0.05
+      min_obstacle_height: 0.15
+      max_obstacle_height: 1.50
+      agent_radius: 0.18
+      nav_slice_height: 0.30
+      hole_area_thresh: 100000
+      obstacle_map_area_threshold: 1.5
+      sigma_tar: 0.60
+      sigma_sce: 0.15
+      tau: 0.15              
+      near_field_dist: 1.0
+      near_field_sigma_scale: 0.8
+      use_raw_nlp: False
+      pcd_window_size: 8
+      fuse_voxel_size: 0.02
+      fuse_max_points: 200000
+      compute_frontiers: True
+      dbscan_eps: 0.20
+      dbscan_min_samples: 3
+      min_dists_2d: 0.3
+      pointnav_stop_radius: 0.30
+      use_max_confidence: True
+      sync_explored_areas: False
+      carving_noise_tolerance: 0.2
+      min_carving_conf: 0.05
+      carving_decay_factor: 0.5
+      pruning_min_conf: 0.01
+      max_voxel_dist: 15.0
+      downsampling_step: 8
+      min_valid_conf: 0.0001
+      cylinder_radius: 1.0
+      cylinder_height: 1.5
+      query_radius: 0.5
+      exploration_thresh: 0.15
+
+    ppo:
+      clip_param: 0.2
+      ppo_epoch: 4
+      num_mini_batch: 2
+      value_loss_coef: 0.5
+      entropy_coef: 0.01
+      lr: 2.5e-4
+      eps: 1e-5
+      max_grad_norm: 0.2
+      num_steps: 64
+      use_gae: True
+      gamma: 0.99
+      tau: 0.95
