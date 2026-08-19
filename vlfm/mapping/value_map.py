@@ -312,6 +312,13 @@ class ValueMap(BaseMap):
         px = int(cam_x * self.pixels_per_meter) + self._episode_pixel_origin[0]
         py = int(-cam_y * self.pixels_per_meter) + self._episode_pixel_origin[1]
 
+        # 2.5D V1 (region style) tolerance: the ValueMap only covers +/-10 m (size=400 @ ppm=20).
+        # When the agent walks past the coverage edge, clamp the center back inside the map to
+        # avoid a place_img_in_img assertion crash (out-of-range parts are cropped internally,
+        # causing only slight distortion at the edge).
+        px = int(np.clip(px, 0, self._map.shape[0] - 1))
+        py = int(np.clip(py, 0, self._map.shape[1] - 1))
+
         # Overlay the new data onto the map
         curr_map = np.zeros_like(self._map)
         curr_map = place_img_in_img(curr_map, curr_data, px, py)

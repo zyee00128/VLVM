@@ -771,3 +771,20 @@ class ITM3DPolicyV2(BaseITM3DPolicy):
         self._update_value_map()
         return super().act(observations, rnn_hidden_states, 
                         prev_actions, masks, deterministic)
+
+
+## To use ITM3D V1/V2, add the following parameters to class VLVMConfig and the YAML config file for registration.
+    # # Phase 7: ITM3D Semantic Value Mapping & Space Carving
+    # use_max_confidence: bool = True          # Project voxel similarity using global max confidence; False uses mean/average aggregation.
+    # sync_explored_areas: bool = False        # Synchronize the physically explored area into the semantic map; True improves map consistency at some cost.
+    # carving_noise_tolerance: float = 0.2     # Depth error tolerance (m) to classify voxels as ghosts/false positives; higher = less aggressive carving.
+    # min_carving_conf: float = 0.05           # Confidence floor; voxels below this are removed entirely; higher = cleaner map, may erase weak targets.
+    # carving_decay_factor: float = 0.5        # Multiplicative confidence decay per frame inside free space; lower = faster decay/cleaner map.
+    # pruning_min_conf: float = 0.01           # Global voxel low-confidence pruning threshold; higher = removes more voxels.
+    # max_voxel_dist: float = 15.0             # Max distance (m) to keep a voxel; larger = bigger map memory, smaller = less far-field noise.
+    # downsampling_step: int = 8               # Downsampling stride for similarity projection; larger = faster but coarser value map.
+    # min_valid_conf: float = 1e-4             # Floor for valid back-projection weights; higher = filters weaker contributions.
+    # cylinder_radius: float = 1.0             # Physical radius (m) of the 3D scoring cylinder around a boundary point.
+    # cylinder_height: float = 1.5             # Physical height (m) of the 3D scoring cylinder; taller = scores more vertical neighbors.
+    # query_radius: float = 0.5                # Query radius (m) for 2D collision pre-filtering; larger = more conservative.
+    # exploration_thresh: float = 0.15         # Minimum similarity to switch into target-chasing mode; higher = more conservative chasing.

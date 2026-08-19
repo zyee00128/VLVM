@@ -52,7 +52,7 @@ habitat_baselines:
 
   rl:
     policy:
-      name: "HabitatITM3DPolicy"
+      name: "HabitatITMPolicyV2" 
 
       pointnav_policy_path: "data/pointnav_weights.pth"
       depth_image_shape: [224, 224]
@@ -64,7 +64,7 @@ habitat_baselines:
 
       min_depth: 0.5
       max_depth: 5.0
-      use_octomap: True
+      use_octomap: False
       voxel_size: 0.05
       min_obstacle_height: 0.15
       max_obstacle_height: 1.50
@@ -78,16 +78,20 @@ habitat_baselines:
       near_field_dist: 1.0
       near_field_sigma_scale: 0.8
       use_raw_nlp: False
+      enable_retry: False
       pcd_window_size: 8
-      fuse_voxel_size: 0.03
-      fuse_max_points: 50000
+      fuse_voxel_size: 0.02
+      fuse_max_points: 200000
       compute_frontiers: True
       dbscan_eps: 0.20
       dbscan_min_samples: 3
       min_dists_2d: 0.3
       pointnav_stop_radius: 0.30
+
+      # Phase 7: ITM3D Semantic Value Mapping & Space Carving (used by HabitatITM3DPolicy)
       use_max_confidence: True
       sync_explored_areas: False
+      exploration_thresh: 0.15
       carving_noise_tolerance: 0.2
       min_carving_conf: 0.05
       carving_decay_factor: 0.5
@@ -98,7 +102,16 @@ habitat_baselines:
       cylinder_radius: 1.0
       cylinder_height: 1.5
       query_radius: 0.5
-      exploration_thresh: 0.15
+
+      # Phase 8: 2.5D Semantic Value Plane (BEV) -- used by HabitatITMPolicyV1/V2
+      value_map_style: "region"      # "region" (V1) / "surface" (V2)
+      h_lam: 1.0                     # Bonus weight lambda (lambda=0 reduces to VLFM)
+      h_norm_max: 1.0                # Upper bound for normalizing H
+      h_z_min: 0.15                  # Lower bound of the H1 passable band (m)
+      h_z_max: 0.88                  # Upper bound of the H1 passable band (m, robot height)
+      query_radius_m: 0.5            # Horizontal query radius r_h for route 2 (m)
+      query_z_min: 0.15              # Lower bound of the fixed query height band (m)
+      query_z_max: 1.50              # Upper bound of the fixed query height band (m)
 
     ppo:
       clip_param: 0.2

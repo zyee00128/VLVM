@@ -62,10 +62,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
             near_field_dist: float = 0.8,         # Distance (m) below which near-field adaptive pruning scaling activates
             near_field_sigma_scale: float = 0.3,  # Minimum voxel retention ratio when pruning near surfaces
             use_raw_nlp: bool = True,
+            enable_retry: bool = False,           # 08-18: retry on empty results with reduced sigma_sce (measured recovery 0.05%, yet ~48% of queries); True keeps old retry for A/B
             # Phase 4.5: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
             pcd_window_size: int = 8,             # Number of frames in the fusion window (recommended 5~10)
-            fuse_voxel_size: float = 0.03,        # Voxel downsample size (m) for window fusion
-            fuse_max_points: int = 50000,         # Cap on the number of fused points
+            fuse_voxel_size: float = 0.02,        # Voxel downsample size (m) for window fusion
+            fuse_max_points: int = 200000,        # Cap on the number of fused points
             # Phase 5: 3D Exploration & Frontier Clustering
             compute_frontiers: bool = True,
             dbscan_eps: float = 0.15,
@@ -102,6 +103,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._near_field_dist = near_field_dist
         self._near_field_sigma_scale = near_field_sigma_scale
         self._nlp_mode = use_raw_nlp  # Whether to use raw NLP processing for text prompts
+        self._enable_retry = enable_retry  # 08-18: retry on empty TSP3D results with reduced sigma_sce (default off; eliminates ~48% useless queries)
         # Temporal PCD sliding window state (multi-frame fusion for TSP3D)
         self._pcd_window: deque = deque(maxlen=max(pcd_window_size, 1))
         self._fuse_voxel_size = fuse_voxel_size
@@ -408,8 +410,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
             use_raw_nlp=self._nlp_mode
         )
 
-        # Fallback: if first attempt returns empty and sigma_sce > 0.02, retry with ultra-conservative pruning
-        if len(raw_preds) == 0 and dynamic_sigma_sce > 0.02:
+        # Retry on empty results is disabled by default: measured recovery rate of a
+        # sigma_sce-reduced retry is only 0.05% while it accounts for ~48% of queries.
+        if self._enable_retry and len(raw_preds) == 0 and dynamic_sigma_sce > 0.02:
             fallback_sce = max(0.01, dynamic_sigma_sce * 0.3)
             print(f"[DEBUG TSP3D] Empty result → retry sigma_sce={fallback_sce:.3f}")
             raw_preds = self._tsp3d_client.predict(
@@ -840,11 +843,12 @@ class VLVMConfig:
     near_field_dist: float = 0.8      # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
     near_field_sigma_scale: float = 0.3  # Minimum voxel retention ratio near surfaces; higher = keep more voxels near obstacles.
     use_raw_nlp: bool = True          # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
+    enable_retry: bool = False        # 08-18: retry on empty results with reduced sigma_sce (measured recovery 0.05%, ~48% of queries); True keeps old retry for A/B
 
     # Phase 4.5: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
     pcd_window_size: int = 8          # Number of frames fused for point-cloud accumulation; larger = more complete geometry but slower/staler.
-    fuse_voxel_size: float = 0.03     # Voxel downsample size (m) for window fusion; larger = fewer points, faster, coarser.
-    fuse_max_points: int = 50000      # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
+    fuse_voxel_size: float = 0.02     # Voxel downsample size (m) for window fusion; larger = fewer points, faster, coarser.
+    fuse_max_points: int = 200000     # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
 
     # Phase 5: 3D Exploration & Frontier Clustering
     compute_frontiers: bool = True    # Compute frontiers from the 3D map for exploration; False disables frontier-based exploration.
@@ -855,9 +859,10 @@ class VLVMConfig:
     # Phase 6: Navigation Execution & Termination
     pointnav_stop_radius: float = 0.25  # Distance (m) at which the agent stops near the goal; larger = stops farther from the target.
 
-    # Phase 7: ITM3D Semantic Value Mapping & Space Carving
+    # Phase 7: ITM3D Semantic Value Mapping & Space Carving (used by HabitatITM3DPolicy)
     use_max_confidence: bool = True          # Project voxel similarity using global max confidence; False uses mean/average aggregation.
     sync_explored_areas: bool = False        # Synchronize the physically explored area into the semantic map; True improves map consistency at some cost.
+    exploration_thresh: float = 0.15         # Min similarity to switch into target-chasing; higher = more conservative chasing.
     carving_noise_tolerance: float = 0.2     # Depth error tolerance (m) to classify voxels as ghosts/false positives; higher = less aggressive carving.
     min_carving_conf: float = 0.05           # Confidence floor; voxels below this are removed entirely; higher = cleaner map, may erase weak targets.
     carving_decay_factor: float = 0.5        # Multiplicative confidence decay per frame inside free space; lower = faster decay/cleaner map.
@@ -868,7 +873,16 @@ class VLVMConfig:
     cylinder_radius: float = 1.0             # Physical radius (m) of the 3D scoring cylinder around a boundary point.
     cylinder_height: float = 1.5             # Physical height (m) of the 3D scoring cylinder; taller = scores more vertical neighbors.
     query_radius: float = 0.5                # Query radius (m) for 2D collision pre-filtering; larger = more conservative.
-    exploration_thresh: float = 0.15         # Minimum similarity to switch into target-chasing mode; higher = more conservative chasing.
+
+    # Phase 8: 2.5D Semantic Value Plane (BEV) -- used by itm_policy (HabitatITMPolicyV1/V2)
+    value_map_style: str = "region"          # Semantic value mapping mode: "region" (V1) / "surface" (V2)
+    h_lam: float = 0.0                       # Bonus weight lambda (lambda=0 reduces to VLFM baseline)
+    h_norm_max: float = 1.0                  # Upper bound for normalizing H (locks the value score range)
+    h_z_min: float = 0.15                    # Lower bound of the H1 passable band (m)
+    h_z_max: float = 0.88                    # Upper bound of the H1 passable band (m, robot height)
+    query_radius_m: float = 0.5              # Horizontal query radius r_h for route 2 (includes dilation semantics)
+    query_z_min: float = 0.15                # Lower bound of the fixed query height band (m, surface landing)
+    query_z_max: float = 1.50                # Upper bound of the fixed query height band (m)
 
     @classmethod  # type: ignore
     @property
