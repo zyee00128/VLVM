@@ -231,20 +231,16 @@ class TSPHead(nn.Module):
 
                 class_scores = scores[ids, i]
                 class_bboxes = bboxes[ids]
-                print(f"[NMS] class_bboxes type={type(class_bboxes).__name__}, shape={getattr(class_bboxes, 'shape', 'N/A')}")
                 if yaw_flag:
                     nms_function = nms3d
                 else:
-                    print(f"[NMS] before cat: class_bboxes={class_bboxes}, slice={class_bboxes[:, :1]}")
                     class_bboxes = torch.cat(
                         (class_bboxes, torch.zeros_like(class_bboxes[:, :1])),
                         dim=1)
                     nms_function = nms3d_normal
 
-                print(f"[NMS] input bboxes={class_bboxes}, scores={class_scores}")
                 nms_ids = nms_function(class_bboxes, class_scores,
                                     self.test_cfg['iou_thr'])
-                print(f"[NMS] nms_ids={nms_ids}")
                 nms_bboxes.append(class_bboxes[nms_ids])
                 nms_scores.append(class_scores[nms_ids])
                 nms_labels.append(

@@ -280,22 +280,28 @@ class SuperOracleFBEPolicy(Habitat3DMixin, TSP3DObjectNavPolicy):
 @baseline_registry.register_policy
 class HabitatITM3DPolicy(Habitat3DMixin, ITM3DPolicyV1):
     """
-    3D semantic value mapping (ITM3D V1): projects cosine scores into a sparse 3D
-    semantic voxel grid with confidence-weighted fusion, space carving, and distant
-    voxel pruning.
+    3D semantic value mapping: projects cosine scores into a sparse 3D
+    semantic voxel grid with confidence-weighted fusion, 
+    space carving, and distant voxel pruning.
     """
     pass
 
 
 @baseline_registry.register_policy
 class HabitatITMPolicyV1(Habitat3DMixin, ITMPolicyV1):
-    """2.5D BEV semantic value plane (route 1, region style): VLFM 2D ValueMap + H1 (vertical passability)."""
+    """
+    2.5D BEV semantic value plane (route 1, region style): 
+    VLFM 2D ValueMap + H1 (vertical passability).
+    """
     pass
 
 
 @baseline_registry.register_policy
 class HabitatITMPolicyV2(Habitat3DMixin, ITMPolicyV2):
-    """2.5D BEV semantic value plane (route 2, surface style): 3D surface points -> 2D buckets (confidence-gated S) + H1."""
+    """
+    2.5D BEV semantic value plane (route 2, surface style): 
+    3D surface points -> 2D buckets (confidence-gated S) + H1.
+    """
     pass
 
 

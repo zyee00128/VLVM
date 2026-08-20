@@ -16,7 +16,7 @@ from vlfm.obs_transformers.utils import image_resize
 from vlfm.policy.base_policy import BasePolicy
 from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
 from vlfm.utils.geometry_utils import rho_theta
-from vlfm.mapping.obstacle_map import ObstacleMap3D, OctoMap
+from vlfm.mapping.obstacle_map import ObstacleMap3D, ProbabilisticGrid
 from vlfm.vlm.blip2itm import BLIP2ITMClient
 from vlfm.vlm.tsp3d import TSP3DClient
 from vlfm.vlm.detections import ObjectDetections
@@ -47,7 +47,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             min_depth: float = 0.5,
             max_depth: float = 5.0,
             # Phase 3: 3D Mapping & Occupancy Grid
-            use_octomap: bool = True,
+            om_style: str = "obstacle",
             voxel_size: float = 0.01,
             min_obstacle_height: float = 0.05,
             max_obstacle_height: float = 1.50,
@@ -94,7 +94,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._min_depth = min_depth
         self._max_depth = max_depth
         # Phase 3: 3D Mapping & Occupancy Grid
-        self._use_octomap = use_octomap
+        self._om_style = om_style
         self._voxel_size = voxel_size
         # Phase 4: TSP3D Perception & Visual Grounding
         self._sigma_tar = sigma_tar  # Target validation activation threshold
@@ -139,21 +139,21 @@ class TSP3DObjectNavPolicy(BasePolicy):
         pixels_per_meter = int(1.0 / voxel_size)
         size = 400
 
-        if self._use_octomap:
-            self._obstacle_map3d = OctoMap(
+        if self._om_style == "obstacle":
+            self._obstacle_map3d = ObstacleMap3D(
                 min_height=min_obstacle_height,
                 max_height=max_obstacle_height,
                 agent_radius=agent_radius,
+                area_thresh=obstacle_map_area_threshold,
                 hole_area_thresh=hole_area_thresh,
                 size=size,
                 pixels_per_meter=pixels_per_meter,
                 voxel_size=voxel_size,
                 height_size=height_size,
                 nav_slice_height=nav_slice_height,
-                visualize=visualize,
             )
-        else:
-            self._obstacle_map3d = ObstacleMap3D(
+        elif self._om_style == "probabilistic":
+            self._obstacle_map3d = ProbabilisticGrid(
                 min_height=min_obstacle_height,
                 max_height=max_obstacle_height,
                 agent_radius=agent_radius,
@@ -239,14 +239,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
             # Increment the cumulative observation count: repeated consensus of
             # the same world-frame location across frames is itself strong
             # evidence. Hallucinated boxes drift and cannot merge repeatedly.
-            num_obs, last_pos, last_yaw = self._target_verify_state[target_class][closest_idx]
+            num_obs, _, _ = self._target_verify_state[target_class][closest_idx]
             num_obs += 1
-            dist_moved = np.linalg.norm(robot_xy[:2] - last_pos[:2])
-            yaw_changed = abs(robot_yaw - last_yaw)
             self._target_verify_state[target_class][closest_idx] = (
                 num_obs, robot_xy.copy(), robot_yaw
             )
-            print(f"[DEBUG VERIFY] '{target_class}' idx={closest_idx} obs={num_obs}, dist_moved={dist_moved:.2f}, yaw_changed={np.rad2deg(yaw_changed):.0f}°, centroid={self._target_3d_memory[target_class][closest_idx]}")
         else:
             self._target_3d_memory[target_class].append(centroid)
             self._target_verify_state[target_class].append((1, robot_xy.copy(), robot_yaw))
@@ -307,6 +304,18 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         return np.hstack([pts_w, colors])
 
+    def _get_shared_pcd(self, i: int) -> np.ndarray:
+        """
+        Returns the i-th shared back-projected point cloud (world frame, (N, 6)).
+        """
+        shared_pcds = self._observations_cache.get("shared_pcds")
+        if shared_pcds is not None and i < len(shared_pcds):
+            return shared_pcds[i]
+        rgb, depth, tf, min_depth, max_depth, fx, fy = self._observations_cache["object_map_rgbd"][i]
+        return self._project_rgbd_to_3d_point_cloud(
+            rgb, depth, fx, fy, tf, min_depth, max_depth
+        )
+
     def _fuse_temporal_pcd_window(self, pcd_world: np.ndarray) -> np.ndarray:
         """
         Fuses a temporal sliding window of world-frame colored point clouds
@@ -362,11 +371,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             idx = np.random.choice(len(fused_local), self._fuse_max_points, replace=False)
             fused_local = fused_local[idx]
 
-        print(
-            f"[DEBUG FUSE] Window={len(self._pcd_window)} frames | "
-            f"Fused pts: {len(fused)} -> {len(fused_local)} "
-            f"(voxel={self._fuse_voxel_size}m)"
-        )
         return fused_local
 
     def _query_tsp3d_client(
@@ -399,7 +403,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         if min_dist < self._near_field_dist:
             scale = max(self._near_field_sigma_scale, min_dist / self._near_field_dist)
             dynamic_sigma_sce = self._sigma_sce * scale
-        print(f"[DEBUG TSP3D] Query '{target_query}' | PCD: {len(aligned_pcd)} pts | MinDist: {min_dist:.2f}m | Yaw: {np.rad2deg(self._observations_cache.get('robot_heading', 0)):.0f}° | sigma_sce: {dynamic_sigma_sce:.2f} | sigma_tar: {self._sigma_tar}")
 
         raw_preds = self._tsp3d_client.predict(
             pcd=aligned_pcd,
@@ -414,7 +417,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         # sigma_sce-reduced retry is only 0.05% while it accounts for ~48% of queries.
         if self._enable_retry and len(raw_preds) == 0 and dynamic_sigma_sce > 0.02:
             fallback_sce = max(0.01, dynamic_sigma_sce * 0.3)
-            print(f"[DEBUG TSP3D] Empty result → retry sigma_sce={fallback_sce:.3f}")
             raw_preds = self._tsp3d_client.predict(
                 pcd=aligned_pcd,
                 text=target_query,
@@ -423,9 +425,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 tau=self._tau,
                 use_raw_nlp=self._nlp_mode
             )
-
-        for i, det in enumerate(raw_preds):
-            print(f"  - Det {i}: conf={det.get('confidence', 0.0):.3f}")
 
         return raw_preds
 
@@ -461,10 +460,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         if self._last_target_coord is None:
             self._last_target_coord = closest_2d
-            print(
-                f"[DEBUG LATCH] First lock target '{self._target_object}' at {closest_2d}. "
-                f"Will latch unless a closer candidate is confirmed."
-            )
             return self._last_target_coord
 
         delta_dist = np.linalg.norm(closest_2d - self._last_target_coord)
@@ -475,10 +470,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             pass  # Small offset and robot still far from the new candidate -> keep current target
         else:
             self._last_target_coord = closest_2d
-            print(
-                f"[DEBUG LATCH] Switch target '{self._target_object}': "
-                f"delta={delta_dist:.2f}m, robot→new={dist_to_new:.2f}m, new={closest_2d}"
-            )
         return self._last_target_coord
 
     def _project_box_to_image_crop(
@@ -611,7 +602,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 active_classes = [target_classes[0]] if len(target_classes) > 0 else []
             if not active_classes:
                 continue
-            print(f"[DEBUG DET] Lock '{self._target_object}': centroid={centroid_np}")
             for cls in active_classes:
                 self._accumulate_3d_target_memory(cls, centroid_np)
 
@@ -747,10 +737,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._pre_step(observations, masks)
 
         object_map_rgbd = self._observations_cache["object_map_rgbd"]
-        shared_pcds = self._observations_cache.get("shared_pcds")
         detections = []
         for i, (rgb, depth, tf, min_depth, max_depth, fx, fy) in enumerate(object_map_rgbd):
-            pcd = shared_pcds[i] if shared_pcds is not None and i < len(shared_pcds) else None
+            pcd = self._get_shared_pcd(i)
             detections.append(
                 self._update_object_map(rgb, depth, tf, min_depth, max_depth, fx, fy, pcd=pcd)
             )
@@ -827,7 +816,7 @@ class VLVMConfig:
     max_depth: float = 5.0   # Maximum valid depth (m); larger sees farther but adds far-field noise/clutter.
 
     # Phase 3: 3D Mapping & Occupancy Grid
-    use_octomap: bool = True                 # Use the sparse OctoMap backend; True saves memory, False uses the dense grid (faster on small maps).
+    om_style: str = "obstacle"
     voxel_size: float = 0.01                 # Voxel grid resolution (m); smaller = finer map but more memory/compute.
     min_obstacle_height: float = 0.15        # Lower height bound (m) for obstacle voxels; too low includes floor noise, too high misses low obstacles.
     max_obstacle_height: float = 1.50        # Upper height bound (m) for obstacle voxels; too low ignores tall obstacles.
@@ -859,30 +848,15 @@ class VLVMConfig:
     # Phase 6: Navigation Execution & Termination
     pointnav_stop_radius: float = 0.25  # Distance (m) at which the agent stops near the goal; larger = stops farther from the target.
 
-    # Phase 7: ITM3D Semantic Value Mapping & Space Carving (used by HabitatITM3DPolicy)
-    use_max_confidence: bool = True          # Project voxel similarity using global max confidence; False uses mean/average aggregation.
-    sync_explored_areas: bool = False        # Synchronize the physically explored area into the semantic map; True improves map consistency at some cost.
-    exploration_thresh: float = 0.15         # Min similarity to switch into target-chasing; higher = more conservative chasing.
-    carving_noise_tolerance: float = 0.2     # Depth error tolerance (m) to classify voxels as ghosts/false positives; higher = less aggressive carving.
-    min_carving_conf: float = 0.05           # Confidence floor; voxels below this are removed entirely; higher = cleaner map, may erase weak targets.
-    carving_decay_factor: float = 0.5        # Multiplicative confidence decay per frame inside free space; lower = faster decay/cleaner map.
-    pruning_min_conf: float = 0.01           # Global voxel low-confidence pruning threshold; higher = removes more voxels.
-    max_voxel_dist: float = 15.0             # Max distance (m) to keep a voxel; larger = bigger map memory, smaller = less far-field noise.
-    downsampling_step: int = 8               # Downsampling stride for similarity projection; larger = faster but coarser value map.
-    min_valid_conf: float = 1e-4             # Floor for valid back-projection weights; higher = filters weaker contributions.
-    cylinder_radius: float = 1.0             # Physical radius (m) of the 3D scoring cylinder around a boundary point.
-    cylinder_height: float = 1.5             # Physical height (m) of the 3D scoring cylinder; taller = scores more vertical neighbors.
-    query_radius: float = 0.5                # Query radius (m) for 2D collision pre-filtering; larger = more conservative.
-
-    # Phase 8: 2.5D Semantic Value Plane (BEV) -- used by itm_policy (HabitatITMPolicyV1/V2)
-    value_map_style: str = "region"          # Semantic value mapping mode: "region" (V1) / "surface" (V2)
-    h_lam: float = 0.0                       # Bonus weight lambda (lambda=0 reduces to VLFM baseline)
-    h_norm_max: float = 1.0                  # Upper bound for normalizing H (locks the value score range)
-    h_z_min: float = 0.15                    # Lower bound of the H1 passable band (m)
-    h_z_max: float = 0.88                    # Upper bound of the H1 passable band (m, robot height)
-    query_radius_m: float = 0.5              # Horizontal query radius r_h for route 2 (includes dilation semantics)
-    query_z_min: float = 0.15                # Lower bound of the fixed query height band (m, surface landing)
-    query_z_max: float = 1.50                # Upper bound of the fixed query height band (m)
+    # Phase 7: 2.5D Semantic Value Plane (BEV)
+    vm_style: str = "region"          # Semantic value mapping mode: "region" (V1) / "surface" (V2)
+    h_lam: float = 0.3                # Bonus weight lambda (lambda=0 reduces to VLFM baseline)
+    h_norm_max: float = 1.0           # Upper bound for normalizing H (locks the value score range)
+    h_z_min: float = 0.15             # Lower bound of the H1 passable band (m)
+    h_z_max: float = 0.88             # Upper bound of the H1 passable band (m, robot height)
+    query_radius_m: float = 0.5       # Horizontal query radius r_h for route 2 (includes dilation semantics)
+    query_z_min: float = 0.15         # Lower bound of the fixed query height band (m, surface landing)
+    query_z_max: float = 1.50         # Upper bound of the fixed query height band (m)
 
     @classmethod  # type: ignore
     @property

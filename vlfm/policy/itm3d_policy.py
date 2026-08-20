@@ -539,7 +539,6 @@ class BaseITM3DPolicy(TSP3DObjectNavPolicy):
 
             if curr_index is not None:
                 curr_value = sorted_values[curr_index]
-                print(f"[DEBUG FRONTIER] curr_value: {curr_value:.4f} | last_value: {self._last_value:.4f}")
                 value_flat = abs(curr_value - self._last_value) < 0.02
                 if not value_flat and curr_value + 0.01 > self._last_value:
                     print(f"Sticking to last point. (Index: {curr_index})")

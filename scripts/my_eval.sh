@@ -42,10 +42,10 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 set -o pipefail
 
 echo "================================================="
-echo "Environment variables configured!"
-echo "Project path: $PROJECT_ROOT"
-echo "Conda env: $CONDA_DEFAULT_ENV"
-echo "Rendering: NVIDIA EGL hardware acceleration"
+echo "环境变量配置完毕！"
+echo "项目路径: $PROJECT_ROOT"
+echo "当前 Conda 环境: $CONDA_DEFAULT_ENV"
+echo "渲染引擎模式: NVIDIA EGL 硬件加速"
 echo "================================================="
 
 # ----------------- Output dir & dataset -----------------
@@ -53,55 +53,16 @@ OUT_DIR="$PROJECT_ROOT/outputs/$(date +%Y-%m-%d)"
 mkdir -p "$OUT_DIR"
 SCENES="[5cdEh9F2hJL]"   # HM3D scene (dataset fixed, do not change)
 
-# ----------------- Experiment definitions -----------------
-# Format: tag | policy name | value_map_style | h_lam
-# V1 (region) / V2 (surface) each run lambda = 0 / 0.3 / 0.6 / 1.0 (lambda=0 == VLFM equivalent)
-# The 3D baseline reuses the "time optimization 2" result (99 eps, SR 0.1414 / 2:57:21), not rerun here
-EXPERIMENTS=(
-#   "v1_region_lam0|HabitatITMPolicyV1|region|0.0"
-#   "v1_region_lam03|HabitatITMPolicyV1|region|0.3"
-#   "v1_region_lam06|HabitatITMPolicyV1|region|0.6"
-#   "v1_region_lam10|HabitatITMPolicyV1|region|1.0"
-  "v2_surface_lam0|HabitatITMPolicyV2|surface|0.0"
-  "v2_surface_lam03|HabitatITMPolicyV2|surface|0.3"
-  "v2_surface_lam06|HabitatITMPolicyV2|surface|0.6"
-  "v2_surface_lam10|HabitatITMPolicyV2|surface|1.0"
-)
-
-echo "Total ${#EXPERIMENTS[@]} experiments, running serially..."
-echo "Log dir: $OUT_DIR"
-
-# ----------------- Run all experiments serially -----------------
-for exp in "${EXPERIMENTS[@]}"; do
-    IFS='|' read -r TAG POLICY STYLE H_LAM <<< "$exp"
-
-    echo ""
-    echo "==================== Experiment: $TAG ===================="
-    echo "  Policy: $POLICY | Style: ${STYLE:-default} | lambda: ${H_LAM:-default}"
-
-    args=(
-        habitat.dataset.content_scenes="$SCENES"
-        habitat_baselines.eval.split=val
-        habitat_baselines.num_environments=1
-        habitat.simulator.habitat_sim_v0.gpu_device_id=0
-        habitat.simulator.habitat_sim_v0.gpu_gpu=False
-        habitat_baselines.rl.policy.name="$POLICY"
-    )
-    if [ -n "$STYLE" ]; then
-        args+=(habitat_baselines.rl.policy.value_map_style="$STYLE")
-    fi
-    if [ -n "$H_LAM" ]; then
-        args+=(habitat_baselines.rl.policy.h_lam="$H_LAM")
-    fi
-
-    python -m vlfm.run "${args[@]}" 2>&1 \
-        | tee "$OUT_DIR/eval_hm3d_${TAG}_$(date +%H%M%S).log"
-
-    echo "===== Experiment $TAG done ====="
-done
+python -m vlfm.run \
+    habitat.dataset.content_scenes="$SCENES" \
+    habitat_baselines.eval.split=val \
+    habitat_baselines.num_environments=1 \
+    habitat.simulator.habitat_sim_v0.gpu_device_id=0 \
+    habitat.simulator.habitat_sim_v0.gpu_gpu=False 2>&1 \
+    | tee "$OUT_DIR/eval_hm3d_$(date +%H%M%S).log"
 
 echo ""
 echo "================================================="
-echo "All ${#EXPERIMENTS[@]} experiments completed!"
+echo "All experiments completed!"
 echo "Log dir: $OUT_DIR"
 echo "================================================="

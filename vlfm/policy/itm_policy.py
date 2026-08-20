@@ -59,8 +59,8 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         use_max_confidence: bool = True,
         sync_explored_areas: bool = False,
         # ---- 2.5D BEV Parameters ----
-        value_map_style: str = "region",      # "region" (V1) / "surface" (V2)
-        h_lam: float = 0.0,                   # Bonus weight lambda (lambda=0 reduces to VLFM)
+        vm_style: str = "region",      # "region" (V1) / "surface" (V2)
+        h_lam: float = 0.3,                   # Bonus weight lambda (lambda=0 reduces to VLFM)
         h_norm_max: float = 1.0,              # Upper bound for normalizing H
         h_z_min: float = 0.15,                # Lower bound of the H1 passable band
         h_z_max: float = 0.88,                # Upper bound of the H1 passable band (robot height)
@@ -82,7 +82,7 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         )
         self._acyclic_enforcer = AcyclicEnforcer()
 
-        self._value_map_style = value_map_style
+        self._vm_style = vm_style
         self._h_lam = h_lam
         self._h_norm_max = h_norm_max
         self._h_z_min = h_z_min
@@ -109,9 +109,11 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
 
     def _get_explored_2d(self) -> np.ndarray:
         """
-        Aggregates the explored 2D mask from the 3D map passable band (_grid > 0 = observed).
+        Aggregates the explored 2D mask from the 3D map passable band (_states/_grid > 0 = observed).
         """
-        grid = getattr(self._obstacle_map3d, "_grid", None)
+        grid = getattr(self._obstacle_map3d, "_states", None)
+        if grid is None:
+            grid = getattr(self._obstacle_map3d, "_grid", None)
         size = self._obstacle_map3d.size
         if grid is None:
             return np.ones((size, size), bool)
@@ -147,7 +149,9 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         (height-axis semantic value score in its simplified 0/1 form).
         Shares the axis convention of the 3D grid. Used by both V1 and V2.
         """
-        grid = getattr(self._obstacle_map3d, "_grid", None)
+        grid = getattr(self._obstacle_map3d, "_states", None)
+        if grid is None:
+            grid = getattr(self._obstacle_map3d, "_grid", None)
         if grid is None:
             return None
         cz0, cz1 = self._z_layer_range(self._h_z_min, self._h_z_max)
@@ -345,11 +349,11 @@ class ITMPolicyV1(BaseITMPolicy):
 
     def __init__(
         self,
-        value_map_style: str = "region",
+        vm_style: str = "region",
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        super().__init__(value_map_style=value_map_style, *args, **kwargs)
+        super().__init__(vm_style=vm_style, *args, **kwargs)
 
     def _update_value_map_impl(self, cosines: List[List[float]]) -> None:
         """Fills the 2D ValueMap with the VLFM visible cone and draws the trajectory."""
@@ -402,11 +406,11 @@ class ITMPolicyV2(BaseITMPolicy):
 
     def __init__(
         self,
-        value_map_style: str = "surface",
+        vm_style: str = "surface",
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        super().__init__(value_map_style=value_map_style, *args, **kwargs)
+        super().__init__(vm_style=vm_style, *args, **kwargs)
         # V2 surface-style state (2D (x, y) buckets; only surface points within the fixed height band)
         size = self._obstacle_map3d.size
         self._surface_max_map = np.zeros((size, size), np.float32)   # S: per-bucket semantic value score
@@ -420,17 +424,13 @@ class ITMPolicyV2(BaseITMPolicy):
     def _update_value_map_impl(self, cosines: List[List[float]]) -> None:
         """
         Lands cosine scores into 2D (x, y) buckets (S: confidence-gated max).
+        Reuses the single shared back-projected point cloud (see `_get_shared_pcd`).
         """
-        pcds = self._observations_cache.get("shared_pcds")
-        if pcds is None:
-            pcds = [
-                self._project_rgbd_to_3d_point_cloud(rgb, depth, fx, fy, tf, min_depth, max_depth)
-                for (rgb, depth, tf, min_depth, max_depth, fx, fy)
-                in self._observations_cache["object_map_rgbd"]
-            ]
-        for cosine, pcd, (rgb, depth, tf, min_depth, max_depth, fov) in zip(
-            cosines, pcds, self._observations_cache["value_map_rgbd"]
+        value_rgbd = self._observations_cache["value_map_rgbd"]
+        for i, (cosine, (rgb, depth, tf, min_depth, max_depth, fov)) in enumerate(
+            zip(cosines, value_rgbd)
         ):
+            pcd = self._get_shared_pcd(i)
             self._project_value_to_surface(np.array(cosine), pcd, tf, max_depth, fov)
 
     def _score_frontiers(self, frontiers: np.ndarray) -> List[float]:
@@ -500,8 +500,9 @@ class ITMPolicyV2(BaseITMPolicy):
         c_angular = np.zeros_like(theta)
         in_fov = theta <= (fov / 2.0)
         c_angular[in_fov] = np.cos(theta[in_fov] / (fov / 2.0) * (np.pi / 2.0)) ** 2
-        c_distance = np.maximum(0.0, 1.0 - dist_3d / max_depth)
-        conf = c_angular * c_distance
+        # c_distance = np.maximum(0.0, 1.0 - dist_3d / max_depth)
+        # conf = c_angular * c_distance
+        conf = c_angular
         valid = conf > self._min_valid_conf
         if not np.any(valid):
             return

@@ -207,7 +207,7 @@ class ObstacleMap(BaseMap):
 def filter_points_by_height(points: np.ndarray, min_height: float, max_height: float) -> np.ndarray:
     return points[(points[:, 2] >= min_height) & (points[:, 2] <= max_height)]
 
-import octomap
+
 from scipy import ndimage
 class ObstacleMap3D(BaseMap):
     """
@@ -394,28 +394,18 @@ class ObstacleMap3D(BaseMap):
                     pcd = np.empty((0, 3))
             if len(pcd) > 0:
                 point_cloud_episodic_frame = pcd[:, :3]
-                # print(f"[DEBUG AXES] Axis 0 min/max: {point_cloud_episodic_frame[:, 0].min():.2f} / {point_cloud_episodic_frame[:, 0].max():.2f}")
-                # print(f"[DEBUG AXES] Axis 1 min/max: {point_cloud_episodic_frame[:, 1].min():.2f} / {point_cloud_episodic_frame[:, 1].max():.2f}")
-                # print(f"[DEBUG AXES] Axis 2 min/max: {point_cloud_episodic_frame[:, 2].min():.2f} / {point_cloud_episodic_frame[:, 2].max():.2f}")
-                # print(f"[DEBUG MAP] Total PCD points: {len(point_cloud_episodic_frame)}, Z min: {point_cloud_episodic_frame[:, 2].min():.2f}, Z max: {point_cloud_episodic_frame[:, 2].max():.2f}")
                 height_mask = (point_cloud_episodic_frame[:, 2] >= self._min_height) & \
                             (point_cloud_episodic_frame[:, 2] <= self._max_height)
                 point_cloud_episodic_frame = point_cloud_episodic_frame[height_mask]
-                # print(f"[DEBUG MAP] Points passing height_mask ({self._min_height} ~ {self._max_height}): {np.sum(height_mask)}")
 
                 # Update Occupied state (2)
                 if len(point_cloud_episodic_frame) > 0:
                     voxel_indices = self._xyz_to_grid_index(point_cloud_episodic_frame)
-                    # print(f"[DEBUG MAP] Voxel indices shape before filter: {voxel_indices.shape}")
                     voxel_indices = self._filter_in_bounds_indices(voxel_indices)
-                    # print(f"[DEBUG MAP] Voxel indices shape AFTER in_bounds filter: {voxel_indices.shape}")
                     if len(voxel_indices) > 0:
                             self._grid[voxel_indices[:, 1], voxel_indices[:, 0], voxel_indices[:, 2]] = 2
                 # Update Free state (1) along the camera rays
                 self._mark_free_space(camera_pos, point_cloud_episodic_frame)
-
-            #     print(f"[DEBUG] Obstacle voxels added: {len(voxel_indices) if 'voxel_indices' in locals() else 0}")
-            #     print(f"[DEBUG] Total non-zero grid elements in ObstacleMap3D: {np.count_nonzero(self._grid)}")
 
             # Fill raw occupied and basic navigable states directly without explicit dilation
             self._map = (self._grid == 2)
@@ -510,13 +500,33 @@ class ObstacleMap3D(BaseMap):
 
         return vis_img
 
-class OctoMap(BaseMap):
+
+class ProbabilisticGrid(BaseMap):
     """
-    3D Occupancy Grid Map based on the OctoMap library.
+    3D Probabilistic Occupancy Grid Map backed by a dense int8 log-odds array.
+
+    Unlike the ternary hard-decision ObstacleMap3D (0/1/2 overwrite), each voxel
+    stores a log-odds occupancy score accumulated by Bayesian addition:
+
+        ray endpoint  (observed surface):  l(v) <- clamp(l(v) + l_occ,  l_min, l_max)
+        ray body      (free space):        l(v) <- clamp(l(v) + l_free, l_min, l_max)
+
+    A single erroneous observation is therefore corrected by later consistent
+    ones (no permanent "pinning", no state flipping), and repeated same-direction
+    observations drive the voxel to a confident state.
+
+    States are projected on query via thresholds:
+        l(v) >  occ_thr  -> Occupied (2)
+        l(v) <  free_thr -> Free     (1)
+        otherwise        -> Unknown  (0)
+    `_states` (uint8 0/1/2) is refreshed at the end of each update_map so all
+    downstream consumers (frontier extraction, collision checking, 2.5D H1 mask
+    aggregation) keep the exact same interface as ObstacleMap3D.
     """
+
     _map_dtype: np.dtype = np.dtype(bool)
-    _frontiers_px: np.ndarray = np.array([]) # Stores pixel-coordinates of the frontiers
-    frontiers: np.ndarray = np.array([]) # Stores world-coordinates (meters) of the frontiers
+    _frontiers_px: np.ndarray = np.array([])  # Stores pixel-coordinates of the frontiers
+    frontiers: np.ndarray = np.array([])  # Stores world-coordinates (meters) of the frontiers
     radius_padding_color: tuple = (100, 100, 100)
 
     def __init__(
@@ -524,13 +534,20 @@ class OctoMap(BaseMap):
         min_height: float,                  # Lower height bound (m) for obstacle points; too low includes floor noise, too high misses low obstacles
         max_height: float,                  # Upper height bound (m) for obstacle points; too low ignores tall obstacles
         agent_radius: float,                # Robot physical radius (m) used for collision checking; larger = more conservative navigation
+        area_thresh: float = 3.0,           # Frontier area threshold (m^2); higher = fewer, larger frontiers
         hole_area_thresh: int = 100000,     # Depth hole filling area threshold (px^2); higher = fills larger holes
         size: int = 1000,                   # Square map size in pixels; larger = bigger map memory
         pixels_per_meter: int = 20,         # Map resolution (px/m); higher = finer but more memory
-        voxel_size: float = 0.05,           # 3D voxel size (m); smaller = finer octree but more memory/compute
+        voxel_size: float = 0.05,           # 3D voxel size (m); smaller = finer grid but more memory/compute
         height_size: int = 40,              # Number of Z-axis slices; higher = taller vertical coverage
         nav_slice_height: float = 0.35,     # Reference navigation height (m) for frontier slicing and visualization
-        visualize: bool = False             # Allocate/update dense visualization grids; True uses more memory
+        # ---- log-odds inverse sensor model ----
+        log_odds_occ: float = 2.0,          # + increment on ray endpoint voxels (observed surface)
+        log_odds_free: float = -2.0,        # - increment on ray-body voxels (free space)
+        log_odds_min: float = -6.0,         # clamp lower bound (~0.003 occupancy probability)
+        log_odds_max: float = 6.0,          # clamp upper bound (~0.997 occupancy probability)
+        occ_threshold: float = 0.0,         # l(v) > occ_thr  -> Occupied
+        free_threshold: float = 0.0,        # l(v) < free_thr -> Free
     ):
         super().__init__(size, pixels_per_meter)
         self._min_height = min_height
@@ -540,63 +557,124 @@ class OctoMap(BaseMap):
         self._agent_radius = agent_radius
         self._hole_area_thresh = hole_area_thresh
         self._nav_slice_height = nav_slice_height
-        self._visualize = visualize
 
-        # Single Octree approach: no inflated octree is needed for implicit collision checking
-        self._octree = octomap.OcTree(self._voxel_size)
-        # 3D grid and legacy compatibility properties (initialized to maintain class structures)
-        self._grid = np.zeros((size, size, height_size), dtype=np.uint8)
+        self._l_occ = int(log_odds_occ)
+        self._l_free = int(log_odds_free)
+        self._l_min = int(log_odds_min)
+        self._l_max = int(log_odds_max)
+        self._occ_thr = occ_threshold
+        self._free_thr = free_threshold
+
+        # Dense int8 log-odds grid (one byte covers ~0.003~0.997 occupancy prob)
+        self._grid = np.zeros((size, size, height_size), dtype=np.int8)
+        # Projected ternary states (0=Unknown, 1=Free, 2=Occupied), refreshed per update
+        self._states = np.zeros((size, size, height_size), dtype=np.uint8)
+        # Compatibility properties maintained for downstream policies and visualizers
+        self.explored_area = np.zeros((size, size, height_size), dtype=bool)     # Explored space mask
+        self._navigable_map = np.zeros((size, size, height_size), dtype=bool)    # Navigable space mask
         self._map = np.zeros((size, size, height_size), dtype=bool)              # Raw obstacle mask
-        # Conditionally allocate large compatibility matrices to save memory and GC overhead
-        if self._visualize:
-            self.explored_area = np.zeros((size, size, height_size), dtype=bool)     # Explored space mask
-            self._navigable_map = np.zeros((size, size, height_size), dtype=bool)    # Navigable space mask
-        else:
-            self.explored_area = None
-            self._navigable_map = None
 
-        # Precalculate spherical offsets for implicit local collision checks
-        self._inflation_offsets = self._generate_inflation_offsets()
-
-    def _generate_inflation_offsets(self) -> np.ndarray:
-        offsets = []
-        step = self._voxel_size
-        r = self._agent_radius
-        for dx in np.arange(-r, r + step, step):
-            for dy in np.arange(-r, r + step, step):
-                for dz in np.arange(-r, r + step, step):
-                    if dx**2 + dy**2 + dz**2 <= r**2:
-                        offsets.append([dx, dy, dz])
-        return np.array(offsets)
-    
     def reset(self) -> None:
-        # super().reset()
-        self._octree = octomap.OcTree(self._voxel_size)
+        super().reset()
         self._grid.fill(0)
+        self._states.fill(0)
+        self.explored_area.fill(0)
+        self._navigable_map.fill(0)
         self._map.fill(0)
-
-        if self._visualize and self._map is not None:
-            self.explored_area.fill(0)
-            self._navigable_map.fill(0)
-
         self._frontiers_px = np.array([])
         self.frontiers = np.array([])
-        self._camera_positions = []
-        self._last_camera_yaw = 0.0
 
     def _xyz_to_grid_index(self, xyz: np.ndarray) -> np.ndarray:
+        """Maps world coordinates (x, y, z) to 3D grid index (cx, cy, cz)"""
         indices = np.empty((xyz.shape[0], 3), dtype=np.int32)
         indices[:, :2] = self._xy_to_px(xyz[:, [0, 1]])
         indices[:, 2] = ((xyz[:, 2] - self._min_height) / self._voxel_size).astype(np.int32)
         return indices
 
     def _grid_index_to_xyz(self, indices: np.ndarray) -> np.ndarray:
+        """Maps 3D grid index (cy, cx, cz) back to world coordinates (x, y, z)"""
+        # Note: indices input from _get_frontiers is [cy, cx, cz] (row, col, z)
+        # _px_to_xy expects [cx, cy] (col, row), so we swap the first two columns.
         xy_world = self._px_to_xy(indices[:, [1, 0]])
         z_world = indices[:, 2] * self._voxel_size + self._min_height
         return np.stack([xy_world[:, 0], xy_world[:, 1], z_world], axis=-1)
 
+    def _filter_in_bounds_indices(self, indices: np.ndarray) -> np.ndarray:
+        """
+        Filter out all indices that lie within the bounds of the 3D grid map.
+        Indices have shape (N, 3): column 0 is px/cx, column 1 is py/cy, column 2 is cz.
+        """
+        if len(indices) == 0:
+            return indices
+        in_bounds = (
+            (indices[:, 0] >= 0) & (indices[:, 0] < self.size) &
+            (indices[:, 1] >= 0) & (indices[:, 1] < self.size) &
+            (indices[:, 2] >= 0) & (indices[:, 2] < self._height_size)
+        )
+        return indices[in_bounds]
+
+    def _accumulate(self, indices: np.ndarray, delta: int) -> None:
+        """Bayesian log-odds accumulation with clamp (int16 intermediate to avoid int8 overflow)."""
+        if len(indices) == 0:
+            return
+        idx = (indices[:, 1], indices[:, 0], indices[:, 2])
+        updated = np.clip(
+            self._grid[idx].astype(np.int16) + delta,
+            self._l_min,
+            self._l_max,
+        ).astype(np.int8)
+        self._grid[idx] = updated
+
+    def _project_states(self) -> None:
+        """Project the int8 log-odds grid into ternary states (0/1/2) via thresholds."""
+        states = np.zeros_like(self._grid, dtype=np.uint8)
+        states[self._grid > self._occ_thr] = 2
+        states[self._grid < self._free_thr] = 1
+        self._states = states
+
+    def _mark_free_space(self, camera_pos: np.ndarray, points: np.ndarray) -> None:
+        if len(points) == 0:
+            return
+
+        # Subsample point clouds to maintain real-time performance
+        step_size = max(1, len(points) // 1000)
+        sampled_points = points[::step_size]
+        # Calculate vectorized ray directions and lengths
+        directions = sampled_points - camera_pos
+        distances = np.linalg.norm(directions, axis=1, keepdims=True)
+        valid_mask = distances.flatten() > 0
+        directions = directions[valid_mask]
+        distances = distances[valid_mask]
+        if len(directions) == 0:
+            return
+        unit_directions = directions / distances
+        max_dist = np.max(distances)
+
+        # Calculate maximum interpolation steps clamped between 2 and 50
+        num_steps = int(max_dist / self._voxel_size) + 1
+        num_steps = max(2, min(num_steps, 50))
+
+        # Interpolate rays up to 0.95 length to avoid clearing the obstacle surface itself
+        steps = np.linspace(0.0, 0.95, num_steps)
+        ray_lengths = steps[:, None] * distances.T
+        ray_pts = camera_pos[None, None, :] + ray_lengths[:, :, None] * unit_directions[None, :, :]
+        # Reshape to coordinate list and retrieve corresponding grid indices
+        ray_pts_flat = ray_pts.reshape(-1, 3)
+        free_indices = self._xyz_to_grid_index(ray_pts_flat)
+        free_indices = self._filter_in_bounds_indices(free_indices)
+        if len(free_indices) == 0:
+            return
+
+        # Prune duplicate spatial voxels to reduce overhead on grid operations
+        flat_indices = free_indices[:, 0] * (self.size * self._height_size) + free_indices[:, 1] * self._height_size + free_indices[:, 2]
+        _, unique_idx = np.unique(flat_indices, return_index=True)
+        free_indices = free_indices[unique_idx]
+
+        # Bayesian free-space evidence: accumulate l_free and clamp (corrects stale occupied votes)
+        self._accumulate(free_indices, self._l_free)
+
     def _get_frontiers(self) -> np.ndarray:
-        """Extracts frontiers from the synced dense grid"""
+        """Finds voxels that are Free (1) and have at least one Unknown (0) voxel in their 26-neighborhood"""
 
         # Vertical height-range constraint: slice a local band around the robot's current vertical slice cz
         nav_target_z = self._nav_slice_height  # Standard height (m) for robot navigation interaction
@@ -605,7 +683,7 @@ class OctoMap(BaseMap):
         z_min = max(0, cz - 3)
         z_max = min(self._height_size - 1, cz + 3)
         # Horizontal downsampling (stride=2) to extract a local grid slice (500, 500, 7)
-        grid_slice = self._grid[::2, ::2, z_min:z_max+1]
+        grid_slice = self._states[::2, ::2, z_min:z_max+1]
 
         is_free = (grid_slice == 1)
         if not np.any(is_free):
@@ -626,63 +704,6 @@ class OctoMap(BaseMap):
         frontiers = np.stack([cy, cx, cz], axis=-1)
         step = max(1, len(frontiers) // 500)
         return frontiers[::step]
-
-    def _sync_octrees_to_dense_grid(self) -> None:
-        """
-        Synchronizes OctoMap states back to dense compatible matrices
-        using vectorized NumPy operations over extracted point clouds.
-        This provides a 100x speedup compared to standard Python loop traversals.
-        """
-        self._grid.fill(0)
-        self._map.fill(0)
-        if self._visualize:
-            self._navigable_map.fill(0)
-
-        # Batch retrieve occupied and empty coordinate arrays directly from C++ wrapper
-        try:
-            occupied_pts, empty_pts = self._octree.extractPointCloud()
-        except Exception:
-            occupied_pts, empty_pts = np.empty((0, 3)), np.empty((0, 3))
-
-        # Sync Free states (1) to the dense compatibility grids in batch
-        if len(empty_pts) > 0:
-            valid_mask = (empty_pts[:, 2] >= self._min_height) & (empty_pts[:, 2] <= self._max_height)
-            valid_empty = empty_pts[valid_mask]
-            if len(valid_empty) > 0:
-                empty_idx = self._xyz_to_grid_index(valid_empty)
-                empty_idx = self._filter_in_bounds_indices(empty_idx)
-                if len(empty_idx) > 0:
-                    self._grid[empty_idx[:, 1], empty_idx[:, 0], empty_idx[:, 2]] = 1
-                    if self._visualize:
-                        self._navigable_map[empty_idx[:, 1], empty_idx[:, 0], empty_idx[:, 2]] = True
-
-        # Sync Occupied states (2) to the dense compatibility grids
-        if len(occupied_pts) > 0:
-            valid_mask = (occupied_pts[:, 2] >= self._min_height) & (occupied_pts[:, 2] <= self._max_height)
-            valid_occupied = occupied_pts[valid_mask]
-            if len(valid_occupied) > 0:
-                occupied_idx = self._xyz_to_grid_index(valid_occupied)
-                occupied_idx = self._filter_in_bounds_indices(occupied_idx)
-                if len(occupied_idx) > 0:
-                    self._grid[occupied_idx[:, 1], occupied_idx[:, 0], occupied_idx[:, 2]] = 2
-                    self._map[occupied_idx[:, 1], occupied_idx[:, 0], occupied_idx[:, 2]] = True
-                    if self._visualize:
-                        self._navigable_map[occupied_idx[:, 1], occupied_idx[:, 0], occupied_idx[:, 2]] = False
-
-    def _filter_in_bounds_indices(self, indices: np.ndarray) -> np.ndarray:
-        """
-        Filter out all indices that lie within the bounds of the 3D grid map.
-        Indices have shape (N, 3): column 0 is px/cx, column 1 is py/cy, column 2 is cz.
-        """
-        if len(indices) == 0:
-            return indices
-        in_bounds = (
-            (indices[:, 0] >= 0) & (indices[:, 0] < self.size) &
-            (indices[:, 1] >= 0) & (indices[:, 1] < self.size) &
-            (indices[:, 2] >= 0) & (indices[:, 2] < self._height_size)
-        )
-        return indices[in_bounds]
-
 
     def update_map(
         self,
@@ -720,27 +741,37 @@ class OctoMap(BaseMap):
                 height_mask = (point_cloud_episodic_frame[:, 2] >= self._min_height) & \
                             (point_cloud_episodic_frame[:, 2] <= self._max_height)
                 point_cloud_episodic_frame = point_cloud_episodic_frame[height_mask]
-                # Update the Raw Octree with the current frame point cloud
+
+                # Occupied evidence: accumulate l_occ on ray endpoint voxels
                 if len(point_cloud_episodic_frame) > 0:
-                    self._octree.insertPointCloud(point_cloud_episodic_frame, camera_pos)
-                # High-performance vectorized synchronization of Octree states back to dense compatible matrices
-                self._sync_octrees_to_dense_grid()
+                    voxel_indices = self._xyz_to_grid_index(point_cloud_episodic_frame)
+                    voxel_indices = self._filter_in_bounds_indices(voxel_indices)
+                    if len(voxel_indices) > 0:
+                        self._accumulate(voxel_indices, self._l_occ)
+                # Free evidence: accumulate l_free along the camera rays
+                self._mark_free_space(camera_pos, point_cloud_episodic_frame)
+
+            # Project log-odds to ternary states and refresh compatibility matrices
+            self._project_states()
+            self._map = (self._states == 2)
+            self._navigable_map = (self._states == 1)  # Navigable maps directly represent Free voxels; collision is handled implicitly
 
         if not explore:
             return
 
-        if self._visualize:
-            # Synchronize explored area mask (voxels mapped as either Free or Occupied)
-            self.explored_area = (self._grid > 0)
-            labeled_array, num_features = ndimage.label(self.explored_area)
-            if num_features > 1:
-                px = np.clip(agent_index[0], 0, self.size - 1)
-                py = np.clip(agent_index[1], 0, self.size - 1)
-                cz = np.clip(agent_index[2], 0, self._height_size - 1)
-                agent_label = labeled_array[py, px, cz]
-                if agent_label > 0:
-                    self.explored_area = (labeled_array == agent_label)
+        # Explored area is any voxel that has reached a non-Unknown state
+        self.explored_area = (self._states != 0)
+        # Keep only the largest explored connected component containing the agent
+        labeled_array, num_features = ndimage.label(self.explored_area)
+        if num_features > 1:
+            px = np.clip(agent_index[0], 0, self.size - 1)
+            py = np.clip(agent_index[1], 0, self.size - 1)
+            cz = np.clip(agent_index[2], 0, self._height_size - 1)
+            agent_label = labeled_array[py, px, cz]
+            if agent_label > 0:
+                self.explored_area = (labeled_array == agent_label)
 
+        # Compute 3D frontiers
         self._frontiers_px = self._get_frontiers()
         if len(self._frontiers_px) == 0:
             self.frontiers = np.array([])
@@ -749,27 +780,25 @@ class OctoMap(BaseMap):
 
     def check_collision(self, xyz: np.ndarray) -> np.ndarray:
         """
-        Implicit Collision Check:
-        Directly queries the sparse OctoMap tree in a local spherical neighborhood.
-        Eliminates the expensive explicit grid-level 3D morphological dilation step.
+        Performs low-cost local-neighborhood collision checking against the projected ternary states.
         """
 
         indices = self._xyz_to_grid_index(xyz)
         rx = int(np.ceil(self._agent_radius * self.pixels_per_meter))
         ry = int(np.ceil(self._agent_radius * self.pixels_per_meter))
         rz = int(np.ceil(self._agent_radius / self._voxel_size))
-        
+
         colliding = np.zeros(len(xyz), dtype=bool)
         for i, idx in enumerate(indices):
             px, py, cz = idx  # Unpack [px, py, cz]
-            
+
             zmin_raw = cz - rz
             zmax_raw = cz + rz
             # Vertical SAT culling: if the collision region is fully outside the grid's
             # vertical extent, skip it (it cannot possibly collide)
             if zmin_raw >= self._height_size or zmax_raw < 0:
                 continue
-            
+
             ymin = max(0, min(self.size - 1, py - ry))
             ymax = max(0, min(self.size - 1, py + ry))
             xmin = max(0, min(self.size - 1, px - rx))
@@ -777,31 +806,29 @@ class OctoMap(BaseMap):
             zmin = max(0, min(self._height_size - 1, cz - rz))
             zmax = max(0, min(self._height_size - 1, cz + rz))
 
-            patch = self._grid[ymin:ymax+1, xmin:xmax+1, zmin:zmax+1]
+            patch = self._states[ymin:ymax+1, xmin:xmax+1, zmin:zmax+1]
             if np.any(patch == 2):
                 colliding[i] = True
 
         return colliding
 
     def visualize_slice(self) -> np.ndarray:
-        # Prevent crashes if visualize_slice is accidentally called when visualization is disabled
-        if not self._visualize:
-            return np.ones((self.size, self.size, 3), dtype=np.uint8) * 128
-        
+        """Visualizes a 2D slice of the 3D map at the robot's height"""
+
         # Lock onto the effective navigation height layer for robot-base/obstacle interaction
         nav_target_z = self._nav_slice_height  # Standard height (m) for robot navigation interaction
         nav_cz = int((nav_target_z - self._min_height) / self._voxel_size)
         cz = np.clip(nav_cz, 0, self._height_size - 1)
-        
+
         explored_2d = self.explored_area[:, :, cz]
         navigable_2d = self._navigable_map[:, :, cz]
         map_2d = self._map[:, :, cz]
-        
+
         vis_img = np.ones((self.size, self.size, 3), dtype=np.uint8) * 255
         vis_img[explored_2d == 1] = (200, 255, 200)
         vis_img[navigable_2d == 0] = self.radius_padding_color
         vis_img[map_2d == 1] = (0, 0, 0)
-        
+
         if len(self._frontiers_px) > 0:
             for frontier in self._frontiers_px:
                 if abs(frontier[2] - cz) <= 3:
