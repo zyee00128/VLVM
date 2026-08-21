@@ -55,10 +55,9 @@ SCENES="[5cdEh9F2hJL]"   # HM3D 场景（数据集固定，不改）
 
 # ----------------- 实验定义 -----------------
 # 格式: 标签 | 策略名 | vm_style | h_lam | om_style | log_odds_occ | log_odds_free | occ_threshold | free_threshold
-# 08-21 保守抵消（方向 C）A/B：#10 基础上 log_odds_occ=2.0 / free=-1.5（不对称，抵消不归零）
-#   + occ_thr=1.0 / free_thr=-1.0（滞回，(-1,+1) 为 Unknown 缓冲带）
+# 最终方案（#10）：ProbabilisticGrid 累积 explored 掩码 + 消费层排除障碍（对称 log-odds）
 EXPERIMENTS=(
-  "v1_prob_consv_C|HabitatITMPolicyV1|region|0.3|probabilistic|2.0|-1.5|1.0|-1.0"
+  "v1_prob_final|HabitatITMPolicyV1|region|0.3|probabilistic|2.0|-2.0|0.0|0.0"
 )
 
 echo "共 ${#EXPERIMENTS[@]} 组实验，串行执行..."
