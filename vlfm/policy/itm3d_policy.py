@@ -33,21 +33,21 @@ class BaseITM3DPolicy(TSP3DObjectNavPolicy):
 
     def __init__(
         self,
-        text_prompt: str = "Seems like there is a target_object ahead.",  # Language prompt used for visual grounding.
-        voxel_size: float = 0.05,                  # 3D voxel size (m); smaller = finer map but more memory/compute.
-        use_max_confidence: bool = True,           # Project voxel similarity using global max confidence; False uses mean aggregation.
-        sync_explored_areas: bool = False,         # Sync the physically explored area into the semantic map; True improves consistency at some cost.
-        exploration_thresh: float = 0.15,          # Min similarity to switch into target-chasing; higher = more conservative chasing.
-        carving_noise_tolerance: float = 0.2,      # Depth error tolerance (m) to classify voxels as ghosts/false positives; higher = less aggressive carving.
-        min_carving_conf: float = 0.05,            # Confidence floor; voxels below this are removed; higher = cleaner map, may erase weak targets.
-        carving_decay_factor: float = 0.5,         # Multiplicative confidence decay per frame in free space; lower = faster decay/cleaner map.
-        pruning_min_conf: float = 0.01,            # Global voxel low-confidence pruning threshold; higher = removes more voxels.
-        max_voxel_dist: float = 15.0,              # Max distance (m) to keep a voxel; larger = more memory, smaller = less far-field noise.
-        downsampling_step: int = 8,                # Downsampling stride for similarity projection; larger = faster but coarser value map.
-        min_valid_conf: float = 1e-4,              # Floor for valid back-projection weights; higher = filters weaker contributions.
-        cylinder_radius: float = 1.0,              # Physical radius (m) of the 3D scoring cylinder around a boundary point.
-        cylinder_height: float = 1.5,              # Physical height (m) of the scoring cylinder; taller = scores more vertical neighbors.
-        query_radius: float = 0.5,                 # Query radius (m) for 2D collision pre-filtering; larger = more conservative.
+        text_prompt: str = "Seems like there is a target_object ahead.",
+        voxel_size: float = 0.05,
+        use_max_confidence: bool = True,
+        sync_explored_areas: bool = False,
+        exploration_thresh: float = 0.15,
+        carving_noise_tolerance: float = 0.2,
+        min_carving_conf: float = 0.05,
+        carving_decay_factor: float = 0.5,
+        pruning_min_conf: float = 0.01,
+        max_voxel_dist: float = 15.0,
+        downsampling_step: int = 8,
+        min_valid_conf: float = 1e-4,
+        cylinder_radius: float = 1.0,
+        cylinder_height: float = 1.5,
+        query_radius: float = 0.5,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -493,7 +493,7 @@ class BaseITM3DPolicy(TSP3DObjectNavPolicy):
         waypoints_3d = np.array(waypoints_3d)
 
         dists_2d = np.linalg.norm(waypoints_3d[:, :2] - robot_xyz[:2], axis=1)
-        far_mask = dists_2d > self._min_dists_2d
+        far_mask = dists_2d > 0.5  # Legacy 3D waypoint min-distance filter (original default 0.5m)
         if np.any(far_mask):
             waypoints_3d = waypoints_3d[far_mask]
 
@@ -587,18 +587,15 @@ class BaseITM3DPolicy(TSP3DObjectNavPolicy):
         Extracts frontiers, clusters them, performs collision checking, 
         and selects the highest scoring 3D coordinate.
         """
-        frontier_voxels = self._extract_3d_frontiers_bfs()
-        candidate_waypoints = self._cluster_and_extract_centroids_dbscan(frontier_voxels)
-        
-        if len(candidate_waypoints) == 0:
-            fallback = self._observations_cache.get("frontier_sensor_3d")
-            if fallback is None:
-                fallback = self._observations_cache.get("frontier_sensor")
-            if fallback is not None and len(fallback) > 0:
-                fallback_arr = np.array(fallback)
-                if fallback_arr.ndim == 2 and fallback_arr.shape[1] >= 2 and not np.all(fallback_arr == 0):
-                    candidate_waypoints = fallback_arr
-        
+        candidate_waypoints = np.empty((0, 3))
+        fallback = self._observations_cache.get("frontier_sensor_3d")
+        if fallback is None:
+            fallback = self._observations_cache.get("frontier_sensor")
+        if fallback is not None and len(fallback) > 0:
+            fallback_arr = np.array(fallback)
+            if fallback_arr.ndim == 2 and fallback_arr.shape[1] >= 2 and not np.all(fallback_arr == 0):
+                candidate_waypoints = fallback_arr
+
         if len(candidate_waypoints) == 0:
             return None
             
@@ -773,17 +770,16 @@ class ITM3DPolicyV2(BaseITM3DPolicy):
 
 
 ## To use ITM3D V1/V2, add the following parameters to class VLVMConfig and the YAML config file for registration.
-    # # Phase 7: ITM3D Semantic Value Mapping & Space Carving
-    # use_max_confidence: bool = True          # Project voxel similarity using global max confidence; False uses mean/average aggregation.
-    # sync_explored_areas: bool = False        # Synchronize the physically explored area into the semantic map; True improves map consistency at some cost.
-    # carving_noise_tolerance: float = 0.2     # Depth error tolerance (m) to classify voxels as ghosts/false positives; higher = less aggressive carving.
-    # min_carving_conf: float = 0.05           # Confidence floor; voxels below this are removed entirely; higher = cleaner map, may erase weak targets.
-    # carving_decay_factor: float = 0.5        # Multiplicative confidence decay per frame inside free space; lower = faster decay/cleaner map.
-    # pruning_min_conf: float = 0.01           # Global voxel low-confidence pruning threshold; higher = removes more voxels.
-    # max_voxel_dist: float = 15.0             # Max distance (m) to keep a voxel; larger = bigger map memory, smaller = less far-field noise.
-    # downsampling_step: int = 8               # Downsampling stride for similarity projection; larger = faster but coarser value map.
-    # min_valid_conf: float = 1e-4             # Floor for valid back-projection weights; higher = filters weaker contributions.
-    # cylinder_radius: float = 1.0             # Physical radius (m) of the 3D scoring cylinder around a boundary point.
-    # cylinder_height: float = 1.5             # Physical height (m) of the 3D scoring cylinder; taller = scores more vertical neighbors.
-    # query_radius: float = 0.5                # Query radius (m) for 2D collision pre-filtering; larger = more conservative.
-    # exploration_thresh: float = 0.15         # Minimum similarity to switch into target-chasing mode; higher = more conservative chasing.
+    # use_max_confidence: bool = True
+    # sync_explored_areas: bool = False
+    # carving_noise_tolerance: float = 0.2
+    # min_carving_conf: float = 0.05
+    # carving_decay_factor: float = 0.5
+    # pruning_min_conf: float = 0.01
+    # max_voxel_dist: float = 15.0
+    # downsampling_step: int = 8
+    # min_valid_conf: float = 1e-4
+    # cylinder_radius: float = 1.0
+    # cylinder_height: float = 1.5
+    # query_radius: float = 0.5
+    # exploration_thresh: float = 0.15

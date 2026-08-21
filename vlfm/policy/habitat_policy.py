@@ -59,10 +59,8 @@ class TorchActionIDs:
 
 
 class Habitat3DMixin:
-    """
-    This Mixin provides adapter utilities for running 3D active semantic navigation 
-    policies inside the Habitat simulator, managing observation parsing, parameter routing, and action mapping.
-    """
+    """Adapter utilities for running 3D active semantic navigation policies inside
+    Habitat: observation parsing, parameter routing, and action mapping."""
 
     _stop_action: Tensor = TorchActionIDs.STOP
     _turn_left_action: Tensor = TorchActionIDs.TURN_LEFT
@@ -93,12 +91,9 @@ class Habitat3DMixin:
         self._fx = self._fy = image_width / (2 * np.tan(camera_fov_rad / 2))
         self._dataset_type = dataset_type
 
-        # When initializing the agent, if no checkpoint is detected, Habitat tries
-        # to orthogonally initialize the network weights, e.g.
-        # nn.init.orthogonal_(actor_critic.critic.fc.weight). This navigation
-        # policy is a zero-shot, purely logic/geometry-based heuristic with no
-        # critic or actor neural networks, so Habitat would crash when it tries
-        # to access critic.fc.weight. The dummy nets below prevent that.
+        # Habitat requires actor/critic nets when loading a policy without a
+        # checkpoint; dummy nets prevent the orthogonal-init crash for this
+        # zero-shot, logic/geometry-only heuristic.
         class DummyNet(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -108,13 +103,12 @@ class Habitat3DMixin:
 
     @classmethod
     def from_config(cls, config: DictConfig, *args_unused: Any, **kwargs_unused: Any) -> "Habitat3DMixin":
-        # Parse policy configurations from YAML and route them to the policy constructors
+        # Parse policy configs from YAML and route them to the policy constructor
         policy_config = config.habitat_baselines.rl.policy
-        # Safely resolve OmegaConf DictConfig to a native Python dictionary for **kwargs unpacking
         kwargs = OmegaConf.to_container(policy_config, resolve=True)
         kwargs.pop("name", None)
 
-        # Bind Habitat sensor configurations (Focal length, height, FOV for geometric projection)
+        # Bind Habitat sensor configs (focal length, height, FOV for projection)
         sim_sensors_cfg = config.habitat.simulator.agents.main_agent.sim_sensors
         kwargs["camera_height"] = sim_sensors_cfg.rgb_sensor.position[1]
         kwargs["min_depth"] = sim_sensors_cfg.depth_sensor.min_depth
@@ -140,10 +134,8 @@ class Habitat3DMixin:
         masks: Tensor,
         deterministic: bool = False,
     ) -> PolicyActionData:
-        """
-        Maps incoming object IDs to string names,
-        invokes the base 3D Policy, and maps predicted actions.
-        """
+        """Maps incoming object IDs to string names, invokes the base 3D policy,
+        and maps the predicted actions."""
         object_id: int = observations[ObjectGoalSensor.cls_uuid][0].item()
         obs_dict = observations.to_tree()
         
@@ -186,10 +178,8 @@ class Habitat3DMixin:
         return info
 
     def _cache_observations(self: Union["Habitat3DMixin", TSP3DObjectNavPolicy], observations: TensorDict) -> None:
-        """
-        Parses RGB, Depth, and GPS data from Habitat, and converts them into 
-        the 3D transformations and raw point clouds required by the 3D policies.
-        """
+        """Parses RGB, Depth, and GPS data from Habitat and converts them into the
+        3D transformations and raw point clouds required by the 3D policies."""
         if len(self._observations_cache) > 0:
             return
             
@@ -203,10 +193,10 @@ class Habitat3DMixin:
         # Convert Habitat GPS coordinates to episodic 3D coordinates (X, Y, Z)
         camera_position = np.array([x, -y, self._camera_height])
         robot_xy = camera_position[:2]
-        # Construct camera-to-episodic transformation matrix (4x4)
+        # Construct the camera-to-episodic transformation matrix (4x4)
         tf_camera_to_episodic = xyz_yaw_to_tf_matrix(camera_position, camera_yaw)
 
-        # Fallback checks for frontier sensors
+        # Frontier sensor fallbacks
         if "frontier_sensor_3d" in observations:
             frontiers_3d = observations["frontier_sensor_3d"][0].cpu().numpy()
         else:
@@ -220,9 +210,9 @@ class Habitat3DMixin:
         self._observations_cache = {
             "frontier_sensor": frontiers,
             "frontier_sensor_3d": frontiers_3d,
-            "nav_depth": observations["depth"], # Target depth for base PointNav
-            "robot_xy": robot_xy,               # 2D horizontal coordinates
-            "robot_xy_z": camera_position,      # 3D world coordinates
+            "nav_depth": observations["depth"],
+            "robot_xy": robot_xy,
+            "robot_xy_z": camera_position,
             "robot_heading": camera_yaw,
             "object_map_rgbd": [
                 (
@@ -279,29 +269,23 @@ class SuperOracleFBEPolicy(Habitat3DMixin, TSP3DObjectNavPolicy):
 
 @baseline_registry.register_policy
 class HabitatITM3DPolicy(Habitat3DMixin, ITM3DPolicyV1):
-    """
-    3D semantic value mapping: projects cosine scores into a sparse 3D
-    semantic voxel grid with confidence-weighted fusion, 
-    space carving, and distant voxel pruning.
-    """
+    """3D semantic value mapping: cosine scores projected into a sparse 3D
+    semantic voxel grid with confidence-weighted fusion, space carving, and
+    distant voxel pruning."""
     pass
 
 
 @baseline_registry.register_policy
 class HabitatITMPolicyV1(Habitat3DMixin, ITMPolicyV1):
-    """
-    2.5D BEV semantic value plane (route 1, region style): 
-    VLFM 2D ValueMap + H1 (vertical passability).
-    """
+    """2.5D BEV semantic value plane (route 1, region style):
+    VLFM 2D ValueMap + H1 (vertical passability)."""
     pass
 
 
 @baseline_registry.register_policy
 class HabitatITMPolicyV2(Habitat3DMixin, ITMPolicyV2):
-    """
-    2.5D BEV semantic value plane (route 2, surface style): 
-    3D surface points -> 2D buckets (confidence-gated S) + H1.
-    """
+    """2.5D BEV semantic value plane (route 2, surface style):
+    3D surface points -> 2D buckets (confidence-gated S) + H1."""
     pass
 
 

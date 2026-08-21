@@ -64,14 +64,19 @@ habitat_baselines:
 
       min_depth: 0.5
       max_depth: 5.0
-      om_style: "obstacle"      # "obstacle" (ternary ObstacleMap3D) / "probabilistic" (log-odds ProbabilisticGrid)
+      om_style: "probabilistic" # probabilistic/ obstacle
       voxel_size: 0.05
       min_obstacle_height: 0.15
       max_obstacle_height: 1.50
       agent_radius: 0.18
       nav_slice_height: 0.30
+      agent_height: 0.88
       hole_area_thresh: 100000
       obstacle_map_area_threshold: 1.5
+      log_odds_occ: 2.0
+      log_odds_free: -2.0
+      occ_threshold: 0.0
+      free_threshold: 0.0
       sigma_tar: 0.60
       sigma_sce: 0.15
       tau: 0.15              
@@ -82,12 +87,8 @@ habitat_baselines:
       pcd_window_size: 8
       fuse_voxel_size: 0.02
       fuse_max_points: 200000
-      compute_frontiers: True
-      dbscan_eps: 0.20
-      dbscan_min_samples: 3
-      min_dists_2d: 0.3
       pointnav_stop_radius: 0.30
-      vm_style: "region"             # "region" (V1) / "surface" (V2)
+      vm_style: "region"  # "region" (V1) / "surface" (V2)
       h_lam: 0.3
       h_norm_max: 1.0
       h_z_min: 0.15

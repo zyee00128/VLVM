@@ -22,12 +22,12 @@ PROMPT_SEPARATOR = "|"
 class TSP3D:
     def __init__(
         self,
-        d_model=128,   # Transformer feature dimension; larger = more capacity but more memory/compute
-        voxel_size: float = 0.01,  # 3D voxel size (m); smaller = finer geometry but more points/compute
-        data_path: str = os.environ.get("TSP3D_DATA_PATH", "/root/autodl-tmp/vlvm/data/tsp3d_models/"),  # Directory containing pretrained model assets
-        config_path: Optional[str] = None,  # Optional path to a model config file
-        weights_path: str = os.environ.get("TSP3D_CHECKPOINT", "/root/autodl-tmp/vlvm/data/tsp3d_models/tsp3d_scanrefer.pth"),  # Path to the pretrained checkpoint
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),  # Compute device for inference
+        d_model=128,
+        voxel_size: float = 0.01,
+        data_path: str = os.environ.get("TSP3D_DATA_PATH", "/root/autodl-tmp/vlvm/data/tsp3d_models/"),
+        config_path: Optional[str] = None,
+        weights_path: str = os.environ.get("TSP3D_CHECKPOINT", "/root/autodl-tmp/vlvm/data/tsp3d_models/tsp3d_scanrefer.pth"),
+        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     ):
         self.device = device
         self.voxel_size = voxel_size
@@ -87,16 +87,14 @@ class TSP3D:
             return []
 
         if use_raw_nlp:
-            # Original VLFM framework method
-            # Multi-class synonym merging Caption
+            # Multi-class synonym merging caption
             classes = [c.strip() for c in text.split(PROMPT_SEPARATOR) if c.strip()]
             if len(classes) > 1:
                 processed_text = " . ".join(classes) + " ."
             else:
                 processed_text = text if text.endswith(".") else text + " ."
         else:
-            # Directly extract pure target words (handling "chair|armchair" or pure "chair")
-            # Use RobertaTokenizerFast for efficient tokenization and character position mapping
+            # Extract only the primary target word (handling "chair|armchair" or pure "chair")
             primary_classes = [c.strip() for c in text.split(PROMPT_SEPARATOR) if c.strip()]
             target_query = primary_classes[0] if primary_classes else text
             processed_text = target_query
@@ -226,22 +224,6 @@ if __name__ == "__main__":
 
                 detections = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_raw_nlp)
                 return {"detections": detections}
-            # # Legacy route: list-based JSON point cloud (backward compatibility)
-            # if "pcd" in payload and "text" in payload:
-            #     pcd = payload["pcd"]  # ServerMixin will automatically deserialize the numpy sequence
-            #     text = payload["text"]
-            #     sigma_sce = payload.get("sigma_sce", 0.7)
-            #     sigma_tar = payload.get("sigma_tar", 0.3)
-            #     tau = payload.get("tau", 0.15)
-            #     use_raw_nlp = payload.get("use_raw_nlp", True)
-
-            #     detections = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_raw_nlp)
-            #     return {"detections": detections}
-            # elif "box_3d" in payload:
-            #     pcd = payload["pcd"]
-            #     box_3d = payload["box_3d"]
-            #     mask = self.segment_bbox(pcd, box_3d)
-            #     return {"mask": bool_arr_to_str(mask)}
             return {}
 
     tsp3d_server = TSP3DServer()

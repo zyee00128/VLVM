@@ -25,19 +25,22 @@ PROMPT_SEPARATOR = "|"
 
 class _ExploredAreaAdapter:
     """
-    Exposes the 3D->2D aggregated explored mask (from the passable band of the
-    3D ObstacleMap) to the 2D `ValueMap`.
+    Thin adapter exposing the 3D->2D explored projection (passable band) of the
+    reconstructed 3D obstacle map to the 2D `ValueMap` (which expects an object
+    with an `explored_area` attribute). The projection itself lives in the
+    value-field policy (`BaseITMPolicy._get_explored_2d`).
     """
 
-    def __init__(self, policy: "BaseITMPolicy") -> None:
-        om = policy._obstacle_map3d
-        self.pixels_per_meter = om.pixels_per_meter
-        self.size = om.size
+    def __init__(self, policy: "BaseITMPolicy", z_min: float, z_max: float) -> None:
+        self.pixels_per_meter = policy._obstacle_map3d.pixels_per_meter
+        self.size = policy._obstacle_map3d.size
         self._policy = policy
+        self._z_min = z_min
+        self._z_max = z_max
 
     @property
     def explored_area(self) -> np.ndarray:
-        return self._policy._get_explored_2d()
+        return self._policy._get_explored_2d(self._z_min, self._z_max)
 
 
 class BaseITMPolicy(TSP3DObjectNavPolicy):
@@ -58,15 +61,14 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         text_prompt: str,
         use_max_confidence: bool = True,
         sync_explored_areas: bool = False,
-        # ---- 2.5D BEV Parameters ----
-        vm_style: str = "region",      # "region" (V1) / "surface" (V2)
-        h_lam: float = 0.3,                   # Bonus weight lambda (lambda=0 reduces to VLFM)
-        h_norm_max: float = 1.0,              # Upper bound for normalizing H
-        h_z_min: float = 0.15,                # Lower bound of the H1 passable band
-        h_z_max: float = 0.88,                # Upper bound of the H1 passable band (robot height)
-        query_radius_m: float = 0.5,          # Horizontal query radius r_h (route 2)
-        query_z_min: float = 0.15,            # Lower bound of the fixed query height band (surface landing)
-        query_z_max: float = 1.50,            # Upper bound of the fixed query height band
+        vm_style: str = "region",
+        h_lam: float = 0.3,
+        h_norm_max: float = 1.0,
+        h_z_min: float = 0.15,
+        h_z_max: float = 0.88,
+        query_radius_m: float = 0.5,
+        query_z_min: float = 0.15,
+        query_z_max: float = 1.50,
         *args: Any,
         **kwargs: Any,
     ):
@@ -74,14 +76,6 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         self._itm = BLIP2ITMClient(port=int(os.environ.get("BLIP2ITM_PORT", "12182")))
         self._text_prompt = text_prompt
         self._value_channels = len(text_prompt.split(PROMPT_SEPARATOR))
-        self._value_map: ValueMap = ValueMap(
-            value_channels=self._value_channels,
-            size=self._obstacle_map3d.size,  # Same grid as the 3D map (400x400, ppm=20, origin=200)
-            use_max_confidence=use_max_confidence,
-            obstacle_map=_ExploredAreaAdapter(self),
-        )
-        self._acyclic_enforcer = AcyclicEnforcer()
-
         self._vm_style = vm_style
         self._h_lam = h_lam
         self._h_norm_max = h_norm_max
@@ -90,6 +84,13 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         self._query_radius_m = query_radius_m
         self._query_z_min = query_z_min
         self._query_z_max = query_z_max
+        self._value_map: ValueMap = ValueMap(
+            value_channels=self._value_channels,
+            size=self._obstacle_map3d.size,  # Same grid as the 3D map (400x400, ppm=20, origin=200)
+            use_max_confidence=use_max_confidence,
+            obstacle_map=_ExploredAreaAdapter(self, self._h_z_min, self._h_z_max),
+        )
+        self._acyclic_enforcer = AcyclicEnforcer()
 
     def _reset(self) -> None:
         super()._reset()
@@ -97,33 +98,6 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         self._acyclic_enforcer = AcyclicEnforcer()
         self._last_value = float("-inf")
         self._last_frontier = np.zeros(2)
-
-    def _z_layer_range(self, z_min: float, z_max: float) -> Tuple[int, int]:
-        """
-        Maps a world height range [z_min, z_max] to the 3D map layer interval [cz0, cz1).
-        """
-        om = self._obstacle_map3d
-        cz0 = int((z_min - om._min_height) / om._voxel_size)
-        cz1 = int((z_max - om._min_height) / om._voxel_size) + 1
-        return max(0, cz0), min(om._height_size, cz1)
-
-    def _get_explored_2d(self) -> np.ndarray:
-        """
-        Aggregates the explored 2D mask from the 3D map passable band (_states/_grid > 0 = observed).
-        """
-        grid = getattr(self._obstacle_map3d, "_states", None)
-        if grid is None:
-            grid = getattr(self._obstacle_map3d, "_grid", None)
-        size = self._obstacle_map3d.size
-        if grid is None:
-            return np.ones((size, size), bool)
-        cz0, cz1 = self._z_layer_range(self._h_z_min, self._h_z_max)
-        if cz1 <= cz0:
-            return np.ones((size, size), bool)
-        observed = np.any(grid[:, :, cz0:cz1] > 0, axis=2)
-        if not observed.any():
-            return np.ones((size, size), bool)
-        return observed
 
     def _query_2d_map_radius(self, arr_2d: np.ndarray, x: float, y: float) -> float:
         """
@@ -143,23 +117,40 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
             return 0.0
         return float(patch.max())
 
-    def _compute_h1(self) -> Union[np.ndarray, None]:
+
+    def _z_layer_range(self, z_min: float, z_max: float) -> Tuple[int, int]:
+        """Maps a world height range [z_min, z_max] to the 3D layer interval [cz0, cz1)."""
+        om = self._obstacle_map3d
+        cz0 = int((z_min - om._min_height) / om._voxel_size)
+        cz1 = int((z_max - om._min_height) / om._voxel_size) + 1
+        return max(0, cz0), min(om._height_size, cz1)
+
+    def _get_explored_2d(self, z_min: float, z_max: float) -> np.ndarray:
+        """2D projection of the 3D explored mask over [z_min, z_max] (for the 2D ValueMap).
+        Obstacle voxels are excluded so only passable explored cells are considered free.
         """
-        H1(x, y) = fraction of free layers within the passable band in [0, 1]
-        (height-axis semantic value score in its simplified 0/1 form).
-        Shares the axis convention of the 3D grid. Used by both V1 and V2.
-        """
-        grid = getattr(self._obstacle_map3d, "_states", None)
-        if grid is None:
-            grid = getattr(self._obstacle_map3d, "_grid", None)
-        if grid is None:
-            return None
-        cz0, cz1 = self._z_layer_range(self._h_z_min, self._h_z_max)
+        om = self._obstacle_map3d
+        cz0, cz1 = self._z_layer_range(z_min, z_max)
         if cz1 <= cz0:
-            return None
-        n_layers = cz1 - cz0
-        free = (grid[:, :, cz0:cz1] == 1).sum(axis=2).astype(np.float32) / n_layers
-        return np.minimum(free, 1.0)
+            return np.ones((om.size, om.size), bool)
+        observed = om.explored_area[:, :, cz0:cz1] & ~om._map[:, :, cz0:cz1]
+        return np.any(observed, axis=2)
+
+    def _free_layers_2d(self, z_min: float, z_max: float) -> Union[np.ndarray, None]:
+        """H1: fraction of (non-occupied & explored) layers within [z_min, z_max]."""
+        om = self._obstacle_map3d
+        cz0, cz1 = self._z_layer_range(z_min, z_max)
+        if cz1 <= cz0:
+            return np.ones((om.size, om.size), np.float32)
+        n = cz1 - cz0
+        free = ~om._map[:, :, cz0:cz1] & om.explored_area[:, :, cz0:cz1]
+        return np.minimum(free.sum(axis=2).astype(np.float32) / n, 1.0)
+
+    def _compute_h1(self) -> Union[np.ndarray, None]:
+        """H1 = fraction of (non-occupied & explored) layers within the passable band,
+        computed directly on the reconstructed 3D obstacle map."""
+        return self._free_layers_2d(self._h_z_min, self._h_z_max)
+
 
     def _update_value_map_impl(self, cosines: List[List[float]]) -> None:
         raise NotImplementedError
@@ -236,6 +227,7 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
 
         return policy_info
 
+
     def _score_frontiers(self, frontiers: np.ndarray) -> List[float]:
         raise NotImplementedError
 
@@ -255,16 +247,7 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         observations: Union[Dict[str, Tensor], "TensorDict"],
         frontiers: np.ndarray,
     ) -> Tuple[np.ndarray, float]:
-        """Returns the best frontier and its value based on the 2.5D value map.
-
-        Args:
-            observations (Union[Dict[str, Tensor], "TensorDict"]): The observations from
-                the environment.
-            frontiers (np.ndarray): The frontiers to choose from, array of 2D points.
-
-        Returns:
-            Tuple[np.ndarray, float]: The best frontier and its value.
-        """
+        """Returns the best frontier and its value based on the 2.5D value map."""
         # The points and values will be sorted in descending order
         sorted_pts, sorted_values = self._sort_frontiers_by_value(observations, frontiers)
         robot_xy = self._observations_cache["robot_xy"]
@@ -397,10 +380,9 @@ class ITMPolicyV1(BaseITMPolicy):
 
 
 class ITMPolicyV2(BaseITMPolicy):
-    """
-    Route 2 (surface style): lands scores from 3D surface points into 2D (x, y) buckets
-    (S: confidence-gated max, consistent with VLFM) + height-axis semantic value (H1).
-    """
+    """Route 2 (surface style): lands scores from 3D surface points into 2D (x, y)
+    buckets (S: confidence-gated max, consistent with VLFM) + height-axis
+    semantic value (H1)."""
 
     _min_valid_conf: float = 1e-4   # Per-point confidence floor (same as itm3d min_valid_conf)
 
@@ -411,10 +393,10 @@ class ITMPolicyV2(BaseITMPolicy):
         **kwargs: Any,
     ) -> None:
         super().__init__(vm_style=vm_style, *args, **kwargs)
-        # V2 surface-style state (2D (x, y) buckets; only surface points within the fixed height band)
+        # V2 surface-style state: 2D (x, y) buckets for surface points in the fixed height band
         size = self._obstacle_map3d.size
-        self._surface_max_map = np.zeros((size, size), np.float32)   # S: per-bucket semantic value score
-        self._surface_conf_map = np.zeros((size, size), np.float32)  # Per-bucket confidence (VLFM-style: higher confidence overwrites)
+        self._surface_max_map = np.zeros((size, size), np.float32)   # Per-bucket semantic value score
+        self._surface_conf_map = np.zeros((size, size), np.float32)  # Per-bucket confidence
 
     def _reset(self) -> None:
         super()._reset()
@@ -454,20 +436,14 @@ class ITMPolicyV2(BaseITMPolicy):
         fov: float,
     ) -> None:
         """
-        Lands cosine scores into 2D (x, y) buckets under confidence gating (surface points
-        within the fixed height band).
+        Lands cosine scores into 2D (x, y) buckets under confidence gating (surface
+        points within the fixed height band).
 
-        Landing-region note: V2 operates directly on the 3D point cloud (shared_pcds) -- the
-        VLVM map source is 3D back-projected surface points (there is no VLFM-style 2D depth
-        cone projection), so scores can only be landed on real surface points (filtered by the
-        height band, then bucketed on a 0.05 m pixel grid).
-
-        - S (`_surface_max_map`): per-bucket semantic value score. Fusion matches VLFM
-          (`ValueMap._fuse_new_data` `use_max_confidence=True` path): a bucket is overwritten
-          only when the current observation's confidence is higher than the stored one.
-        - Confidence (`_surface_conf_map`): per-point angular x distance confidence
-          C_3D = c_angular * c_distance (the angular term derives from the VLFM
-          `_get_confidence_mask` cos^2 confidence; the distance term follows itm3d).
+        - S (`_surface_max_map`): per-bucket semantic value score; a bucket is
+          overwritten only when the current observation's confidence is higher
+          (VLFM `use_max_confidence=True` fusion).
+        - Confidence (`_surface_conf_map`): per-point angular distance confidence
+          C_3D = c_angular * c_distance (VLFM cos^2 angular term + itm3d distance term).
         """
         if pcd is None or len(pcd) == 0:
             return
@@ -482,7 +458,7 @@ class ITMPolicyV2(BaseITMPolicy):
             return
         score = float(np.clip(np.mean(scores), 0.0, 1.0))  # Single-frame semantic value (mean over channels)
 
-        # ---- Per-point confidence (VLFM angular confidence; distance term follows itm3d) ----
+        # Per-point confidence (VLFM angular confidence; distance term follows itm3d)
         try:
             tf_episodic_to_camera = np.linalg.inv(tf_camera_to_episodic)
         except np.linalg.LinAlgError:
@@ -500,8 +476,6 @@ class ITMPolicyV2(BaseITMPolicy):
         c_angular = np.zeros_like(theta)
         in_fov = theta <= (fov / 2.0)
         c_angular[in_fov] = np.cos(theta[in_fov] / (fov / 2.0) * (np.pi / 2.0)) ** 2
-        # c_distance = np.maximum(0.0, 1.0 - dist_3d / max_depth)
-        # conf = c_angular * c_distance
         conf = c_angular
         valid = conf > self._min_valid_conf
         if not np.any(valid):
@@ -509,7 +483,7 @@ class ITMPolicyV2(BaseITMPolicy):
         pts_w = pts_w[valid]
         conf = conf[valid]
 
-        # Land surface points into (x, y) pixel buckets (vectorized np.at, no Python loop)
+        # Land surface points into (x, y) pixel buckets (vectorized, no Python loop)
         px_py = om._xy_to_px(pts_w[:, :2]).astype(int)
         in_b = (
             (px_py[:, 0] >= 0) & (px_py[:, 0] < self._surface_max_map.shape[1]) &
@@ -520,16 +494,15 @@ class ITMPolicyV2(BaseITMPolicy):
         rows, cols = px_py[in_b, 1], px_py[in_b, 0]
         pt_conf = conf[in_b]
 
-        # Aggregate the max confidence per bucket within this frame (multiple points per
-        # bucket per frame -> that bucket's observation quality for this frame)
+        # Per-frame max confidence per bucket (this bucket's observation quality)
         frame_conf = np.zeros_like(self._surface_conf_map)
         np.maximum.at(frame_conf, (rows, cols), pt_conf)
         b_rows, b_cols = np.nonzero(frame_conf)
         if len(b_rows) == 0:
             return
 
-        # Confidence-gated fusion (VLFM `_fuse_new_data` `use_max_confidence=True` path):
-        # overwrite S and update confidence only when this frame's confidence is higher.
+        # Confidence-gated fusion: overwrite S and confidence only when this frame's
+        # confidence is higher (VLFM `use_max_confidence=True` path).
         improve = frame_conf[b_rows, b_cols] > self._surface_conf_map[b_rows, b_cols]
         if improve.any():
             idx_r, idx_c = b_rows[improve], b_cols[improve]
