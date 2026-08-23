@@ -61,33 +61,26 @@ habitat_baselines:
       text_prompt: "Seems like there is a target_object ahead."
       visualize: False
       init_turn_steps: 12
-
       min_depth: 0.5
       max_depth: 5.0
+
+      pointnav_stop_radius: 0.90 # 0.90
+
       om_style: "probabilistic" # probabilistic/ obstacle
       voxel_size: 0.05
       min_obstacle_height: 0.15
       max_obstacle_height: 1.50
-      agent_radius: 0.18
-      nav_slice_height: 0.30
-      agent_height: 0.88
       hole_area_thresh: 100000
-      obstacle_map_area_threshold: 1.5
       log_odds_occ: 2.0
       log_odds_free: -2.0
       occ_threshold: 0.0
       free_threshold: 0.0
-      sigma_tar: 0.60
-      sigma_sce: 0.15
-      tau: 0.15              
-      near_field_dist: 1.0
-      near_field_sigma_scale: 0.8
-      use_raw_nlp: False
-      enable_retry: False
-      pcd_window_size: 8
-      fuse_voxel_size: 0.02
-      fuse_max_points: 200000
-      pointnav_stop_radius: 0.30
+      obstacle_map_area_threshold: 1.5
+      ## Dilation / structuring element 
+      agent_radius: 0.18
+      agent_height: 0.88
+      nav_slice_height: 0.30
+
       vm_style: "region"  # "region" (V1) / "surface" (V2)
       h_lam: 0.3
       h_norm_max: 1.0
@@ -96,6 +89,24 @@ habitat_baselines:
       query_radius_m: 0.5
       query_z_min: 0.15
       query_z_max: 1.50
+
+      sigma_tar: 0.70
+      sigma_sce: 0.15
+      tau: 0.15
+      near_field_dist: 1.0
+      near_field_sigma_scale: 0.8
+      # TSP3D Input Processing
+      use_raw_nlp: False
+      enable_retry: False
+      pcd_window_size: 8
+      fuse_voxel_size: 0.02
+      fuse_max_points: 200000
+      # Anti-hallucination fallback
+      enable_fb: True
+      fb_near_radius: 2.5
+      fb_hysteresis: 5
+      fb_suspicious_hysteresis: 2
+      fb_suspicious_conf: 0.5
 
     ppo:
       clip_param: 0.2
