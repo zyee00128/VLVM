@@ -16,7 +16,6 @@ from omegaconf import DictConfig, OmegaConf
 from vlfm.utils.geometry_utils import xyz_yaw_to_tf_matrix
 from vlfm.vlm.detections import ObjectDetections
 from vlfm.policy.tsp3d_objectnav_policy import TSP3DObjectNavPolicy, VLVMConfig
-from vlfm.policy.itm3d_policy import ITM3DPolicyV1
 from vlfm.policy.itm_policy import ITMPolicyV1, ITMPolicyV2
 
 HM3D_ID_TO_NAME = [
@@ -265,14 +264,6 @@ class SuperOracleFBEPolicy(Habitat3DMixin, TSP3DObjectNavPolicy):
             rnn_hidden_states=rnn_hidden_states,
             policy_info=[self._policy_info],
         )
-
-
-@baseline_registry.register_policy
-class HabitatITM3DPolicy(Habitat3DMixin, ITM3DPolicyV1):
-    """3D semantic value mapping: cosine scores projected into a sparse 3D
-    semantic voxel grid with confidence-weighted fusion, space carving, and
-    distant voxel pruning."""
-    pass
 
 
 @baseline_registry.register_policy

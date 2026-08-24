@@ -114,7 +114,7 @@ class TSPHead(nn.Module):
         self.keep_conv = nn.ModuleList([
             ME.MinkowskiConvolution(out_channels, 1, kernel_size=1, bias=True, dimension=3),
             ME.MinkowskiConvolution(out_channels, 1, kernel_size=1, bias=True, dimension=3)
-        ])
+        ]) # 用于剪枝的分数评估卷积列表
         self.pos_embed = PositionEmbeddingLearned(3, 128)
         
         # Build a three-layer bi-directional transformer subnet 
@@ -208,7 +208,6 @@ class TSPHead(nn.Module):
 
         return x
 
-
     def _nms(self, bboxes, scores, img_meta):
             """Multi-class nms for a single scene.
             Args:
@@ -270,25 +269,6 @@ class TSPHead(nn.Module):
                 origin=(.5, .5, .5))
 
             return nms_bboxes, nms_scores, nms_labels
-
-    def init_weights(self):
-        nn.init.normal_(self.bbox_conv.kernel, std=.01)
-        nn.init.normal_(self.cls_conv.kernel, std=.01)
-        nn.init.constant_(self.cls_conv.bias, bias_init_with_prob(.01))
-
-        for i in range(len(self.keep_conv)):
-            nn.init.normal_(self.keep_conv[i].kernel, std=.01)
-
-        for n, m in self.named_modules():
-            if ('bbox_conv' not in n) and ('cls_conv' not in n) \
-                and ('keep_conv' not in n) and ('loss' not in n):
-                if isinstance(m, ME.MinkowskiConvolution):
-                    ME.utils.kaiming_normal_(
-                        m.kernel, mode='fan_out', nonlinearity='relu')
-
-                if isinstance(m, ME.MinkowskiBatchNorm):
-                    nn.init.constant_(m.bn.weight, 1)
-                    nn.init.constant_(m.bn.bias, 0)       
 
 
     @staticmethod
@@ -360,6 +340,7 @@ class TSPHead(nn.Module):
             results.append(result)
         return results
 
+
     def _forward_single(self, x):
         reg_final = self.bbox_conv(x).features
         reg_distance = torch.exp(reg_final[:, 3:6])
@@ -392,18 +373,29 @@ class TSPHead(nn.Module):
         prune_inference = None  
         if img_metas is None:
             # Perform robustness completion for img_metas
-            img_metas = [{'box_type_3d': DepthInstance3DBoxes} 
+            img_metas = [{'box_type_3d': DepthInstance3DBoxes}
                         for _ in range(len(inputs[0].decomposition_permutations))]
 
         prune_threshold_layer1 = sigma_sce if sigma_sce is not None else self.prune_threshold[1]
         prune_threshold_layer0 = (sigma_sce * (self.prune_threshold[0] / self.prune_threshold[1])) if sigma_sce is not None else self.prune_threshold[0]
         com_threshold = tau if tau is not None else self.com_threshold
+
+        # ---- Pruning / completion behavior diagnostics ----
+        diag = {
+            "input_voxels": [len(inputs[k]) for k in range(len(inputs))],
+            "prune_layer1_before": None, "prune_layer1_after": None, "pruned_all_layer1": False,
+            "prune_layer0_before": None, "prune_layer0_after": None, "pruned_all_layer0": False,
+            "com_sampled": None, "com_valid": None, "com_kept": None, "com_added": None, "tau": com_threshold,
+            "out_voxels": None, "n_boxes": 0, "max_score": 0.0,
+        }
         
         for i in range(len(inputs) - 1, -1, -1):
             if i == 1:
                 # Execute Layer 1 language-guided pruning
+                diag["prune_layer1_before"] = len(x)
                 x = self._prune_inference(x, prune_inference, i, prune_threshold=prune_threshold_layer1) 
                 if x is not None:
+                    diag["prune_layer1_after"] = len(x)
                     # x = self.__getattr__(f'up_block_{i + 1}')(x)
                     x = getattr(self, f'up_block_{i + 1}')(x)
                     coords = x.coordinates.float()
@@ -413,17 +405,21 @@ class TSPHead(nn.Module):
                                               coordinate_manager=x.coordinate_manager)
                     x = x + x_level
                 else:
+                    diag["pruned_all_layer1"] = True
+                    diag["prune_layer1_after"] = 0
                     logging.warning("[TSPHead] All features pruned at Layer 1. Returning robust empty predictions.")
                     return [(img_meta['box_type_3d'](torch.zeros((0, 6), device=inputs[0].device), 
                             box_dim=6, with_yaw=False), 
                             torch.zeros((0,), device=inputs[0].device), 
                             torch.zeros((0,), dtype=torch.long, device=inputs[0].device))
-                            for img_meta in img_metas], 0.0
+                            for img_meta in img_metas], 0.0, diag
             
             elif i == 0:
                 # Execute Layer 0 dynamic language-guided pruning
+                diag["prune_layer0_before"] = len(x)
                 x = self._prune_inference(x, prune_inference, i, prune_threshold=prune_threshold_layer0)                
                 if x is not None:
+                    diag["prune_layer0_after"] = len(x)
                     # x = self.__getattr__(f'up_block_{i + 1}')(x)
                     x = getattr(self, f'up_block_{i + 1}')(x)
                     coords = x.coordinates.float()
@@ -433,16 +429,20 @@ class TSPHead(nn.Module):
                                               coordinate_manager=x.coordinate_manager)
                     x_ori = x + x_level
                 else:
+                    diag["pruned_all_layer0"] = True
+                    diag["prune_layer0_after"] = 0
                     logging.warning("[TSPHead] All features pruned at Layer 0. Returning robust empty predictions.")
                     return [(img_meta['box_type_3d'](torch.zeros((0, 6), device=inputs[0].device), 
                             box_dim=6, with_yaw=False), 
                             torch.zeros((0,), device=inputs[0].device), 
                             torch.zeros((0,), dtype=torch.long, device=inputs[0].device)) 
-                            for img_meta in img_metas], 0.0
-        
+                            for img_meta in img_metas], 0.0, diag
+
+                # Shape Completion
                 sampled_coords, sampled_features, original_indices = [], [], []
                 # Restore multi-scale feature voxels that failed to reconstruct 
-                # due to line-of-sight blind spots, strong light refraction, or partial physical occlusion
+                # due to line-of-sight blind spots, strong light refraction, 
+                # or partial physical occlusion
                 for permutation in inputs[0].decomposition_permutations:
                     original_indices.extend(permutation.cpu().numpy())
                     if len(permutation) > self.num_samples_com:
@@ -463,9 +463,11 @@ class TSPHead(nn.Module):
                         sampled_coords.append(padded_coords)
                 sampled_features = torch.stack(sampled_features)    # Merge feature list
                 sampled_coords = torch.stack(sampled_coords)        # Merge coordinate list
-                
+                diag["com_sampled"] = int(sampled_features.shape[0])
+
                 # Utilize cross-modal bi-directional attention awareness 
-                # to align sparse coordinates with language features, generating candidate foreground representations
+                # to align sparse coordinates with language features, 
+                # generating candidate foreground representations
                 sampled_features, text_feats = self.com_trans(
                     vis_feats=sampled_features.contiguous(),
                     pos_feats=self.pos_embed(sampled_coords[:, :, 1:] * self.voxel_size).transpose(1, 2).contiguous(),
@@ -476,16 +478,19 @@ class TSPHead(nn.Module):
                 # Compute semantic score logits for missing candidates
                 com_pred = self.com_cls(sampled_features.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
                 valid_mask = sampled_coords[:, :, 0] != -1
+                diag["com_valid"] = int(valid_mask.sum().item())
                 sampled_features = sampled_features[valid_mask]
                 sampled_coords = sampled_coords[valid_mask]
                 com_pred = com_pred[valid_mask].squeeze(-1)
                 com_mask = com_pred.sigmoid() > com_threshold  # Extract candidates with language scores higher than the threshold
+                diag["com_kept"] = int(com_mask.sum().item())
                 sampled_features = sampled_features[com_mask]
                 sampled_coords = sampled_coords[com_mask]
                 # Eliminate duplicate voxel hash points that already exist in space to avoid collisions
                 matches = (sampled_coords.unsqueeze(1) == x_ori.coordinates.unsqueeze(0)).all(dim=-1).any(dim=1)
                 sampled_features = sampled_features[~matches]
                 sampled_coords = sampled_coords[~matches]
+                diag["com_added"] = int(sampled_features.shape[0])
 
                 # Interpolate and extract original coordinates' potential physical features
                 x_com_features = x.features_at_coordinates(sampled_coords.float())
@@ -497,7 +502,7 @@ class TSPHead(nn.Module):
                                     coordinate_manager=x_ori.coordinate_manager, 
                                     tensor_stride=x_ori.tensor_stride, 
                                     device=x_ori.device)
-            
+
             if i > 0:
                 sampled_coords, sampled_features = [], []
                 len_x = []
@@ -531,7 +536,7 @@ class TSPHead(nn.Module):
                         sampled_coords.append(x.coordinates[permutation])                        
                 sampled_features = torch.stack(sampled_features)
                 sampled_coords = torch.stack(sampled_coords)
-                
+
                 # Perform bi-directional feature attention decoupling calculations 
                 # on voxel positions and language query features
                 sampled_features, text_feats = self.keep_trans[i - 1](
@@ -540,7 +545,7 @@ class TSPHead(nn.Module):
                     padding_mask=sampled_coords[:, :, 0] == -1,
                     text_feats=text_feats,
                     text_padding_mask=text_attention_mask)
-                
+
                 valid_mask = sampled_coords[:, :, 0] != -1
                 sampled_features = sampled_features[valid_mask]
                 sampled_coords = sampled_coords[valid_mask]
@@ -557,13 +562,19 @@ class TSPHead(nn.Module):
             x = getattr(self, f'lateral_block_{i}')(x)
             if i == 0:
                 out = getattr(self, f'out_block_{i}')(x)
-        
+
         start_time = time.time()
         out = self.fuse(out, text_feats[:, 0])
+        diag["out_voxels"] = len(out)
         bbox_pred, cls_pred, point = self._forward_single(out)
         results = self._get_bboxes([bbox_pred], [cls_pred], [point], img_metas)
+        if len(results) > 0:
+            _, res_scores, _ = results[0]
+            diag["n_boxes"] = int(res_scores.shape[0])
+            if res_scores.shape[0] > 0:
+                diag["max_score"] = float(res_scores.max().item())
         head_time = time.time() - start_time
-        return results, head_time
+        return results, head_time, diag
 
     def forward(self, x, text_feats, text_attention_mask, 
                 img_metas=None, pc=None, gt_bboxes=None,

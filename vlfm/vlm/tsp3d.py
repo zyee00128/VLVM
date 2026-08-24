@@ -84,7 +84,7 @@ class TSP3D:
             List[Dict[str, Any]]: Detected 3D bounding boxes and scores.
         """
         if len(pcd) == 0:
-            return []
+            return [], {}
 
         if use_raw_nlp:
             # Multi-class synonym merging caption
@@ -108,7 +108,7 @@ class TSP3D:
         }
         
         with torch.inference_mode():
-            bbox_results, _, _, times = self.model(inputs)
+            bbox_results, _, diagnostics, times = self.model(inputs)
         # Parse inference results and convert format to adapt to the policy layer
         # bbox_results corresponds to the mmdet3d output structure (bboxes, scores, labels)
         formatted_detections = []
@@ -156,7 +156,7 @@ class TSP3D:
         else:
             print(f"[TSP3D Server] bbox_results empty (all voxels likely pruned)! sigma_sce={sigma_sce}, text='{processed_text}'")
                         
-        return formatted_detections
+        return formatted_detections, diagnostics
 
     def segment_bbox(self, pcd: np.ndarray, box_3d: np.ndarray) -> np.ndarray:
         if len(pcd) == 0:
@@ -195,7 +195,7 @@ class TSP3DClient:
             "use_raw_nlp": use_raw_nlp
         }
         response = send_request(self.url, **payload)
-        return response.get("detections", [])
+        return response.get("detections", []), response.get("diagnostics", {})
 
 if __name__ == "__main__":
     import argparse
@@ -222,8 +222,8 @@ if __name__ == "__main__":
                 tau = payload.get("tau", 0.15)
                 use_raw_nlp = payload.get("use_raw_nlp", True)
 
-                detections = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_raw_nlp)
-                return {"detections": detections}
+                detections, diagnostics = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_raw_nlp)
+                return {"detections": detections, "diagnostics": diagnostics}
             return {}
 
     tsp3d_server = TSP3DServer()

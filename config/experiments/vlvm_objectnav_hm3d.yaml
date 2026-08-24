@@ -106,7 +106,7 @@ habitat_baselines:
       fb_near_radius: 2.5
       fb_hysteresis: 5
       fb_suspicious_hysteresis: 2
-      fb_suspicious_conf: 0.5
+      fb_suspicious_conf: 0.75
 
     ppo:
       clip_param: 0.2

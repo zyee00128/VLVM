@@ -86,7 +86,7 @@ class BeaUTyDETR(nn.Module):
 
         if not self.training:
             start_time = time.time()
-            bbox_list, head_time = self.head.forward_test(
+            bbox_list, head_time, diagnostics = self.head.forward_test(
                     x, text_feats, text_attention_mask, img_metas,
                     sigma_sce=sigma_sce, tau=tau
             )
@@ -95,7 +95,7 @@ class BeaUTyDETR(nn.Module):
                 for bboxes, scores, labels in bbox_list
             ]
             fusion_time = time.time() - start_time
-            return bbox_results, {'loss':0.}, 0., [visual_time,text_time,fusion_time-head_time,head_time]
+            return bbox_results, {'loss':0.}, diagnostics, [visual_time,text_time,fusion_time-head_time,head_time]
 
         losses = self.head.forward_train(x,text_feats, text_attention_mask, gt_bboxes, gt_labels, gt_all_bbox_new, auxi_bbox, img_metas)
         losses.update({'loss':sum(value for key, value in losses.items() if '_loss' in key)})

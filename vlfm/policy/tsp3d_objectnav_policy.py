@@ -57,21 +57,21 @@ class TSP3DObjectNavPolicy(BasePolicy):
             occ_threshold: float = 0.0,
             free_threshold: float = 0.0,
             sigma_sce: float = 0.15,
-            sigma_tar: float = 0.25,
-            tau: float = 0.10,
-            near_field_dist: float = 0.8,
-            near_field_sigma_scale: float = 0.3,
-            use_raw_nlp: bool = True,
+            sigma_tar: float = 0.70,
+            tau: float = 0.15,
+            near_field_dist: float = 1.0,
+            near_field_sigma_scale: float = 0.8,
+            use_raw_nlp: bool = False,
             enable_retry: bool = False,
             pcd_window_size: int = 8,
             fuse_voxel_size: float = 0.02,
             fuse_max_points: int = 200000,
-            pointnav_stop_radius: float = 0.25,
-            enable_fb: bool = False,
+            pointnav_stop_radius: float = 0.30,
+            enable_fb: bool = True,
             fb_near_radius: float = 2.5,
             fb_hysteresis: int = 5,
             fb_suspicious_hysteresis: int = 2,
-            fb_suspicious_conf: float = 0.5,
+            fb_suspicious_conf: float = 0.75,
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -237,6 +237,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
         robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
 
         # Suspicious if the detection is far or low-confidence (VLFM range_id != 1 analogue).
+        # Two-tier gating: with fb_suspicious_conf > sigma_tar, detections in
+        # [sigma_tar, fb_suspicious_conf) are marked suspicious and deleted after
+        # `fb_suspicious_hysteresis` (2) near-field frames without a fresh merge
+        # (the false-positive-heavy marginal band), while >= fb_suspicious_conf
+        # detections are trusted (deleted after `fb_hysteresis`=5 frames).
         if centroid.shape[0] >= 3:
             detect_dist = float(np.linalg.norm(centroid - robot_xyz))
         else:
@@ -443,6 +448,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         return fused_local
 
+
     def _query_tsp3d_client(
         self,
         aligned_pcd: np.ndarray,
@@ -454,7 +460,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         close to surfaces.
         """
         if len(aligned_pcd) == 0:
-            return []
+            return [], {}
         
         camera_height = getattr(self, "_camera_height", 0.88)
         camera_pos_local = np.array([0.0, 0.0, camera_height])
@@ -468,7 +474,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             scale = max(self._near_field_sigma_scale, min_dist / self._near_field_dist)
             dynamic_sigma_sce = self._sigma_sce * scale
 
-        raw_preds = self._tsp3d_client.predict(
+        raw_preds, diagnostics = self._tsp3d_client.predict(
             pcd=aligned_pcd,
             text=target_query,
             sigma_tar=self._sigma_tar,
@@ -482,7 +488,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         # ~48% of queries.
         if self._enable_retry and len(raw_preds) == 0 and dynamic_sigma_sce > 0.02:
             fallback_sce = max(0.01, dynamic_sigma_sce * 0.3)
-            raw_preds = self._tsp3d_client.predict(
+            raw_preds, diagnostics = self._tsp3d_client.predict(
                 pcd=aligned_pcd,
                 text=target_query,
                 sigma_tar=self._sigma_tar,
@@ -491,7 +497,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 use_raw_nlp=self._nlp_mode
             )
 
-        return raw_preds
+        return raw_preds, diagnostics
 
     def _get_target_object_location(self, position: np.ndarray) -> Union[None, np.ndarray]:
         """
@@ -569,7 +575,23 @@ class TSP3DObjectNavPolicy(BasePolicy):
         # Multi-frame sliding-window fusion: transform historical world-frame point
         # clouds into the current camera-canonical coordinate frame
         fused_pcd_local = self._fuse_temporal_pcd_window(pcd)
-        raw_detections = self._query_tsp3d_client(fused_pcd_local, self._target_object)
+        raw_detections, tsp3d_diag = self._query_tsp3d_client(fused_pcd_local, self._target_object)
+
+        # ---- Pruning / completion behavior diagnostics (read-only) ----
+        if tsp3d_diag:
+            d = tsp3d_diag
+            def _ratio(a, b):
+                return f"{a}->{b}" + (f"({b / a:.0%})" if a else "")
+            print(
+                f"[TSP3D Diag] step={self._num_steps} target='{self._target_object}' "
+                f"input={d.get('input_voxels')} "
+                f"pr1={_ratio(d.get('prune_layer1_before'), d.get('prune_layer1_after'))} "
+                f"pr0={_ratio(d.get('prune_layer0_before'), d.get('prune_layer0_after'))} "
+                f"com={d.get('com_sampled')}->{d.get('com_valid')}->{d.get('com_kept')}->{d.get('com_added')} "
+                f"(tau={d.get('tau')}) out={d.get('out_voxels')} "
+                f"boxes={d.get('n_boxes')} maxscore={d.get('max_score'):.3f}",
+                flush=True,
+            )
 
         # Restore predicted boxes to global coordinates (inverse rotation + translation)
         valid_raw = [det for det in raw_detections if det.get("box_3d") is not None]
@@ -799,20 +821,20 @@ class VLVMConfig:
     fuse_voxel_size: float = 0.02     # Voxel downsample size (m) for window fusion; larger = fewer points, faster, coarser.
     fuse_max_points: int = 200000     # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
     # Phase 5b: TSP3D Perception & Visual Grounding
-    sigma_tar: float = 0.25           # Target confidence threshold; higher = stricter/fewer detections, lower = more detections but more false positives.
+    sigma_tar: float = 0.70           # Target confidence threshold (准入); higher = stricter/fewer detections, lower = more detections but more false positives. V4.1 网格确认 0.70 最优.
     sigma_sce: float = 0.15           # TGP scene voxel retention threshold; higher = more aggressive pruning (fewer hallucinations, may miss targets).
-    tau: float = 0.10                 # Soft-pruning temperature; higher = smoother/looser pruning, lower = harder thresholding.
+    tau: float = 0.15                 # Soft-pruning temperature; higher = smoother/looser pruning, lower = harder thresholding.
     near_field_dist: float = 1.0      # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
     near_field_sigma_scale: float = 0.8  # Minimum voxel retention ratio near surfaces; higher = keep more voxels near obstacles.
-    use_raw_nlp: bool = True          # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
+    use_raw_nlp: bool = False         # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
     enable_retry: bool = False        # Retry once on empty TSP3D results with reduced sigma_sce; disabled by default (measured recovery 0.05%).
 
     # Phase 6: Anti-hallucination fallback
-    enable_fb: bool = False             # Delete confirmed-false centroids near the FOV cone -> fallback to explore.
+    enable_fb: bool = True              # Delete confirmed-false centroids near the FOV cone -> fallback to explore.
     fb_near_radius: float = 2.5         # Near-field confirmation cone radius (m); VLFM uses max_depth*0.5 (2.5m @ max_depth=5).
     fb_hysteresis: int = 5              # Trusted centroid: consecutive near-field frames without a fresh merge before deletion.
     fb_suspicious_hysteresis: int = 2   # Suspicious centroid (far/low-conf): fewer frames before deletion.
-    fb_suspicious_conf: float = 0.5     # TSP3D confidence below this marks a detection suspicious (range_id != 1 analogue).
+    fb_suspicious_conf: float = 0.75    # 可信分界 (两档分级, 须 > sigma_tar 才激活): [sigma_tar, fb_suspicious_conf) 的检测标记可疑、2 帧近场未重检测即删; 0.75 为最保守激活档 (V4.1 定稿).
 
     @classmethod  # type: ignore
     @property
