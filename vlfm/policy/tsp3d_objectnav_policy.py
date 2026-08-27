@@ -1,7 +1,6 @@
 import os
-from collections import deque
 from dataclasses import dataclass, fields
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from torch import Tensor
@@ -19,15 +18,12 @@ from vlfm.mapping.obstacle_map import ObstacleMap3D, ProbabilisticGrid
 from vlfm.vlm.blip2itm import BLIP2ITMClient
 from vlfm.vlm.tsp3d import TSP3DClient
 from vlfm.vlm.detections import ObjectDetections
+from vlfm.tsp3d_models.utils.pipeline import TSP3DInputPreprocessor
 
 PROMPT_SEPARATOR = "|"
 
 class TSP3DObjectNavPolicy(BasePolicy):
-    """
-    3D Active Semantic Target Navigation Policy utilizing TSP3D.
-    Localizes target objects directly on 3D point clouds and sparse voxels,
-    while building geometric and semantic representations to guide active exploration.
-    """
+    """TSP3D-based 3D active semantic target navigation policy."""
     _target_object: str = ""
     _policy_info: Dict[str, Any] = {}
     _observations_cache: Dict[str, Any] = {}
@@ -63,9 +59,27 @@ class TSP3DObjectNavPolicy(BasePolicy):
             near_field_sigma_scale: float = 0.8,
             use_raw_nlp: bool = False,
             enable_retry: bool = False,
+            use_world_map: bool = False,
+            wm_voxel_size: float = 0.02,
+            wm_radius: float = 6.0,
+            wm_min_view_disp: float = 0.15,
+            wm_min_view_yaw: float = 15.0,
+            wm_max_voxels: int = 400000,
+            wm_max_frames: Optional[int] = 8, 
+            distance_sample: bool = False,
+            near_dist: float = 1.5,
+            mid_dist: float = 3.0,
+            near_voxel: float = 0.01,
+            mid_voxel: float = 0.02,
+            far_voxel: float = 0.05,
             pcd_window_size: int = 8,
             fuse_voxel_size: float = 0.02,
             fuse_max_points: int = 200000,
+            cam_radius: Optional[float] = None,
+            cam_min_view_disp: float = 0.0,
+            cam_min_view_yaw: float = 0.0,
+            cap_style: str = "random",
+            send_voxel_size: Optional[float] = None,
             pointnav_stop_radius: float = 0.30,
             enable_fb: bool = True,
             fb_near_radius: float = 2.5,
@@ -103,10 +117,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._near_field_sigma_scale = near_field_sigma_scale
         self._nlp_mode = use_raw_nlp
         self._enable_retry = enable_retry
-        # Temporal PCD sliding window (multi-frame fusion for TSP3D)
-        self._pcd_window: deque = deque(maxlen=max(pcd_window_size, 1))
-        self._fuse_voxel_size = fuse_voxel_size
-        self._fuse_max_points = fuse_max_points
         self._pointnav_stop_radius = pointnav_stop_radius
         self._init_step_count = 0
         self._num_steps = 0
@@ -125,6 +135,34 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._fb_hysteresis = fb_hysteresis
         self._fb_suspicious_hysteresis = fb_suspicious_hysteresis
         self._fb_suspicious_conf = fb_suspicious_conf
+
+        # Unified input-adaptation pipeline (4.3c): camera 8-frame window (baseline)
+        # / world-frame accumulation, switched by use_world_map; send-side
+        # post-processing (distance sampling / point cap) is shared by both routes.
+        self._use_world_map = use_world_map
+        self._preprocessor = TSP3DInputPreprocessor(
+            fusion_style="world" if use_world_map else "camera",
+            window_size=pcd_window_size,
+            fuse_voxel_size=fuse_voxel_size,
+            map_voxel_size=wm_voxel_size,
+            map_radius=wm_radius,
+            min_view_disp=wm_min_view_disp,
+            min_view_yaw=np.deg2rad(wm_min_view_yaw),
+            max_map_voxels=wm_max_voxels,
+            map_max_frames=wm_max_frames,
+            max_points=fuse_max_points,
+            cam_radius=cam_radius,
+            cam_min_view_disp=cam_min_view_disp,
+            cam_min_view_yaw=np.deg2rad(cam_min_view_yaw),
+            cap_style=cap_style,
+            send_voxel_size=send_voxel_size,
+            use_distance_sampling=distance_sample,
+            near_dist=near_dist,
+            mid_dist=mid_dist,
+            near_voxel=near_voxel,
+            mid_voxel=mid_voxel,
+            far_voxel=far_voxel,
+        )
 
         # 3D visual grounding and vision-language evaluation clients
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
@@ -174,9 +212,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             )
 
     def _reset(self) -> None:
-        """
-        Resets target memories, step counters, pointnav models, and 3D occupancy maps.
-        """
+        """Reset memories, step counters, pointnav model, and 3D occupancy map."""
         self._target_object = ""
         self._init_step_count = 0
         self._num_steps = 0
@@ -189,17 +225,14 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._last_target_coord = None
         self._pointnav_policy.reset()
         self._obstacle_map3d.reset()
-        self._pcd_window.clear()
+        self._preprocessor.reset()
         self._did_reset = True
 
     # ==========================================================================
     # === Input & Mapping Module ===
     # ==========================================================================
     def _pre_step(self, observations: "TensorDict", masks: Tensor) -> None:
-        """
-        Pre-step initialization. Triggers reset on episode termination,
-        caches observation data, and resets policy logging dict.
-        """
+        """Reset on episode end, cache observations, clear logging dict."""
         assert masks.shape[1] == 1, "Currently only supporting single-environment instances."
         if self._did_reset or masks[0] == 0:
             if not self._did_reset:
@@ -213,35 +246,19 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._policy_info = {}
 
     def _cache_observations(self, observations: "TensorDict") -> None:
-        """
-        Extracts and normalizes rgb, depth, and camera extrinsics from raw observations.
-        Must be implemented by environment-specific wrappers or subclasses.
-        """
+        """Extract/normalize rgb, depth, extrinsics; implemented by subclasses."""
         raise NotImplementedError
 
     def _accumulate_3d_target_memory(self, target_class: str, centroid: np.ndarray, confidence: float = 1.0) -> None:
-        """
-        Registers detected 3D target centroids into persistent memory.
-        A detection is written into memory immediately (locking it in for navigation);
-        repeated observations within 0.5m are merged via EMA spatial consensus.
-
-        Each entry also carries anti-hallucination fallback state (VLFM `update_explored`
-        aligned): a `suspicious` flag (far `>max_depth*0.95` or low TSP3D confidence,
-        the centroid analogue of VLFM `range_id != 1`) and a near-field miss counter.
-        A fresh EMA merge resets the counter (evidence the target is real); drift-only
-        (hallucinated) boxes can never reset it and are deleted near the FOV cone
-        (see `_anti_hallucination_fallback`) -> back to explore.
-        """
+        """Write detection into memory; EMA-merge within 0.5m; track suspicious
+        (far/low-conf) + near-miss counter — fresh merge resets it, so drift-only
+        hallucinated boxes get deleted near the FOV cone -> explore."""
         robot_xy = self._observations_cache.get("robot_xy", np.zeros(2))
         robot_yaw = self._observations_cache.get("robot_heading", 0.0)
         robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
 
-        # Suspicious if the detection is far or low-confidence (VLFM range_id != 1 analogue).
-        # Two-tier gating: with fb_suspicious_conf > sigma_tar, detections in
-        # [sigma_tar, fb_suspicious_conf) are marked suspicious and deleted after
-        # `fb_suspicious_hysteresis` (2) near-field frames without a fresh merge
-        # (the false-positive-heavy marginal band), while >= fb_suspicious_conf
-        # detections are trusted (deleted after `fb_hysteresis`=5 frames).
+        # Suspicious = far or low-conf (VLFM range_id != 1 analogue); two-tier gating:
+        # [sigma_tar, fb_suspicious_conf) deleted after 2 near-field misses, >= conf trusted (5).
         if centroid.shape[0] >= 3:
             detect_dist = float(np.linalg.norm(centroid - robot_xyz))
         else:
@@ -258,20 +275,18 @@ class TSP3DObjectNavPolicy(BasePolicy):
         dists = np.linalg.norm(existing_centroids - centroid, axis=1)
         closest_idx = np.argmin(dists)
 
-        # Merge observations if within 0.5m using EMA smoothing
+        # EMA-merge observations within 0.5m
         if dists[closest_idx] < 0.5:
             self._target_3d_memory[target_class][closest_idx] = (
                 0.8 * self._target_3d_memory[target_class][closest_idx] + 0.2 * centroid
             )
-            # Repeated consensus of the same world-frame location across frames is
-            # itself strong evidence: hallucinated boxes drift and cannot merge.
+            # Cross-frame consensus is strong evidence; hallucinated boxes drift and can't merge.
             num_obs, _, _ = self._target_verify_state[target_class][closest_idx]
             num_obs += 1
             self._target_verify_state[target_class][closest_idx] = (
                 num_obs, robot_xy.copy(), robot_yaw
             )
-            # A fresh merge is fresh evidence the target is real: reset the near-field
-            # miss counter (drift-only hallucinated boxes can never reset it).
+            # Fresh merge = real target: reset near-miss counter (drift-only boxes can't).
             self._target_fallback_state[target_class][closest_idx]["near_miss"] = 0
         else:
             self._target_3d_memory[target_class].append(centroid)
@@ -279,26 +294,15 @@ class TSP3DObjectNavPolicy(BasePolicy):
             self._target_fallback_state[target_class].append({"suspicious": suspicious, "near_miss": 0})
 
     def _anti_hallucination_fallback(self, tf_camera_to_episodic: np.ndarray, max_depth: float) -> None:
-        """
-        VLFM `update_explored` aligned anti-hallucination fallback (centroid version).
+        """VLFM-aligned anti-hallucination fallback (centroid version).
 
-        Every step (including navigate), for each remembered target centroid that now
-        lies inside the near-field FOV confirmation cone (radius `fb_near_radius`,
-        default = max_depth*0.5 = 2.5m), if there is no *fresh* re-detection (which would
-        have reset its near-miss counter via the EMA merge), increment its miss counter.
-        Once a centroid exceeds its hysteresis threshold (suspicious: low; trusted:
-        higher), it is deleted. When a target's memory is emptied,
-        `_get_target_object_location()` returns None -> the policy falls back to explore
-        (same chain as VLFM: delete -> has_object False -> explore).
-
-        Protection: fresh merges reset the counter, so true targets that are re-detected
-        when approached are never deleted; only drift-only (hallucinated) boxes are.
-        """
+        Increment the miss counter of centroids inside the near-field FOV cone that got
+        no fresh re-detection; delete past the hysteresis threshold (suspicious: low,
+        trusted: high). Fresh merges reset the counter, so only drift-only (hallucinated)
+        boxes are ever deleted -> fall back to explore."""
         camera_pos = tf_camera_to_episodic[:3, 3]
         camera_yaw = extract_yaw(tf_camera_to_episodic)
-        # VLFM-aligned: derive the horizontal FOV from the (sensor-derived) focal
-        # length so the confirmation cone matches the actual camera frustum, instead
-        # of relying on the default `fov_angle` (which may differ from the sensor hfov).
+        # hFOV from sensor-derived focal length so the cone matches the actual frustum.
         cone_fov = get_fov(self._fx, self._depth_image_shape[1])
         near_radius = self._fb_near_radius
 
@@ -313,7 +317,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             keep_c, keep_v, keep_s = [], [], []
 
             for idx, centroid in enumerate(centroids):
-                # Is this centroid inside the near-field confirmation cone right now?
+                # Inside the near-field confirmation cone?
                 if centroid.shape[0] >= 3:
                     query_pt = centroid.reshape(1, 3)
                 else:
@@ -339,7 +343,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             self._target_verify_state[target_class] = keep_v
             self._target_fallback_state[target_class] = keep_s
 
-        # Drop emptied target classes (no target -> _get_target_object_location returns None -> explore)
+        # Drop emptied classes (no target -> explore)
         for target_class in list(self._target_3d_memory.keys()):
             if len(self._target_3d_memory[target_class]) == 0:
                 del self._target_3d_memory[target_class]
@@ -356,10 +360,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         min_depth: float,
         max_depth: float,
     ) -> np.ndarray:
-        """
-        Projects raw RGB-D arrays into colored 3D point cloud coordinates in the
-        episodic world frame, returning an array of (N, 6) [x, y, z, r, g, b].
-        """
+        """Project RGB-D into a colored world-frame point cloud (N, 6)."""
         H, W = depth.shape[:2]
 
         if self._cached_grid_size != (H, W) or self._cached_grid_size is None:
@@ -392,9 +393,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         return np.hstack([pts_w, colors])
 
     def _get_shared_pcd(self, i: int) -> np.ndarray:
-        """
-        Returns the i-th shared back-projected point cloud (world frame, (N, 6)).
-        """
+        """Return the i-th shared back-projected world-frame cloud (N, 6)."""
         shared_pcds = self._observations_cache.get("shared_pcds")
         if shared_pcds is not None and i < len(shared_pcds):
             return shared_pcds[i]
@@ -403,62 +402,12 @@ class TSP3DObjectNavPolicy(BasePolicy):
             rgb, depth, fx, fy, tf, min_depth, max_depth
         )
 
-    def _fuse_temporal_pcd_window(self, pcd_world: np.ndarray) -> np.ndarray:
-        """
-        Fuses a temporal sliding window of world-frame colored point clouds
-        into the current camera-canonical frame for TSP3D inference.
-
-        Accumulates world-frame point clouds over a sliding window, re-projects the
-        whole window into the current camera-canonical coordinate frame, then
-        voxel-downsamples to bound the point count. This gives TSP3D a much more
-        complete local geometry than a single-frame partial shell.
-        """
-        # Voxel-downsample the current frame BEFORE pushing into the window
-        if len(pcd_world) > 0:
-            vox = np.floor(pcd_world[:, :3] / self._fuse_voxel_size).astype(np.int64)
-            _, idx = np.unique(vox, axis=0, return_index=True)
-            pcd_world = pcd_world[np.sort(idx)]
-            self._pcd_window.append(pcd_world)
-
-        if len(self._pcd_window) == 0:
-            return np.empty((0, 6))
-
-        fused = np.concatenate(list(self._pcd_window), axis=0)
-
-        # Transform the entire window into the current camera-canonical frame
-        robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
-        robot_yaw = self._observations_cache.get("robot_heading", 0.0)
-
-        fused_local = fused.copy()
-        fused_local[:, :2] -= robot_xyz[:2]
-        cos_yaw, sin_yaw = np.cos(robot_yaw), np.sin(robot_yaw)
-        xy = fused_local[:, :2]
-        fused_local[:, 0] = cos_yaw * xy[:, 0] + sin_yaw * xy[:, 1]
-        fused_local[:, 1] = -sin_yaw * xy[:, 0] + cos_yaw * xy[:, 1]
-
-        # Voxel downsample to deduplicate overlapping frames
-        voxel_coords = np.round(fused_local[:, :3] / self._fuse_voxel_size).astype(np.int32)
-        _, unique_idx = np.unique(voxel_coords, axis=0, return_index=True)
-        fused_local = fused_local[np.sort(unique_idx)]
-
-        # Point-count bound (sparse conv is sensitive to extreme density)
-        if len(fused_local) > self._fuse_max_points:
-            idx = np.random.choice(len(fused_local), self._fuse_max_points, replace=False)
-            fused_local = fused_local[idx]
-
-        return fused_local
-
-
     def _query_tsp3d_client(
         self,
         aligned_pcd: np.ndarray,
         target_query: str
     ) -> List[Dict[str, Any]]:
-        """
-        Queries predictions from the multi-modal TSP3D visual grounding client,
-        adaptively adjusting the text-guided pruning threshold when extremely
-        close to surfaces.
-        """
+        """Query TSP3D, scaling the pruning threshold when extremely close to surfaces."""
         if len(aligned_pcd) == 0:
             return [], {}
         
@@ -500,13 +449,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
         return raw_preds, diagnostics
 
     def _get_target_object_location(self, position: np.ndarray) -> Union[None, np.ndarray]:
-        """
-        Returns the closest observed target centroid with a hysteresis latch to
-        suppress target switching (avoiding circling / back-and-forth):
-        - New closest candidate 2D offset < 0.1m from current target  -> keep current target
-        - Offset 0.1~0.5m and robot > 2.0m from the new candidate     -> keep current target
-        - Otherwise -> switch target
-        """
+        """Closest target centroid with hysteresis latch against switching:
+        keep current if new candidate is <0.1m away, or <0.5m while robot >2.0m away."""
         target_classes = self._target_object.split("|")
         valid_centroids = []
 
@@ -532,9 +476,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
         delta_dist = np.linalg.norm(closest_2d - self._last_target_coord)
         dist_to_new = dists_2d[closest_idx]
         if delta_dist < 0.1:
-            pass  # Small offset from the current target -> keep current target
+            pass  # <0.1m from current target: keep
         elif delta_dist < 0.5 and dist_to_new > 2.0:
-            pass  # Small offset and robot still far from the new candidate -> keep current target
+            pass  # <0.5m and robot >2m away: keep
         else:
             self._last_target_coord = closest_2d
         return self._last_target_coord
@@ -550,10 +494,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         fy: float,
         pcd: Union[np.ndarray, None] = None,
     ) -> ObjectDetections:
-        """
-        Updates the 3D occupancy map, projects RGB-D to a 3D point cloud, and
-        queries the TSP3D client for grounded target detections.
-        """
+        """Update occupancy map, build fused PCD, query TSP3D, filter & memorize detections."""
         if pcd is None:
             pcd = self._project_rgbd_to_3d_point_cloud(
                 rgb, depth, fx, fy, tf_camera_to_episodic, min_depth, max_depth
@@ -572,9 +513,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
         robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
         robot_yaw = self._observations_cache.get("robot_heading", 0.0)
 
-        # Multi-frame sliding-window fusion: transform historical world-frame point
-        # clouds into the current camera-canonical coordinate frame
-        fused_pcd_local = self._fuse_temporal_pcd_window(pcd)
+        # Unified input pipeline: camera window / world map -> update -> prepare.
+        self._preprocessor.update(pcd, robot_xyz, robot_yaw)
+        fused_pcd_local = self._preprocessor.prepare(
+            robot_xyz,
+            robot_yaw,
+            camera_height=self._camera_height,
+        )
         raw_detections, tsp3d_diag = self._query_tsp3d_client(fused_pcd_local, self._target_object)
 
         # ---- Pruning / completion behavior diagnostics (read-only) ----
@@ -623,14 +568,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
         detections.filter_by_conf(self._sigma_tar)
         target_classes = [c.strip() for c in self._target_object.split("|") if c.strip()]
         detections.filter_by_class(target_classes, use_raw_nlp=self._nlp_mode)
-        # Skip detection accumulation during the initialization turning phase:
-        # in-place rotation sees the same nearby surfaces repeatedly and pollutes
-        # target memory with duplicate spurious detections.
+        # Skip memory accumulation during initialization turning (repeated surfaces pollute memory).
         if not self._done_initializing:
             return detections
         
-        # Any detection that passes the confidence and class filters is written
-        # into target memory immediately and locked in.
+        # Every filtered detection is written into memory immediately.
         for centroid, conf, _ in zip(detections.centroids, detections.logits, detections.boxes):
             centroid_np = centroid.cpu().numpy()
             conf_f = float(conf.cpu().numpy()) if torch.is_tensor(conf) else float(conf)
@@ -643,8 +585,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             for cls in active_classes:
                 self._accumulate_3d_target_memory(cls, centroid_np, confidence=conf_f)
 
-        # VLFM `update_explored` aligned: every step, run the anti-hallucination
-        # fallback (delete confirmed-false centroids near the FOV cone -> back to explore).
+        # VLFM-aligned: run anti-hallucination fallback every step (delete confirmed-false -> explore).
         if self._enable_fb:
             self._anti_hallucination_fallback(tf_camera_to_episodic, max_depth)
 
@@ -660,11 +601,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         raise NotImplementedError
 
     def _pointnav(self, goal: np.ndarray, stop: bool = False) -> Tensor:
-        """
-        Computes rho/theta from the agent's current position to the goal and
-        drives the pre-trained PointNav policy. Supports 2D (x, y) and 3D
-        (x, y, z) goal inputs.
-        """
+        """PointNav to goal via rho/theta; supports 2D (x,y) and 3D (x,y,z) goals."""
         device = next(self._pointnav_policy.policy.parameters()).device
         masks = torch.tensor([[self._num_steps != 0]], dtype=torch.bool, device=device)
 
@@ -718,8 +655,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
         goal_3d = self._get_target_object_location(robot_xyz)
 
-        # Exploration uses the habitat `frontier_sensor` (same 2D
-        # detect_frontier_waypoints frontiers as VLFM).
+        # Exploration via habitat frontier_sensor (same 2D frontiers as VLFM).
         if not self._done_initializing:
             mode = "initialize"
             action = self._initialize()
@@ -785,9 +721,15 @@ class VLVMConfig:
     # Phase 2: Depth Sensor Filtering
     min_depth: float = 0.5   # Minimum valid depth (m); points closer than this are discarded.
     max_depth: float = 5.0   # Maximum valid depth (m); larger sees farther but adds far-field noise/clutter.
-
+    
     # Phase 6: Navigation Execution & Termination
     pointnav_stop_radius: float = 0.30  # Distance (m) at which the agent stops near the goal; larger = stops farther from the target.
+    # Phase 6: Anti-hallucination fallback
+    enable_fb: bool = True              # Delete confirmed-false centroids near the FOV cone -> fallback to explore.
+    fb_near_radius: float = 2.5         # Near-field confirmation cone radius (m); VLFM uses max_depth*0.5 (2.5m @ max_depth=5).
+    fb_hysteresis: int = 5              # Trusted centroid: consecutive near-field frames without a fresh merge before deletion.
+    fb_suspicious_hysteresis: int = 2   # Suspicious centroid (far/low-conf): fewer frames before deletion.
+    fb_suspicious_conf: float = 0.75    # Trust boundary (two-tier, must be > sigma_tar to activate): detections in [sigma_tar, fb_suspicious_conf) are flagged suspicious and deleted if not re-detected within 2 near-field frames; 0.75 is the most conservative active tier (V4.1).
 
     # Phase 3: 3D Mapping & Occupancy Grid
     om_style: str = "obstacle"
@@ -795,17 +737,17 @@ class VLVMConfig:
     min_obstacle_height: float = 0.15        # Lower height bound (m) for obstacle voxels; too low includes floor noise, too high misses low obstacles.
     max_obstacle_height: float = 1.50        # Upper height bound (m) for obstacle voxels; too low ignores tall obstacles.
     hole_area_thresh: int = 100000           # Hole area threshold (px) for depth gap filling; -1 disables filling (assume max depth).
-    ## Dilation / structuring element 
-    agent_radius: float = 0.18               # Robot physical radius (m) used for collision inflation; larger = more conservative navigation.
-    agent_height: float = 0.88               # Robot height (m) for the 3D cylinder structuring element (dilation / collision).
-    nav_slice_height: float = 0.35           # Reference navigation height (m) for frontier slicing and visualization.
     # Phase 3.5: ProbabilisticGrid log-odds inverse-sensor model (om_style=probabilistic only)
     log_odds_occ: float = 2.0                # Occupied endpoint evidence weight (default symmetric: |free|==occ)
     log_odds_free: float = -2.0              # Free ray-body evidence weight; |free| < occ -> conservative bias (offset not cancelled to 0)
     occ_threshold: float = 0.0               # Occupied decision threshold (l > occ_thr); >0 -> hysteresis buffer (Unknown band)
     free_threshold: float = 0.0              # Free decision threshold (l < free_thr); <0 -> hysteresis buffer (Unknown band)
     obstacle_map_area_threshold: float = 1.5 # Frontier area threshold (m^2) to filter small isolated regions; higher = fewer, larger frontiers.
-
+    ## Dilation / structuring element 
+    agent_radius: float = 0.18               # Robot physical radius (m) used for collision inflation; larger = more conservative navigation.
+    agent_height: float = 0.88               # Robot height (m) for the 3D cylinder structuring element (dilation / collision).
+    nav_slice_height: float = 0.35           # Reference navigation height (m) for frontier slicing and visualization.
+    
     # Phase 4: 2.5D Semantic Value Plane (BEV)
     vm_style: str = "region"          # Semantic value mapping mode: "region" (V1) / "surface" (V2)
     h_lam: float = 0.3                # Bonus weight lambda (lambda=0 reduces to VLFM baseline)
@@ -816,25 +758,39 @@ class VLVMConfig:
     query_z_min: float = 0.15         # Lower bound of the fixed query height band (m, surface landing)
     query_z_max: float = 1.50         # Upper bound of the fixed query height band (m)
 
-    # Phase 5a: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
+    # Phase 5a: TSP3D Perception & Visual Grounding
+    sigma_tar: float = 0.70             # Target confidence threshold (admission); higher = stricter/fewer detections, lower = more detections but more false positives. V4.1 grid search: 0.70 optimal.
+    sigma_sce: float = 0.15             # TGP scene voxel retention threshold; higher = more aggressive pruning (fewer hallucinations, may miss targets).
+    tau: float = 0.15                   # Soft-pruning temperature; higher = smoother/looser pruning, lower = harder thresholding.
+    near_field_dist: float = 1.0        # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
+    near_field_sigma_scale: float = 0.8 # Minimum voxel retention ratio near surfaces; higher = keep more voxels near obstacles.
+    use_raw_nlp: bool = False           # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
+    enable_retry: bool = False          # Retry once on empty TSP3D results with reduced sigma_sce; disabled by default (measured recovery 0.05%).
+    cap_style: str = "random"           # D1: send-side point cap (shared): "random" (baseline) / "near_first" (near-field priority)
+    send_voxel_size: Optional[float] = None  # D2: send-side re-voxelization (shared); None = skip
+    distance_sample: bool = False       # D3: distance-adaptive sampling (dense near / sparse far, shared post-processing)
+    near_dist: float = 1.5             # D3 distance sampling: near/mid band boundary (m)
+    mid_dist: float = 3.0              # D3 distance sampling: mid/far band boundary (m)
+    near_voxel: float = 0.01           # D3 distance sampling: near-band voxel (m)
+    mid_voxel: float = 0.02            # D3 distance sampling: mid-band voxel (m)
+    far_voxel: float = 0.05            # D3 distance sampling: far-band voxel (m)
+    use_world_map: bool = False         # True = world-frame accumulation / False = camera 8-frame window (baseline)
+
+    # Phase 5b: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
     pcd_window_size: int = 8          # Number of frames fused for point-cloud accumulation; larger = more complete geometry but slower/staler.
     fuse_voxel_size: float = 0.02     # Voxel downsample size (m) for window fusion; larger = fewer points, faster, coarser.
     fuse_max_points: int = 200000     # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
-    # Phase 5b: TSP3D Perception & Visual Grounding
-    sigma_tar: float = 0.70           # Target confidence threshold (准入); higher = stricter/fewer detections, lower = more detections but more false positives. V4.1 网格确认 0.70 最优.
-    sigma_sce: float = 0.15           # TGP scene voxel retention threshold; higher = more aggressive pruning (fewer hallucinations, may miss targets).
-    tau: float = 0.15                 # Soft-pruning temperature; higher = smoother/looser pruning, lower = harder thresholding.
-    near_field_dist: float = 1.0      # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
-    near_field_sigma_scale: float = 0.8  # Minimum voxel retention ratio near surfaces; higher = keep more voxels near obstacles.
-    use_raw_nlp: bool = False         # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
-    enable_retry: bool = False        # Retry once on empty TSP3D results with reduced sigma_sce; disabled by default (measured recovery 0.05%).
-
-    # Phase 6: Anti-hallucination fallback
-    enable_fb: bool = True              # Delete confirmed-false centroids near the FOV cone -> fallback to explore.
-    fb_near_radius: float = 2.5         # Near-field confirmation cone radius (m); VLFM uses max_depth*0.5 (2.5m @ max_depth=5).
-    fb_hysteresis: int = 5              # Trusted centroid: consecutive near-field frames without a fresh merge before deletion.
-    fb_suspicious_hysteresis: int = 2   # Suspicious centroid (far/low-conf): fewer frames before deletion.
-    fb_suspicious_conf: float = 0.75    # 可信分界 (两档分级, 须 > sigma_tar 才激活): [sigma_tar, fb_suspicious_conf) 的检测标记可疑、2 帧近场未重检测即删; 0.75 为最保守激活档 (V4.1 定稿).
+    cam_radius: Optional[float] = None  # camera: send-side horizontal radius crop (m), None = no crop (baseline); align with wm_radius=6.0 -> 6.0
+    cam_min_view_disp: float = 0.0     # camera: min displacement (m) to accept a frame into fusion, 0 = off; world uses wm_min_view_disp 0.15
+    cam_min_view_yaw: float = 0.0      # camera: min yaw change (deg) to accept a frame into fusion, 0 = off; world uses wm_min_view_yaw 15.0
+    
+    # Phase 5c: World-frame Local Map (TSP3DInputPreprocessor, 4.3c)
+    wm_voxel_size: float = 0.02       # world: local map voxel size (m) for fixed-grid dedup
+    wm_radius: Optional[float] = 6.0  # world: local map radius (m), None = no crop (only max_voxels hard cap); cam_radius=None is the symmetric case
+    wm_min_view_disp: float = 0.15    # world: min displacement (m) to accept a frame into fusion
+    wm_min_view_yaw: float = 15.0     # world: min yaw change (deg) to accept a frame into fusion
+    wm_max_voxels: int = 400000       # world: hard cap on map voxels
+    wm_max_frames: Optional[int] = 8  # world: frame-window cap (keep voxels of the most recent N frames); None = all history
 
     @classmethod  # type: ignore
     @property

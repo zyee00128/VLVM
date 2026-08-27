@@ -114,7 +114,7 @@ class TSPHead(nn.Module):
         self.keep_conv = nn.ModuleList([
             ME.MinkowskiConvolution(out_channels, 1, kernel_size=1, bias=True, dimension=3),
             ME.MinkowskiConvolution(out_channels, 1, kernel_size=1, bias=True, dimension=3)
-        ]) # 用于剪枝的分数评估卷积列表
+        ])  # pruning score-evaluation conv list
         self.pos_embed = PositionEmbeddingLearned(3, 128)
         
         # Build a three-layer bi-directional transformer subnet 

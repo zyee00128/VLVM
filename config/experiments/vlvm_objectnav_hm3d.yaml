@@ -63,8 +63,14 @@ habitat_baselines:
       init_turn_steps: 12
       min_depth: 0.5
       max_depth: 5.0
-
+      
       pointnav_stop_radius: 0.90 # 0.90
+      # Anti-hallucination fallback
+      enable_fb: True
+      fb_near_radius: 2.5
+      fb_hysteresis: 5
+      fb_suspicious_hysteresis: 2
+      fb_suspicious_conf: 0.75
 
       om_style: "probabilistic" # probabilistic/ obstacle
       voxel_size: 0.05
@@ -98,15 +104,29 @@ habitat_baselines:
       # TSP3D Input Processing
       use_raw_nlp: False
       enable_retry: False
+      # D1/D2/D3 send-side post-processing (shared by both fusion routes)
+      cap_style: random           # D1: point cap - "random" (baseline) / "near_first"
+      send_voxel_size: null       # D2: send-side re-voxelization (m), null = skip
+      distance_sample: False      # D3: distance-adaptive sampling (dense near / sparse far)
+      near_dist: 1.5
+      mid_dist: 3.0
+      near_voxel: 0.01
+      mid_voxel: 0.02
+      far_voxel: 0.05
+      use_world_map: False
+
       pcd_window_size: 8
       fuse_voxel_size: 0.02
       fuse_max_points: 200000
-      # Anti-hallucination fallback
-      enable_fb: True
-      fb_near_radius: 2.5
-      fb_hysteresis: 5
-      fb_suspicious_hysteresis: 2
-      fb_suspicious_conf: 0.75
+      cam_radius: null
+      cam_min_view_disp: 0.15
+      cam_min_view_yaw: 15.0
+      wm_max_frames: 8
+      wm_voxel_size: 0.02
+      wm_max_voxels: 400000
+      wm_radius: 6.0
+      wm_min_view_disp: 0.15
+      wm_min_view_yaw: 15.0
 
     ppo:
       clip_param: 0.2
