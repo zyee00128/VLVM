@@ -58,7 +58,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             near_field_dist: float = 1.0,
             near_field_sigma_scale: float = 0.8,
             use_raw_nlp: bool = False,
-            enable_retry: bool = False,
             use_world_map: bool = False,
             wm_voxel_size: float = 0.02,
             wm_radius: float = 6.0,
@@ -86,6 +85,14 @@ class TSP3DObjectNavPolicy(BasePolicy):
             fb_hysteresis: int = 5,
             fb_suspicious_hysteresis: int = 2,
             fb_suspicious_conf: float = 0.75,
+            enable_s_penalty: bool = True,
+            s_penalty_gate_admission: bool = True,
+            s_penalty_thresh: float = 0.15,
+            s_penalty_floor: float = 0.3,
+            s_penalty_radius_m: float = 0.5,
+            # 4.6.1: multi-candidate NMS + top-1 write
+            nms_score_thr: Optional[float] = None,
+            top1_write: bool = False,
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -116,7 +123,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._near_field_dist = near_field_dist
         self._near_field_sigma_scale = near_field_sigma_scale
         self._nlp_mode = use_raw_nlp
-        self._enable_retry = enable_retry
         self._pointnav_stop_radius = pointnav_stop_radius
         self._init_step_count = 0
         self._num_steps = 0
@@ -135,10 +141,18 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._fb_hysteresis = fb_hysteresis
         self._fb_suspicious_hysteresis = fb_suspicious_hysteresis
         self._fb_suspicious_conf = fb_suspicious_conf
+        # S-penalty: semantic-field cross-validation
+        self._enable_s_penalty = enable_s_penalty
+        self._s_penalty_thresh = s_penalty_thresh
+        self._s_penalty_floor = s_penalty_floor
+        self._s_penalty_radius_m = s_penalty_radius_m
+        self._s_penalty_gate_admission = s_penalty_gate_admission
+        # 4.6.1: model-side NMS score floor (None = single-candidate baseline) and
+        # write-memory top-1 (keep only the highest c' per frame under multi-candidate).
+        self._nms_score_thr = nms_score_thr
+        self._top1_write = top1_write
 
-        # Unified input-adaptation pipeline (4.3c): camera 8-frame window (baseline)
-        # / world-frame accumulation, switched by use_world_map; send-side
-        # post-processing (distance sampling / point cap) is shared by both routes.
+        # camera 8-frame window (baseline) world-frame accumulation, switched by use_world_map
         self._use_world_map = use_world_map
         self._preprocessor = TSP3DInputPreprocessor(
             fusion_style="world" if use_world_map else "camera",
@@ -175,7 +189,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         height_size = int(height_range / voxel_size) + 1
         pixels_per_meter = int(1.0 / voxel_size)
         size = 400
-
         if self._om_style == "obstacle":
             self._obstacle_map3d = ObstacleMap3D(
                 min_height=min_obstacle_height,
@@ -250,9 +263,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
         raise NotImplementedError
 
     def _accumulate_3d_target_memory(self, target_class: str, centroid: np.ndarray, confidence: float = 1.0) -> None:
-        """Write detection into memory; EMA-merge within 0.5m; track suspicious
-        (far/low-conf) + near-miss counter — fresh merge resets it, so drift-only
-        hallucinated boxes get deleted near the FOV cone -> explore."""
+        """Write detection into memory; EMA-merge within 0.5m; 
+        track suspicious (far/low-conf) + near-miss counter — fresh merge resets it, 
+        so drift-only hallucinated boxes get deleted near the FOV cone -> explore."""
         robot_xy = self._observations_cache.get("robot_xy", np.zeros(2))
         robot_yaw = self._observations_cache.get("robot_heading", 0.0)
         robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
@@ -292,6 +305,29 @@ class TSP3DObjectNavPolicy(BasePolicy):
             self._target_3d_memory[target_class].append(centroid)
             self._target_verify_state[target_class].append((1, robot_xy.copy(), robot_yaw))
             self._target_fallback_state[target_class].append({"suspicious": suspicious, "near_miss": 0})
+
+    def _query_semantic_at(self, x: float, y: float, radius_m: Optional[float] = None) -> Union[float, None]:
+        """
+        Hook: query the 2.5D semantic-field value S at world (x, y) to cross-validate a TSP3D detection. 
+        """
+        return None
+
+    def _s_penalty_weight(self, x: float, y: float) -> Tuple[float, Union[float, None]]:
+        """
+        S-penalty weight w_S in [floor, 1] — S as an independent penalty axis 
+        combined with the raw TSP3D confidence: c' = c * w_S(S).
+        Returns (w_S, S_value); S_value None = no semantic field -> w_S = 1.0 (no penalty).
+        """
+        if not self._enable_s_penalty:
+            return 1.0, None
+        s = self._query_semantic_at(x, y, self._s_penalty_radius_m)
+        if s is None:
+            return 1.0, None
+        if s >= self._s_penalty_thresh:
+            w = 1.0
+        else:
+            w = max(self._s_penalty_floor, s / max(self._s_penalty_thresh, 1e-6))
+        return w, s
 
     def _anti_hallucination_fallback(self, tf_camera_to_episodic: np.ndarray, max_depth: float) -> None:
         """VLFM-aligned anti-hallucination fallback (centroid version).
@@ -429,22 +465,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
             sigma_tar=self._sigma_tar,
             sigma_sce=dynamic_sigma_sce,
             tau=self._tau,
-            use_raw_nlp=self._nlp_mode
+            use_raw_nlp=self._nlp_mode,
+            nms_score_thr=self._nms_score_thr
         )
-
-        # Retry on empty results is disabled by default: the measured recovery
-        # rate of a sigma_sce-reduced retry is only 0.05% while it accounts for
-        # ~48% of queries.
-        if self._enable_retry and len(raw_preds) == 0 and dynamic_sigma_sce > 0.02:
-            fallback_sce = max(0.01, dynamic_sigma_sce * 0.3)
-            raw_preds, diagnostics = self._tsp3d_client.predict(
-                pcd=aligned_pcd,
-                text=target_query,
-                sigma_tar=self._sigma_tar,
-                sigma_sce=fallback_sce,
-                tau=self._tau,
-                use_raw_nlp=self._nlp_mode
-            )
 
         return raw_preds, diagnostics
 
@@ -572,7 +595,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
         if not self._done_initializing:
             return detections
         
-        # Every filtered detection is written into memory immediately.
+        # Every filtered detection is written into memory immediately. 4.6.1 top-1:
+        # with multi-candidate NMS there can be several boxes per frame; when top1_write
+        # is on, keep only the highest amplified confidence c' (prevents low-score
+        # hallucinated candidates from polluting memory).
+        pending = []
         for centroid, conf, _ in zip(detections.centroids, detections.logits, detections.boxes):
             centroid_np = centroid.cpu().numpy()
             conf_f = float(conf.cpu().numpy()) if torch.is_tensor(conf) else float(conf)
@@ -582,8 +609,24 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 active_classes = [target_classes[0]] if len(target_classes) > 0 else []
             if not active_classes:
                 continue
+
+            # ---- S-penalty (3.2): amplify confidence discrimination — c' = c * w_S(S).
+            # S (BLIP2 ITM semantic field, zero extra queries) is an independent signal: low S
+            # at the detection centroid is a strong contradiction to a high TSP3D confidence.
+            w_s, _ = self._s_penalty_weight(centroid_np[0], centroid_np[1])
+            conf_amp = conf_f * w_s
+            # Optional: also gate admission with the amplified confidence (skip below sigma_tar).
+            if self._s_penalty_gate_admission and conf_amp < self._sigma_tar:
+                continue
+
+            pending.append((conf_amp, centroid_np, active_classes))
+
+        if self._top1_write and len(pending) > 1:
+            pending.sort(key=lambda x: x[0], reverse=True)
+            pending = pending[:1]
+        for conf_amp, centroid_np, active_classes in pending:
             for cls in active_classes:
-                self._accumulate_3d_target_memory(cls, centroid_np, confidence=conf_f)
+                self._accumulate_3d_target_memory(cls, centroid_np, confidence=conf_amp)
 
         # VLFM-aligned: run anti-hallucination fallback every step (delete confirmed-false -> explore).
         if self._enable_fb:
@@ -721,23 +764,23 @@ class VLVMConfig:
     # Phase 2: Depth Sensor Filtering
     min_depth: float = 0.5   # Minimum valid depth (m); points closer than this are discarded.
     max_depth: float = 5.0   # Maximum valid depth (m); larger sees farther but adds far-field noise/clutter.
-    
-    # Phase 6: Navigation Execution & Termination
+
+    # Phase 6a: Navigation Execution & Termination
     pointnav_stop_radius: float = 0.30  # Distance (m) at which the agent stops near the goal; larger = stops farther from the target.
-    # Phase 6: Anti-hallucination fallback
+    # Phase 6b: Anti-hallucination fallback
     enable_fb: bool = True              # Delete confirmed-false centroids near the FOV cone -> fallback to explore.
     fb_near_radius: float = 2.5         # Near-field confirmation cone radius (m); VLFM uses max_depth*0.5 (2.5m @ max_depth=5).
     fb_hysteresis: int = 5              # Trusted centroid: consecutive near-field frames without a fresh merge before deletion.
     fb_suspicious_hysteresis: int = 2   # Suspicious centroid (far/low-conf): fewer frames before deletion.
     fb_suspicious_conf: float = 0.75    # Trust boundary (two-tier, must be > sigma_tar to activate): detections in [sigma_tar, fb_suspicious_conf) are flagged suspicious and deleted if not re-detected within 2 near-field frames; 0.75 is the most conservative active tier (V4.1).
 
-    # Phase 3: 3D Mapping & Occupancy Grid
+    # Phase 3a: 3D Mapping & Occupancy Grid
     om_style: str = "obstacle"
     voxel_size: float = 0.01                 # Voxel grid resolution (m); smaller = finer map but more memory/compute.
     min_obstacle_height: float = 0.15        # Lower height bound (m) for obstacle voxels; too low includes floor noise, too high misses low obstacles.
     max_obstacle_height: float = 1.50        # Upper height bound (m) for obstacle voxels; too low ignores tall obstacles.
     hole_area_thresh: int = 100000           # Hole area threshold (px) for depth gap filling; -1 disables filling (assume max depth).
-    # Phase 3.5: ProbabilisticGrid log-odds inverse-sensor model (om_style=probabilistic only)
+    # Phase 3b: ProbabilisticGrid log-odds inverse-sensor model (om_style=probabilistic only)
     log_odds_occ: float = 2.0                # Occupied endpoint evidence weight (default symmetric: |free|==occ)
     log_odds_free: float = -2.0              # Free ray-body evidence weight; |free| < occ -> conservative bias (offset not cancelled to 0)
     occ_threshold: float = 0.0               # Occupied decision threshold (l > occ_thr); >0 -> hysteresis buffer (Unknown band)
@@ -747,7 +790,7 @@ class VLVMConfig:
     agent_radius: float = 0.18               # Robot physical radius (m) used for collision inflation; larger = more conservative navigation.
     agent_height: float = 0.88               # Robot height (m) for the 3D cylinder structuring element (dilation / collision).
     nav_slice_height: float = 0.35           # Reference navigation height (m) for frontier slicing and visualization.
-    
+
     # Phase 4: 2.5D Semantic Value Plane (BEV)
     vm_style: str = "region"          # Semantic value mapping mode: "region" (V1) / "surface" (V2)
     h_lam: float = 0.3                # Bonus weight lambda (lambda=0 reduces to VLFM baseline)
@@ -765,7 +808,6 @@ class VLVMConfig:
     near_field_dist: float = 1.0        # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
     near_field_sigma_scale: float = 0.8 # Minimum voxel retention ratio near surfaces; higher = keep more voxels near obstacles.
     use_raw_nlp: bool = False           # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
-    enable_retry: bool = False          # Retry once on empty TSP3D results with reduced sigma_sce; disabled by default (measured recovery 0.05%).
     cap_style: str = "random"           # D1: send-side point cap (shared): "random" (baseline) / "near_first" (near-field priority)
     send_voxel_size: Optional[float] = None  # D2: send-side re-voxelization (shared); None = skip
     distance_sample: bool = False       # D3: distance-adaptive sampling (dense near / sparse far, shared post-processing)
@@ -792,6 +834,17 @@ class VLVMConfig:
     wm_max_voxels: int = 400000       # world: hard cap on map voxels
     wm_max_frames: Optional[int] = 8  # world: frame-window cap (keep voxels of the most recent N frames); None = all history
 
+    # Phase 5d: S-penalty (semantic-field cross-validation, 3.2 / 4.6 P0)
+    enable_s_penalty: bool = True           # Master switch: c' = c * w_S(S) — multiply TSP3D confidence by a semantic-field weight (BLIP2 ITM, zero extra queries) to amplify TP/FP discrimination.
+    s_penalty_gate_admission: bool = True   # True: also gate admission (skip if amplified conf < sigma_tar); False: only feed the suspicious two-tier (fb_suspicious_conf).
+    s_penalty_thresh: float = 0.15          # S below this (ITM raw cosine scale ~0.10-0.15; measured min 0.084) -> apply penalty (w_S = floor).
+    s_penalty_floor: float = 0.3            # Lower bound of the dynamic penalty weight w_S = max(floor, S/thresh) when S < thresh (non-zero -> keep recall; S->0 -> floor).
+    s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection centroid (2D map query).
+
+    # Phase 5e: 4.6.1 multi-candidate + top-1 write
+    nms_score_thr: Optional[float] = None   # 4.6.1: model-side NMS score floor; None = baseline single-candidate (nms_pre=1); e.g. 0.5-0.7 to output multiple boxes.
+    top1_write: bool = False                # 4.6.1: write only the highest c' detection per frame when multi-candidate is on.
+    
     @classmethod  # type: ignore
     @property
     def kwaarg_names(cls) -> List[str]:

@@ -1,7 +1,7 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
 import os
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -99,14 +99,16 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         self._last_value = float("-inf")
         self._last_frontier = np.zeros(2)
 
-    def _query_2d_map_radius(self, arr_2d: np.ndarray, x: float, y: float) -> float:
+    def _query_2d_map_radius(
+        self, arr_2d: np.ndarray, x: float, y: float, radius_m: Optional[float] = None
+    ) -> float:
         """
-        Queries a 2D map with a disk of radius query_radius_m centered at world (x, y).
-        Max-pooling.
+        Queries a 2D map with a disk of radius radius_m (default query_radius_m) centered
+        at world (x, y). Max-pooling.
         """
         ret = self._obstacle_map3d._xy_to_px(np.array([[x, y]]))[0]
         row, col = int(ret[1]), int(ret[0])
-        r_px = int(self._query_radius_m * self._obstacle_map3d.pixels_per_meter)
+        r_px = int((radius_m if radius_m is not None else self._query_radius_m) * self._obstacle_map3d.pixels_per_meter)
         H, W = arr_2d.shape[:2]
         if not (0 <= row < H and 0 <= col < W):
             return 0.0
@@ -359,7 +361,7 @@ class ITMPolicyV1(BaseITMPolicy):
             values.append(s + self._h_lam * h)
         return values
 
-    def _query_2d_value(self, x: float, y: float) -> float:
+    def _query_2d_value(self, x: float, y: float, radius_m: Optional[float] = None) -> float:
         """
         Radius query on the 2D ValueMap (reuses the VLFM sort_waypoints pixel convention).
         """
@@ -368,7 +370,7 @@ class ITMPolicyV1(BaseITMPolicy):
         px = int(-x * ppm) + vm._episode_pixel_origin[0]
         py = int(-y * ppm) + vm._episode_pixel_origin[1]
         point_px = (vm._value_map.shape[0] - px, py)
-        r_px = int(self._query_radius_m * ppm)
+        r_px = int((radius_m if radius_m is not None else self._query_radius_m) * ppm)
         H, W = vm._value_map.shape[:2]
         if not (0 <= point_px[0] < H and 0 <= point_px[1] < W):
             return 0.0
@@ -377,6 +379,10 @@ class ITMPolicyV1(BaseITMPolicy):
             v = pixel_value_within_radius(vm._value_map[..., c], point_px, r_px)
             best = max(best, float(v))
         return best if best > 0.0 else 0.0
+
+    def _query_semantic_at(self, x: float, y: float, radius_m: Optional[float] = None) -> Union[float, None]:
+        """Semantic field S at world (x, y) for detection cross-validation (3.2 S-penalty)."""
+        return self._query_2d_value(x, y, radius_m)
 
 
 class ITMPolicyV2(BaseITMPolicy):
@@ -426,6 +432,10 @@ class ITMPolicyV2(BaseITMPolicy):
             h = self._query_2d_map_radius(h1, x, y) if h1 is not None else 0.0  # H1: free-layer ratio in the passable band
             values.append(s + self._h_lam * h)
         return values
+
+    def _query_semantic_at(self, x: float, y: float, radius_m: Optional[float] = None) -> Union[float, None]:
+        """Semantic field S (surface-bucket max) at world (x, y) for detection cross-validation (3.2 S-penalty)."""
+        return self._query_2d_map_radius(self._surface_max_map, x, y, radius_m)
 
     def _project_value_to_surface(
         self,

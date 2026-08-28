@@ -83,12 +83,13 @@ class BeaUTyDETR(nn.Module):
         # Extract dynamic control parameters
         sigma_sce = inputs.get('sigma_sce', None)
         tau = inputs.get('tau', None)
+        nms_score_thr = inputs.get('nms_score_thr', None)  # 4.6.1 multi-candidate
 
         if not self.training:
             start_time = time.time()
             bbox_list, head_time, diagnostics = self.head.forward_test(
                     x, text_feats, text_attention_mask, img_metas,
-                    sigma_sce=sigma_sce, tau=tau
+                    sigma_sce=sigma_sce, tau=tau, nms_score_thr=nms_score_thr
             )
             bbox_results = [
                 bbox3d2result(bboxes, scores, labels)

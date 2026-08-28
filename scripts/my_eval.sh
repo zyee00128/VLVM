@@ -22,18 +22,6 @@ fi
 
 cd "$PROJECT_ROOT"
 
-if [ -z "$TMUX" ] || [ "$(tmux display-message -p '#S' 2>/dev/null)" != "eval" ]; then
-    if tmux has-session -t eval 2>/dev/null; then
-        echo ">>> tmux 会话 'eval' 已存在，向其发送启动命令..."
-        tmux send-keys -t eval "cd $PROJECT_ROOT && bash scripts/my_eval.sh" C-m
-    else
-        echo ">>> 创建 tmux 会话 'eval' 并启动实验..."
-        tmux new-session -d -s eval "cd $PROJECT_ROOT && bash scripts/my_eval.sh"
-    fi
-    echo ">>> 实验已在 tmux 会话 'eval' 中启动。监控: tmux attach-session -t eval"
-    exit 0
-fi
-
 # 加载 Conda 环境
 CONDA_PROFILE="/root/miniconda3/etc/profile.d/conda.sh"
 if [ -f "$CONDA_PROFILE" ]; then
@@ -65,8 +53,13 @@ TSP3D_PORT=${TSP3D_PORT:-12186}
 
 # ----------------- 实验定义 -----------------
 # 格式: 标签 | 参数覆盖（多个 hydra 键=值，空格分隔；值含 { } 需单引号包裹）
+# 基线 = cam_B1（yaml 默认：σ_tar=0.70 / fb_suspicious_conf=0.75 / psr=0.90 / 回退开 /
+#        probabilistic / camera 路线 B1 视角去重 0.15/15°，s_penalty 全关）——复用已有 0.3030 结果
 EXPERIMENTS=(
-    # 4.6 档位待代码实现后填充（3.2 语义场交叉验证 / 4.6.1 多候选+top-1）
+    # ===== 4.6.1 多候选 + top-1 网格（基座 = gate：enable_s_penalty + thresh=0.15 + gate_admission=True）=====
+    "nms_gate_t03|habitat_baselines.rl.policy.enable_s_penalty=True habitat_baselines.rl.policy.s_penalty_thresh=0.15 habitat_baselines.rl.policy.s_penalty_gate_admission=True habitat_baselines.rl.policy.nms_score_thr=0.3 habitat_baselines.rl.policy.top1_write=True"
+    "nms_gate_t05|habitat_baselines.rl.policy.enable_s_penalty=True habitat_baselines.rl.policy.s_penalty_thresh=0.15 habitat_baselines.rl.policy.s_penalty_gate_admission=True habitat_baselines.rl.policy.nms_score_thr=0.5 habitat_baselines.rl.policy.top1_write=True"
+    "nms_gate_t07|habitat_baselines.rl.policy.enable_s_penalty=True habitat_baselines.rl.policy.s_penalty_thresh=0.15 habitat_baselines.rl.policy.s_penalty_gate_admission=True habitat_baselines.rl.policy.nms_score_thr=0.7 habitat_baselines.rl.policy.top1_write=True"
 )
 
 # ----------------- 运行 -----------------

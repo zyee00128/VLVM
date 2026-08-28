@@ -68,7 +68,8 @@ class TSP3D:
             sigma_sce: float = 0.3, 
             sigma_tar: float = 0.05, 
             tau: float = 0.15,
-            use_raw_nlp: bool = True
+            use_raw_nlp: bool = True,
+            nms_score_thr: Optional[float] = None
         ) -> List[Dict[str, Any]]:
         """
         Use the TSP3D model to perform 3D object detection and visual grounding.
@@ -104,7 +105,8 @@ class TSP3D:
             'point_clouds': [points_tensor],
             'text': [processed_text],
             'sigma_sce': sigma_sce,
-            'tau': tau
+            'tau': tau,
+            'nms_score_thr': nms_score_thr
         }
         
         with torch.inference_mode():
@@ -143,8 +145,13 @@ class TSP3D:
                 scores_np = scores.cpu().numpy() if torch.is_tensor(scores) else np.array(scores)
                 print(f"[TSP3D Server] Post-NMS detections: {len(boxes_np)} boxes, scores={np.round(scores_np.flatten(), 3).tolist()} (sigma_tar={sigma_tar})")
                 
-                for box, score in zip(boxes_np, scores_np):
-                    conf = float(score[0]) if hasattr(score, "__getitem__") else float(score)
+                # scores_3d is (N, n_classes) on the single-candidate path and (N,)
+                # after _nms (4.6.1 multi-candidate); handle both shapes.
+                for i, box in enumerate(boxes_np):
+                    if scores_np.ndim == 2:
+                        conf = float(scores_np[i, 0])
+                    else:
+                        conf = float(scores_np[i])
                     if conf >= sigma_tar:
                         # box: (8, 3)
                         formatted_detections.append({
@@ -180,7 +187,8 @@ class TSP3DClient:
         sigma_sce: float = 0.3, 
         sigma_tar: float = 0.05, 
         tau: float = 0.15,
-        use_raw_nlp: bool = True
+        use_raw_nlp: bool = True,
+        nms_score_thr: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         # Send point cloud as compact binary (float16) + base64, replacing the
         # slow tolist()+JSON-text serialization of the raw float32 array.
@@ -192,7 +200,8 @@ class TSP3DClient:
             "sigma_sce": sigma_sce,
             "sigma_tar": sigma_tar,
             "tau": tau,
-            "use_raw_nlp": use_raw_nlp
+            "use_raw_nlp": use_raw_nlp,
+            "nms_score_thr": nms_score_thr
         }
         response = send_request(self.url, **payload)
         return response.get("detections", []), response.get("diagnostics", {})
@@ -221,8 +230,9 @@ if __name__ == "__main__":
                 sigma_tar = payload.get("sigma_tar", 0.3)
                 tau = payload.get("tau", 0.15)
                 use_raw_nlp = payload.get("use_raw_nlp", True)
+                nms_score_thr = payload.get("nms_score_thr", None)
 
-                detections, diagnostics = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_raw_nlp)
+                detections, diagnostics = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_raw_nlp, nms_score_thr)
                 return {"detections": detections, "diagnostics": diagnostics}
             return {}
 

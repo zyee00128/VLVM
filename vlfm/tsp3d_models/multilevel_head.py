@@ -70,6 +70,9 @@ class TSPHead(nn.Module):
         else dict(nms_pre=1, iou_thr=.5, score_thr=.01) # Parse inference NMS settings
         # Limit maximum scale of reconstructed voxel sampling for bi-directional attention inference
         self.num_samples_com = 2400
+        # 4.6.1: when not None -> multi-candidate NMS path (output every box above
+        # nms_score_thr with iou=0.5 NMS); None -> baseline single-candidate (nms_pre=1).
+        self._nms_score_thr = None
         self._init_layers(in_channels, out_channels, 
                         n_reg_outs, n_classes)
 
@@ -316,14 +319,36 @@ class TSPHead(nn.Module):
         points = torch.cat(points)
         max_scores, _ = scores.max(dim=1)
 
-        # Preliminarily retain top-N geometric candidates based on maximum class confidence
-        if len(scores) > self.test_cfg['nms_pre'] > 0:
-            _, ids = max_scores.topk(self.test_cfg['nms_pre'])  
+        # Unified coarse top-k: baseline keeps nms_pre=1; 4.6.1 multi-candidate keeps a
+        # fixed N (larger pool for the NMS step, bounded to avoid an O(n^2) nms3d over
+        # all voxels). 4.6.1 NMS path below then filters by score_thr and dedups by iou.
+        n_coarse = 100 if self._nms_score_thr is not None else int(self.test_cfg['nms_pre'])
+        if len(scores) > n_coarse > 0:
+            _, ids = max_scores.topk(n_coarse)
             bbox_preds = bbox_preds[ids]
             scores = scores[ids]
             points = points[ids]
 
         boxes = self._bbox_pred_to_bbox(points, bbox_preds)
+
+        # 4.6.1 multi-candidate path: score-threshold filter + iou=0.5 3D NMS dedup ->
+        # multiple non-overlapping boxes per query. Falls back to the global max when
+        # nothing clears the floor (keeps single-candidate semantics).
+        if self._nms_score_thr is not None:
+            old_thr = self.test_cfg.get('score_thr', 0.01)
+            self.test_cfg['score_thr'] = self._nms_score_thr
+            boxes, scores, labels = self._nms(boxes, scores, img_meta)
+            self.test_cfg['score_thr'] = old_thr
+            if len(boxes) == 0:
+                coarse_max = scores.max(dim=1).values
+                ids = coarse_max.topk(1).indices
+                boxes = self._bbox_pred_to_bbox(points[ids], bbox_preds[ids])
+                labels = boxes.new_zeros((1, ), dtype=torch.long)
+                boxes = img_meta['box_type_3d'](boxes, box_dim=6, with_yaw=False, origin=(.5, .5, .5))
+                return boxes, scores[ids], labels
+            return boxes, scores, labels
+
+        # Baseline single-candidate path: wrap the top-1 box.
         # labels = boxes.new_zeros((1, ),dtype=int)
         labels = boxes.new_zeros((len(boxes), ), dtype=torch.long)
         boxes = img_meta['box_type_3d'](boxes, box_dim=6, with_yaw=False, origin=(.5, .5, .5))
@@ -362,11 +387,15 @@ class TSPHead(nn.Module):
                     text_attention_mask, 
                     img_metas=None, 
                     pc=None, gt_bboxes=None,
-                    sigma_sce=None, tau=None):
+                    sigma_sce=None, tau=None,
+                    nms_score_thr=None):
         """ 
         Pure inference forward pass main loop: 
         Implement multi-layer transposed convolution geometric upsampling, dynamic scene pruning, 
         and bi-directional feature compensation/completion for missing voxels """
+
+        # 4.6.1 multi-candidate: remember the NMS score floor for _get_bboxes_single.
+        self._nms_score_thr = nms_score_thr
 
         inputs = x[1:]
         x = inputs[-1]

@@ -103,7 +103,6 @@ habitat_baselines:
       near_field_sigma_scale: 0.8
       # TSP3D Input Processing
       use_raw_nlp: False
-      enable_retry: False
       # D1/D2/D3 send-side post-processing (shared by both fusion routes)
       cap_style: random           # D1: point cap - "random" (baseline) / "near_first"
       send_voxel_size: null       # D2: send-side re-voxelization (m), null = skip
@@ -127,6 +126,16 @@ habitat_baselines:
       wm_radius: 6.0
       wm_min_view_disp: 0.15
       wm_min_view_yaw: 15.0
+      # S-penalty
+      enable_s_penalty: True
+      s_penalty_gate_admission: True
+      s_penalty_thresh: 0.15         # S below this (ITM cosine scale ~0.10-0.15) -> apply penalty
+      s_penalty_floor: 0.3           # lower bound of dynamic weight w_S = max(floor, S/thresh) when S < thresh (S->0 -> floor)
+      s_penalty_radius_m: 0.5        # S query radius (m) around detection centroid
+      
+      # 4.6.1 多候选 + top-1（模型侧 NMS score 阈值 / 策略侧写记忆只取最高 c'）
+      nms_score_thr: null            # null = 单候选基线（nms_pre=1）；如 0.5~0.7 启用多候选
+      top1_write: False              # True = 多候选时每帧只写最高 c' 的检测
 
     ppo:
       clip_param: 0.2
