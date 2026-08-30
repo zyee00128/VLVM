@@ -19,6 +19,7 @@ from vlfm.vlm.blip2itm import BLIP2ITMClient
 from vlfm.vlm.tsp3d import TSP3DClient
 from vlfm.vlm.detections import ObjectDetections
 from vlfm.tsp3d_models.utils.pipeline import TSP3DInputPreprocessor
+from vlfm.tsp3d_models.utils.s_penalty import SPenaltyConfig, apply_s_penalty, near_surface_point, query_semantic_at
 
 PROMPT_SEPARATOR = "|"
 
@@ -78,7 +79,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             cam_min_view_disp: float = 0.0,
             cam_min_view_yaw: float = 0.0,
             cap_style: str = "random",
-            send_voxel_size: Optional[float] = None,
             pointnav_stop_radius: float = 0.30,
             enable_fb: bool = True,
             fb_near_radius: float = 2.5,
@@ -86,13 +86,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
             fb_suspicious_hysteresis: int = 2,
             fb_suspicious_conf: float = 0.75,
             enable_s_penalty: bool = True,
-            s_penalty_gate_admission: bool = True,
             s_penalty_thresh: float = 0.15,
             s_penalty_floor: float = 0.3,
             s_penalty_radius_m: float = 0.5,
-            # 4.6.1: multi-candidate NMS + top-1 write
-            nms_score_thr: Optional[float] = None,
-            top1_write: bool = False,
+            s_penalty_use_surface: bool = True,
+            goal_use_surface: bool = True,
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -133,6 +131,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._stop_action = torch.tensor([[0]], dtype=torch.long)
         self._turn_left_action = torch.tensor([[2]], dtype=torch.long)
         self._target_3d_memory: Dict[str, List[np.ndarray]] = {}
+        self._target_surface_memory: Dict[str, List[np.ndarray]] = {}  # per-centroid near-surface point
         self._target_verify_state: Dict[str, List[Tuple[int, np.ndarray]]] = {}
         self._target_fallback_state: Dict[str, List[Dict[str, Any]]] = {}
         self._last_target_coord: Union[None, np.ndarray] = None
@@ -141,18 +140,16 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._fb_hysteresis = fb_hysteresis
         self._fb_suspicious_hysteresis = fb_suspicious_hysteresis
         self._fb_suspicious_conf = fb_suspicious_conf
-        # S-penalty: semantic-field cross-validation
-        self._enable_s_penalty = enable_s_penalty
-        self._s_penalty_thresh = s_penalty_thresh
-        self._s_penalty_floor = s_penalty_floor
-        self._s_penalty_radius_m = s_penalty_radius_m
-        self._s_penalty_gate_admission = s_penalty_gate_admission
-        # 4.6.1: model-side NMS score floor (None = single-candidate baseline) and
-        # write-memory top-1 (keep only the highest c' per frame under multi-candidate).
-        self._nms_score_thr = nms_score_thr
-        self._top1_write = top1_write
+        self._s_penalty_cfg = SPenaltyConfig(
+            enable=enable_s_penalty,
+            thresh=s_penalty_thresh,
+            floor=s_penalty_floor,
+            radius_m=s_penalty_radius_m,
+        )
+        self._s_penalty_use_surface = s_penalty_use_surface
+        self._goal_use_surface = goal_use_surface
 
-        # camera 8-frame window (baseline) world-frame accumulation, switched by use_world_map
+        # camera 8-frame window / world-frame accumulation, switched by use_world_map
         self._use_world_map = use_world_map
         self._preprocessor = TSP3DInputPreprocessor(
             fusion_style="world" if use_world_map else "camera",
@@ -169,7 +166,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             cam_min_view_disp=cam_min_view_disp,
             cam_min_view_yaw=np.deg2rad(cam_min_view_yaw),
             cap_style=cap_style,
-            send_voxel_size=send_voxel_size,
             use_distance_sampling=distance_sample,
             near_dist=near_dist,
             mid_dist=mid_dist,
@@ -233,6 +229,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._done_initializing = False
         self._called_stop = False
         self._target_3d_memory.clear()
+        self._target_surface_memory.clear()
         self._target_verify_state.clear()
         self._target_fallback_state.clear()
         self._last_target_coord = None
@@ -262,80 +259,21 @@ class TSP3DObjectNavPolicy(BasePolicy):
         """Extract/normalize rgb, depth, extrinsics; implemented by subclasses."""
         raise NotImplementedError
 
-    def _accumulate_3d_target_memory(self, target_class: str, centroid: np.ndarray, confidence: float = 1.0) -> None:
-        """Write detection into memory; EMA-merge within 0.5m; 
-        track suspicious (far/low-conf) + near-miss counter — fresh merge resets it, 
-        so drift-only hallucinated boxes get deleted near the FOV cone -> explore."""
-        robot_xy = self._observations_cache.get("robot_xy", np.zeros(2))
-        robot_yaw = self._observations_cache.get("robot_heading", 0.0)
-        robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
-
-        # Suspicious = far or low-conf (VLFM range_id != 1 analogue); two-tier gating:
-        # [sigma_tar, fb_suspicious_conf) deleted after 2 near-field misses, >= conf trusted (5).
-        if centroid.shape[0] >= 3:
-            detect_dist = float(np.linalg.norm(centroid - robot_xyz))
-        else:
-            detect_dist = float(np.linalg.norm(centroid - robot_xyz[:2]))
-        suspicious = (confidence < self._fb_suspicious_conf) or (detect_dist > self._max_depth * 0.95)
-
-        if target_class not in self._target_3d_memory:
-            self._target_3d_memory[target_class] = [centroid]
-            self._target_verify_state[target_class] = [(1, robot_xy.copy(), robot_yaw)]
-            self._target_fallback_state[target_class] = [{"suspicious": suspicious, "near_miss": 0}]
-            return
-
-        existing_centroids = np.array(self._target_3d_memory[target_class])
-        dists = np.linalg.norm(existing_centroids - centroid, axis=1)
-        closest_idx = np.argmin(dists)
-
-        # EMA-merge observations within 0.5m
-        if dists[closest_idx] < 0.5:
-            self._target_3d_memory[target_class][closest_idx] = (
-                0.8 * self._target_3d_memory[target_class][closest_idx] + 0.2 * centroid
-            )
-            # Cross-frame consensus is strong evidence; hallucinated boxes drift and can't merge.
-            num_obs, _, _ = self._target_verify_state[target_class][closest_idx]
-            num_obs += 1
-            self._target_verify_state[target_class][closest_idx] = (
-                num_obs, robot_xy.copy(), robot_yaw
-            )
-            # Fresh merge = real target: reset near-miss counter (drift-only boxes can't).
-            self._target_fallback_state[target_class][closest_idx]["near_miss"] = 0
-        else:
-            self._target_3d_memory[target_class].append(centroid)
-            self._target_verify_state[target_class].append((1, robot_xy.copy(), robot_yaw))
-            self._target_fallback_state[target_class].append({"suspicious": suspicious, "near_miss": 0})
-
     def _query_semantic_at(self, x: float, y: float, radius_m: Optional[float] = None) -> Union[float, None]:
-        """
-        Hook: query the 2.5D semantic-field value S at world (x, y) to cross-validate a TSP3D detection. 
-        """
-        return None
+        """Hook: query the 2.5D semantic-field value S at world (x, y).
 
-    def _s_penalty_weight(self, x: float, y: float) -> Tuple[float, Union[float, None]]:
-        """
-        S-penalty weight w_S in [floor, 1] — S as an independent penalty axis 
-        combined with the raw TSP3D confidence: c' = c * w_S(S).
-        Returns (w_S, S_value); S_value None = no semantic field -> w_S = 1.0 (no penalty).
-        """
-        if not self._enable_s_penalty:
-            return 1.0, None
-        s = self._query_semantic_at(x, y, self._s_penalty_radius_m)
-        if s is None:
-            return 1.0, None
-        if s >= self._s_penalty_thresh:
-            w = 1.0
-        else:
-            w = max(self._s_penalty_floor, s / max(self._s_penalty_thresh, 1e-6))
-        return w, s
+        Base implementation delegates to the module default (None = no coverage);
+        subclasses override to query the value map."""
+        return query_semantic_at(x, y, radius_m)
 
     def _anti_hallucination_fallback(self, tf_camera_to_episodic: np.ndarray, max_depth: float) -> None:
         """VLFM-aligned anti-hallucination fallback (centroid version).
 
         Increment the miss counter of centroids inside the near-field FOV cone that got
-        no fresh re-detection; delete past the hysteresis threshold (suspicious: low,
-        trusted: high). Fresh merges reset the counter, so only drift-only (hallucinated)
-        boxes are ever deleted -> fall back to explore."""
+        no fresh re-detection; delete past the hysteresis threshold. 
+        Fresh merges reset the counter, so only drift-only (hallucinated)
+        boxes are ever deleted -> fall back to explore.
+        """
         camera_pos = tf_camera_to_episodic[:3, 3]
         camera_yaw = extract_yaw(tf_camera_to_episodic)
         # hFOV from sensor-derived focal length so the cone matches the actual frustum.
@@ -351,6 +289,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 self._target_fallback_state[target_class] = states
 
             keep_c, keep_v, keep_s = [], [], []
+            surfaces = self._target_surface_memory.get(target_class, [])
+            keep_surf = []
 
             for idx, centroid in enumerate(centroids):
                 # Inside the near-field confirmation cone?
@@ -372,10 +312,12 @@ class TSP3DObjectNavPolicy(BasePolicy):
                               f"near_miss={states[idx]['near_miss']}) -> fallback to explore")
                         continue  # drop this centroid
                 keep_c.append(centroid)
+                keep_surf.append(surfaces[idx] if idx < len(surfaces) else centroid)
                 keep_v.append(self._target_verify_state[target_class][idx])
                 keep_s.append(states[idx])
 
             self._target_3d_memory[target_class] = keep_c
+            self._target_surface_memory[target_class] = keep_surf
             self._target_verify_state[target_class] = keep_v
             self._target_fallback_state[target_class] = keep_s
 
@@ -383,6 +325,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         for target_class in list(self._target_3d_memory.keys()):
             if len(self._target_3d_memory[target_class]) == 0:
                 del self._target_3d_memory[target_class]
+                self._target_surface_memory.pop(target_class, None)
                 self._target_verify_state.pop(target_class, None)
                 self._target_fallback_state.pop(target_class, None)
 
@@ -466,31 +409,86 @@ class TSP3DObjectNavPolicy(BasePolicy):
             sigma_sce=dynamic_sigma_sce,
             tau=self._tau,
             use_raw_nlp=self._nlp_mode,
-            nms_score_thr=self._nms_score_thr
         )
 
         return raw_preds, diagnostics
 
+    def _accumulate_3d_target_memory(self, target_class: str, centroid: np.ndarray, confidence: float = 1.0, near_surface: Optional[np.ndarray] = None) -> None:
+        """Write detection into memory; EMA-merge within 0.5m; 
+        track suspicious (far/low-conf) + near-miss counter — fresh merge resets it, 
+        so drift-only hallucinated boxes get deleted near the FOV cone -> explore.
+        """
+
+        robot_xy = self._observations_cache.get("robot_xy", np.zeros(2))
+        robot_yaw = self._observations_cache.get("robot_heading", 0.0)
+        robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
+
+        # Suspicious = far or low-conf (VLFM range_id != 1 analogue); two-tier gating:
+        # [sigma_tar, fb_suspicious_conf) deleted after 2 near-field misses, >= conf trusted (5).
+        if centroid.shape[0] >= 3:
+            detect_dist = float(np.linalg.norm(centroid - robot_xyz))
+        else:
+            detect_dist = float(np.linalg.norm(centroid - robot_xyz[:2]))
+        suspicious = (confidence < self._fb_suspicious_conf) or (detect_dist > self._max_depth * 0.95)
+
+        if target_class not in self._target_3d_memory:
+            self._target_3d_memory[target_class] = [centroid]
+            self._target_surface_memory[target_class] = [near_surface if near_surface is not None else centroid]
+            self._target_verify_state[target_class] = [(1, robot_xy.copy(), robot_yaw)]
+            self._target_fallback_state[target_class] = [{"suspicious": suspicious, "near_miss": 0}]
+            return
+
+        existing_centroids = np.array(self._target_3d_memory[target_class])
+        dists = np.linalg.norm(existing_centroids - centroid, axis=1)
+        closest_idx = np.argmin(dists)
+
+        # EMA-merge observations within 0.5m
+        if dists[closest_idx] < 0.5:
+            self._target_3d_memory[target_class][closest_idx] = (
+                0.8 * self._target_3d_memory[target_class][closest_idx] + 0.2 * centroid
+            )
+            # Cross-frame consensus is strong evidence; hallucinated boxes drift and can't merge.
+            num_obs, _, _ = self._target_verify_state[target_class][closest_idx]
+            num_obs += 1
+            self._target_verify_state[target_class][closest_idx] = (
+                num_obs, robot_xy.copy(), robot_yaw
+            )
+            # Fresh merge = real target: reset near-miss counter (drift-only boxes can't).
+            self._target_fallback_state[target_class][closest_idx]["near_miss"] = 0
+        else:
+            self._target_3d_memory[target_class].append(centroid)
+            self._target_surface_memory[target_class].append(near_surface if near_surface is not None else centroid)
+            self._target_verify_state[target_class].append((1, robot_xy.copy(), robot_yaw))
+            self._target_fallback_state[target_class].append({"suspicious": suspicious, "near_miss": 0})
+
     def _get_target_object_location(self, position: np.ndarray) -> Union[None, np.ndarray]:
         """Closest target centroid with hysteresis latch against switching:
-        keep current if new candidate is <0.1m away, or <0.5m while robot >2.0m away."""
+        keep current if new candidate is <0.1m away, or <0.5m while robot >2.0m away.
+        """
         target_classes = self._target_object.split("|")
         valid_centroids = []
+        valid_goals = []
 
         for cls in target_classes:
             if cls in self._target_3d_memory and len(self._target_3d_memory[cls]) > 0:
-                for centroid in self._target_3d_memory[cls]:
+                surf_list = self._target_surface_memory.get(cls, [])
+                for i, centroid in enumerate(self._target_3d_memory[cls]):
                     valid_centroids.append(np.array(centroid))
+                    if self._goal_use_surface and i < len(surf_list):
+                        valid_goals.append(np.array(surf_list[i]))
+                    else:
+                        valid_goals.append(np.array(centroid))
 
         if len(valid_centroids) == 0:
             return None
 
         centroids = np.array(valid_centroids)
+        goals = np.array(valid_goals)
         robot_xy = np.asarray(position)[:2]
         dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
 
         closest_idx = np.argmin(dists_2d)
-        closest_2d = centroids[closest_idx][:2].copy()
+        closest_2d = goals[closest_idx][:2].copy()
 
         if self._last_target_coord is None:
             self._last_target_coord = closest_2d
@@ -543,23 +541,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             robot_yaw,
             camera_height=self._camera_height,
         )
-        raw_detections, tsp3d_diag = self._query_tsp3d_client(fused_pcd_local, self._target_object)
-
-        # ---- Pruning / completion behavior diagnostics (read-only) ----
-        if tsp3d_diag:
-            d = tsp3d_diag
-            def _ratio(a, b):
-                return f"{a}->{b}" + (f"({b / a:.0%})" if a else "")
-            print(
-                f"[TSP3D Diag] step={self._num_steps} target='{self._target_object}' "
-                f"input={d.get('input_voxels')} "
-                f"pr1={_ratio(d.get('prune_layer1_before'), d.get('prune_layer1_after'))} "
-                f"pr0={_ratio(d.get('prune_layer0_before'), d.get('prune_layer0_after'))} "
-                f"com={d.get('com_sampled')}->{d.get('com_valid')}->{d.get('com_kept')}->{d.get('com_added')} "
-                f"(tau={d.get('tau')}) out={d.get('out_voxels')} "
-                f"boxes={d.get('n_boxes')} maxscore={d.get('max_score'):.3f}",
-                flush=True,
-            )
+        raw_detections, _ = self._query_tsp3d_client(fused_pcd_local, self._target_object)
 
         # Restore predicted boxes to global coordinates (inverse rotation + translation)
         valid_raw = [det for det in raw_detections if det.get("box_3d") is not None]
@@ -595,38 +577,19 @@ class TSP3DObjectNavPolicy(BasePolicy):
         if not self._done_initializing:
             return detections
         
-        # Every filtered detection is written into memory immediately. 4.6.1 top-1:
-        # with multi-candidate NMS there can be several boxes per frame; when top1_write
-        # is on, keep only the highest amplified confidence c' (prevents low-score
-        # hallucinated candidates from polluting memory).
-        pending = []
-        for centroid, conf, _ in zip(detections.centroids, detections.logits, detections.boxes):
-            centroid_np = centroid.cpu().numpy()
-            conf_f = float(conf.cpu().numpy()) if torch.is_tensor(conf) else float(conf)
-            if self._nlp_mode:
-                active_classes = target_classes
-            else:
-                active_classes = [target_classes[0]] if len(target_classes) > 0 else []
-            if not active_classes:
-                continue
-
-            # ---- S-penalty (3.2): amplify confidence discrimination — c' = c * w_S(S).
-            # S (BLIP2 ITM semantic field, zero extra queries) is an independent signal: low S
-            # at the detection centroid is a strong contradiction to a high TSP3D confidence.
-            w_s, _ = self._s_penalty_weight(centroid_np[0], centroid_np[1])
-            conf_amp = conf_f * w_s
-            # Optional: also gate admission with the amplified confidence (skip below sigma_tar).
-            if self._s_penalty_gate_admission and conf_amp < self._sigma_tar:
-                continue
-
-            pending.append((conf_amp, centroid_np, active_classes))
-
-        if self._top1_write and len(pending) > 1:
-            pending.sort(key=lambda x: x[0], reverse=True)
-            pending = pending[:1]
-        for conf_amp, centroid_np, active_classes in pending:
+        # S-penalty gate cross-validation -> write passed detections to memory.
+        pending = apply_s_penalty(
+            detections, target_classes, robot_xyz,
+            query_semantic=self._query_semantic_at,
+            cfg=self._s_penalty_cfg,
+            sigma_tar=self._sigma_tar,
+            use_surface=self._s_penalty_use_surface,
+            goal_use_surface=self._goal_use_surface,
+            nlp_mode=self._nlp_mode,
+        )
+        for conf_amp, centroid_np, near_surface, active_classes in pending:
             for cls in active_classes:
-                self._accumulate_3d_target_memory(cls, centroid_np, confidence=conf_amp)
+                self._accumulate_3d_target_memory(cls, centroid_np, confidence=conf_amp, near_surface=near_surface)
 
         # VLFM-aligned: run anti-hallucination fallback every step (delete confirmed-false -> explore).
         if self._enable_fb:
@@ -802,49 +765,45 @@ class VLVMConfig:
     query_z_max: float = 1.50         # Upper bound of the fixed query height band (m)
 
     # Phase 5a: TSP3D Perception & Visual Grounding
-    sigma_tar: float = 0.70             # Target confidence threshold (admission); higher = stricter/fewer detections, lower = more detections but more false positives. V4.1 grid search: 0.70 optimal.
+    sigma_tar: float = 0.70             # Target confidence threshold (admission); higher = stricter/fewer detections, lower = more detections but more false positives.
     sigma_sce: float = 0.15             # TGP scene voxel retention threshold; higher = more aggressive pruning (fewer hallucinations, may miss targets).
     tau: float = 0.15                   # Soft-pruning temperature; higher = smoother/looser pruning, lower = harder thresholding.
     near_field_dist: float = 1.0        # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
     near_field_sigma_scale: float = 0.8 # Minimum voxel retention ratio near surfaces; higher = keep more voxels near obstacles.
     use_raw_nlp: bool = False           # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
-    cap_style: str = "random"           # D1: send-side point cap (shared): "random" (baseline) / "near_first" (near-field priority)
-    send_voxel_size: Optional[float] = None  # D2: send-side re-voxelization (shared); None = skip
-    distance_sample: bool = False       # D3: distance-adaptive sampling (dense near / sparse far, shared post-processing)
-    near_dist: float = 1.5             # D3 distance sampling: near/mid band boundary (m)
-    mid_dist: float = 3.0              # D3 distance sampling: mid/far band boundary (m)
-    near_voxel: float = 0.01           # D3 distance sampling: near-band voxel (m)
-    mid_voxel: float = 0.02            # D3 distance sampling: mid-band voxel (m)
-    far_voxel: float = 0.05            # D3 distance sampling: far-band voxel (m)
+    cap_style: str = "random"           # send-side point cap (shared): "random" (baseline) / "near_first" (near-field priority)
+    distance_sample: bool = False       # distance-adaptive sampling (dense near / sparse far, shared post-processing)
+    near_dist: float = 1.5              # distance sampling: near/mid band boundary (m)
+    mid_dist: float = 3.0               # distance sampling: mid/far band boundary (m)
+    near_voxel: float = 0.01            # distance sampling: near-band voxel (m)
+    mid_voxel: float = 0.02             # distance sampling: mid-band voxel (m)
+    far_voxel: float = 0.05             # distance sampling: far-band voxel (m)
     use_world_map: bool = False         # True = world-frame accumulation / False = camera 8-frame window (baseline)
 
     # Phase 5b: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
-    pcd_window_size: int = 8          # Number of frames fused for point-cloud accumulation; larger = more complete geometry but slower/staler.
-    fuse_voxel_size: float = 0.02     # Voxel downsample size (m) for window fusion; larger = fewer points, faster, coarser.
-    fuse_max_points: int = 200000     # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
-    cam_radius: Optional[float] = None  # camera: send-side horizontal radius crop (m), None = no crop (baseline); align with wm_radius=6.0 -> 6.0
-    cam_min_view_disp: float = 0.0     # camera: min displacement (m) to accept a frame into fusion, 0 = off; world uses wm_min_view_disp 0.15
-    cam_min_view_yaw: float = 0.0      # camera: min yaw change (deg) to accept a frame into fusion, 0 = off; world uses wm_min_view_yaw 15.0
+    pcd_window_size: int = 8                # Number of frames fused for point-cloud accumulation; larger = more complete geometry but slower/staler.
+    fuse_voxel_size: float = 0.02           # Voxel downsample size (m) for window fusion; larger = fewer points, faster, coarser.
+    fuse_max_points: int = 200000           # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
+    cam_radius: Optional[float] = None      # camera: send-side horizontal radius crop (m), None = no crop (baseline); align with wm_radius=6.0 -> 6.0
+    cam_min_view_disp: float = 0.15         # camera: min displacement (m) to accept a frame into fusion, 0 = off; world uses wm_min_view_disp 0.15
+    cam_min_view_yaw: float = 15.0           # camera: min yaw change (deg) to accept a frame into fusion, 0 = off; world uses wm_min_view_yaw 15.0
     
-    # Phase 5c: World-frame Local Map (TSP3DInputPreprocessor, 4.3c)
+    # Phase 5c: World-frame Local Map (TSP3DInputPreprocessor)
+    wm_max_frames: Optional[int] = 8  # world: frame-window cap (keep voxels of the most recent N frames); None = all history
     wm_voxel_size: float = 0.02       # world: local map voxel size (m) for fixed-grid dedup
+    wm_max_voxels: int = 400000       # world: hard cap on map voxels
     wm_radius: Optional[float] = 6.0  # world: local map radius (m), None = no crop (only max_voxels hard cap); cam_radius=None is the symmetric case
     wm_min_view_disp: float = 0.15    # world: min displacement (m) to accept a frame into fusion
     wm_min_view_yaw: float = 15.0     # world: min yaw change (deg) to accept a frame into fusion
-    wm_max_voxels: int = 400000       # world: hard cap on map voxels
-    wm_max_frames: Optional[int] = 8  # world: frame-window cap (keep voxels of the most recent N frames); None = all history
-
-    # Phase 5d: S-penalty (semantic-field cross-validation, 3.2 / 4.6 P0)
+    
+    # Phase 5d: S-penalty (semantic-field cross-validation)
     enable_s_penalty: bool = True           # Master switch: c' = c * w_S(S) — multiply TSP3D confidence by a semantic-field weight (BLIP2 ITM, zero extra queries) to amplify TP/FP discrimination.
-    s_penalty_gate_admission: bool = True   # True: also gate admission (skip if amplified conf < sigma_tar); False: only feed the suspicious two-tier (fb_suspicious_conf).
     s_penalty_thresh: float = 0.15          # S below this (ITM raw cosine scale ~0.10-0.15; measured min 0.084) -> apply penalty (w_S = floor).
     s_penalty_floor: float = 0.3            # Lower bound of the dynamic penalty weight w_S = max(floor, S/thresh) when S < thresh (non-zero -> keep recall; S->0 -> floor).
-    s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection centroid (2D map query).
+    s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection point.
+    s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
+    goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
 
-    # Phase 5e: 4.6.1 multi-candidate + top-1 write
-    nms_score_thr: Optional[float] = None   # 4.6.1: model-side NMS score floor; None = baseline single-candidate (nms_pre=1); e.g. 0.5-0.7 to output multiple boxes.
-    top1_write: bool = False                # 4.6.1: write only the highest c' detection per frame when multi-candidate is on.
-    
     @classmethod  # type: ignore
     @property
     def kwaarg_names(cls) -> List[str]:

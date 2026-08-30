@@ -19,8 +19,8 @@ class _BaseObstacleMap3D(BaseMap):
       - ObstacleMap3D     (binary 0/1 occupancy grid)
       - ProbabilisticGrid (int8 log-odds occupancy grid)
 
-    Common services: 3D cylindrical dilation, 3D explored mask (VLFM "known"
-    semantics), and ray-body/endpoint observed-voxel updates via per-class hooks.
+    3D cylindrical dilation, 3D explored mask, 
+    and ray-body/endpoint observed-voxel updates via per-class hooks.
     """
 
     _map_dtype: np.dtype = np.dtype(bool)
@@ -215,7 +215,6 @@ class _BaseObstacleMap3D(BaseMap):
     def _refresh_compat(self) -> None:
         """Refresh `_map` (and `_navigable_map` when compute_navigable)."""
         raise NotImplementedError
-
     # Visualization / parity / full-3D utilities (not on the 2.5D inference path)
     def dilate_3d_cylinder(self, occupied: np.ndarray, rz: int, disk: np.ndarray) -> np.ndarray:
         """Fast 3D cylinder dilation (agent_radius x agent_height).
@@ -255,37 +254,12 @@ class _BaseObstacleMap3D(BaseMap):
                 self._last_camera_yaw,
             )
         return vis_img
-    def check_collision(self, xyz: np.ndarray) -> np.ndarray:
-        """3D cylindrical patch collision query (agent_radius x agent_height)."""
-        if len(xyz) == 0:
-            return np.zeros(0, bool)
-        indices = self._xyz_to_grid_index(xyz)
-        rx = max(1, int(np.ceil(self._agent_radius * self.pixels_per_meter)))
-        ry = rx
-        rz = max(1, int(np.ceil(self._agent_height / self._voxel_size)))
-        colliding = np.zeros(len(xyz), bool)
-        for i, idx in enumerate(indices):
-            px, py, cz = idx
-            zmin_raw = cz - rz
-            zmax_raw = cz + rz
-            if zmin_raw >= self._height_size or zmax_raw < 0:
-                continue
-            ymin = max(0, min(self.size - 1, py - ry))
-            ymax = max(0, min(self.size - 1, py + ry))
-            xmin = max(0, min(self.size - 1, px - rx))
-            xmax = max(0, min(self.size - 1, px + rx))
-            zmin = max(0, min(self._height_size - 1, cz - rz))
-            zmax = max(0, min(self._height_size - 1, cz + rz))
-            patch = self._map[ymin:ymax + 1, xmin:xmax + 1, zmin:zmax + 1]
-            if np.any(patch):
-                colliding[i] = True
-        return colliding
 
 
 class ObstacleMap3D(_BaseObstacleMap3D):
     """
-    3D Occupancy Grid Map: binary occupancy (0/1) + 3D explored mask, with
-    VLFM-aligned 2D behavior lifted to 3D.
+    3D Occupancy Grid Map: binary occupancy (0/1) + 3D explored mask, 
+    with VLFM-aligned 2D behavior lifted to 3D.
 
     - Occupied: hard-overwrite, monotonic (aligned with VLFM conflict handling; never flips)
     - explored_area (3D): voxels observed by ray bodies + ray endpoints

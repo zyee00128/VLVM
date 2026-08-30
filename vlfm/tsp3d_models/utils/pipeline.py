@@ -4,12 +4,11 @@ import numpy as np
 
 from .local_map import WorldLocalMap
 from .sliding_window import TemporalPcdWindow
-from .sampling import cap_point_count, distance_adaptive_sample, voxelize_world
-
+from .sampling import cap_point_count, distance_adaptive_sample
 
 class TSP3DInputPreprocessor:
-    """End-to-end input adaptation: fusion (camera window or world map) -> unified
-    send-side post-processing (send voxelization / distance sampling / point cap)."""
+    """End-to-end input adaptation: fusion (camera window or world map) -> 
+    unified send-side post-processing (distance sampling / point cap)."""
 
     def __init__(
         self,
@@ -28,15 +27,14 @@ class TSP3DInputPreprocessor:
         max_map_voxels: int = 400000,
         map_max_frames: Optional[int] = 8,
         # send-side post-processing (shared by both routes)
-        send_voxel_size: Optional[float] = None,  # D2
         max_points: int = 200000,
-        cap_style: str = "random",                # D1: "random" / "near_first"
+        cap_style: str = "random",  # "random" / "near_first"
         near_dist: float = 1.5,
         mid_dist: float = 3.0,
         near_voxel: float = 0.01,
         mid_voxel: float = 0.02,
         far_voxel: float = 0.05,
-        use_distance_sampling: bool = False,      # D3
+        use_distance_sampling: bool = False,
     ) -> None:
         if fusion_style not in ("camera", "world"):
             raise ValueError("fusion_style MUST BE 'camera' or 'world'")
@@ -61,7 +59,6 @@ class TSP3DInputPreprocessor:
             )
             self._map: Optional[WorldLocalMap] = None
 
-        self._send_voxel_size = send_voxel_size
         self._max_points = max_points
         self._cap_style = cap_style
 
@@ -109,9 +106,6 @@ class TSP3DInputPreprocessor:
         if len(pts) == 0:
             return np.empty((0, 6), dtype=np.float32)
 
-        if self._send_voxel_size is not None:
-            pts = voxelize_world(pts, self._send_voxel_size)
-
         camera_pos_local = np.array([0.0, 0.0, camera_height], dtype=np.float32)
 
         if self._use_distance_sampling:
@@ -126,4 +120,5 @@ class TSP3DInputPreprocessor:
             )
 
         pts = cap_point_count(pts, camera_pos_local, self._max_points, self._cap_style)
+
         return pts

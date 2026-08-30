@@ -355,7 +355,7 @@ class ITMPolicyV1(BaseITMPolicy):
         """S (region ValueMap radius query) + lambda * H1 (vertical passability)."""
         h1 = self._compute_h1()
         values = []
-        for (x, y) in frontiers:
+        for i, (x, y) in enumerate(frontiers):
             s = self._query_2d_value(x, y)
             h = self._query_2d_map_radius(h1, x, y) if h1 is not None else 0.0
             values.append(s + self._h_lam * h)

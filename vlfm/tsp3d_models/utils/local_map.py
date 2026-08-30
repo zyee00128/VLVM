@@ -1,4 +1,3 @@
-"""World-frame local map fusion (VLVM 4.3c): fixed-grid incremental dedup + view gating + sliding window."""
 from collections import deque
 from typing import Optional
 import numpy as np
@@ -72,59 +71,8 @@ class WorldLocalMap:
         self._frame_keys.clear()
         self._last_pose = None
 
-    def update(
-        self,
-        pcd_world: np.ndarray,
-        robot_pose: np.ndarray,
-    ) -> None:
-        if len(pcd_world) == 0:
-            return
-        if self._view_gate(robot_pose):
-            return
-
-        # Fixed-grid voxelization (floor, same grid as window fusion)
-        vox = np.floor(pcd_world[:, :3] / self.voxel_size).astype(np.int64)
-        _, first_idx = np.unique(vox, axis=0, return_index=True)
-        vox = vox[np.sort(first_idx)]
-        pts = pcd_world[np.sort(first_idx)]
-        new_keys = _flat_key(vox)
-
-        # Merge only unseen voxels (first observation wins)
-        if self._keys.shape[0] == 0:
-            order = np.argsort(new_keys, kind="stable")
-            self._keys = new_keys[order]
-            self._points = pts[order].astype(np.float32)
-            new_only_keys = new_keys
-        else:
-            is_dup = np.isin(new_keys, self._keys)
-            new_only_keys = new_keys[~is_dup]
-            new_only_pts = pts[~is_dup]
-            if new_only_keys.shape[0] > 0:
-                all_keys = np.concatenate([self._keys, new_only_keys])
-                all_pts = np.concatenate([self._points, new_only_pts], axis=0)
-                order = np.argsort(all_keys, kind="stable")
-                self._keys = all_keys[order]
-                self._points = all_pts[order]
-
-        self._last_pose = np.asarray(robot_pose, dtype=np.float32).copy()
-
-        # Keep only the most recent max_frames frames
-        if self.max_frames is not None:
-            self._frame_keys.append(new_only_keys)
-            while len(self._frame_keys) > self.max_frames:
-                oldest = self._frame_keys.popleft()
-                if len(oldest) > 0:
-                    rm = np.isin(self._keys, oldest)
-                    self._keys = self._keys[~rm]
-                    self._points = self._points[~rm]
-
-        # Bounded-radius slide-out centered at the robot
-        self._slide_radius(robot_pose[:2])
-
     def _view_gate(self, robot_pose: np.ndarray) -> bool:
         """True = skip this frame (not enough new view information).
-
-        B1 (base) gate is enabled; B2/B3 blocks below are kept commented.
         """
         if self._last_pose is None:
             return False
@@ -159,11 +107,60 @@ class WorldLocalMap:
             self._keys = self._keys[keep]
             self._points = self._points[keep]
 
+    def update(
+        self,
+        pcd_world: np.ndarray,
+        robot_pose: np.ndarray,
+    ) -> None:
+        if len(pcd_world) == 0:
+            return
+        if self._view_gate(robot_pose):
+            return
+
+        # Fixed-grid voxelization (floor, same grid as window fusion)
+        vox = np.floor(pcd_world[:, :3] / self.voxel_size).astype(np.int64)
+        _, first_idx = np.unique(vox, axis=0, return_index=True)
+
+        vox = vox[np.sort(first_idx)]
+        pts = pcd_world[np.sort(first_idx)]
+        new_keys = _flat_key(vox)
+        self._last_pose = np.asarray(robot_pose, dtype=np.float32).copy()
+
+        # Merge only unseen voxels (first observation wins)
+        if self._keys.shape[0] == 0:
+            order = np.argsort(new_keys, kind="stable")
+            self._keys = new_keys[order]
+            self._points = pts[order].astype(np.float32)
+            new_only_keys = new_keys
+        else:
+            is_dup = np.isin(new_keys, self._keys)
+            new_only_keys = new_keys[~is_dup]
+            new_only_pts = pts[~is_dup]
+            if new_only_keys.shape[0] > 0:
+                all_keys = np.concatenate([self._keys, new_only_keys])
+                all_pts = np.concatenate([self._points, new_only_pts], axis=0)
+                order = np.argsort(all_keys, kind="stable")
+                self._keys = all_keys[order]
+                self._points = all_pts[order]
+
+        # Keep only the most recent max_frames frames
+        if self.max_frames is not None:
+            self._frame_keys.append(new_only_keys)
+            while len(self._frame_keys) > self.max_frames:
+                oldest = self._frame_keys.popleft()
+                if len(oldest) > 0:
+                    rm = np.isin(self._keys, oldest)
+                    self._keys = self._keys[~rm]
+                    self._points = self._points[~rm]
+
+        # Bounded-radius slide-out centered at the robot
+        self._slide_radius(robot_pose[:2])
+
     def to_camera_canonical(
         self,
         robot_xyz: np.ndarray,
         robot_yaw: float,
-        z_offset: float = 0.0,
+        z_offset: float = 0.0,  # 当前发送点云的 z 基准与 TSP3D 训练分布一致，平移破坏对齐
     ) -> np.ndarray:
         if self._keys.shape[0] == 0:
             return np.empty((0, 6), dtype=np.float32)
