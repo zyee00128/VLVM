@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, fields
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
@@ -15,11 +16,14 @@ from vlfm.policy.base_policy import BasePolicy
 from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
 from vlfm.utils.geometry_utils import rho_theta, extract_yaw, within_fov_cone, get_fov
 from vlfm.mapping.obstacle_map import ObstacleMap3D, ProbabilisticGrid
+from vlfm.vlm.blip2 import BLIP2Client
 from vlfm.vlm.blip2itm import BLIP2ITMClient
 from vlfm.vlm.tsp3d import TSP3DClient
 from vlfm.vlm.detections import ObjectDetections
 from vlfm.tsp3d_models.utils.pipeline import TSP3DInputPreprocessor
-from vlfm.tsp3d_models.utils.s_penalty import SPenaltyConfig, apply_s_penalty, near_surface_point, query_semantic_at
+from vlfm.tsp3d_models.utils.vqa_confirmation import vqa_confirm_detections
+from vlfm.tsp3d_models.utils.s_penalty import (SPenaltyConfig, apply_s_penalty, 
+                                            near_surface_point, query_semantic_at)
 
 PROMPT_SEPARATOR = "|"
 
@@ -66,6 +70,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             wm_min_view_yaw: float = 15.0,
             wm_max_voxels: int = 400000,
             wm_max_frames: Optional[int] = 8, 
+            wm_near_refresh_radius: Optional[float] = None,
+            wm_near_refresh_value: bool = False,
             distance_sample: bool = False,
             near_dist: float = 1.5,
             mid_dist: float = 3.0,
@@ -91,6 +97,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_radius_m: float = 0.5,
             s_penalty_use_surface: bool = True,
             goal_use_surface: bool = True,
+            use_vqa: bool = False,
+            vqa_prompt: str = "Is this ",
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -136,7 +144,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._target_fallback_state: Dict[str, List[Dict[str, Any]]] = {}
         self._last_target_coord: Union[None, np.ndarray] = None
         self._enable_fb = enable_fb
-        self._fb_near_radius = fb_near_radius
+        self._fb_near_radius = max_depth * 0.5 # fb_near_radius
         self._fb_hysteresis = fb_hysteresis
         self._fb_suspicious_hysteresis = fb_suspicious_hysteresis
         self._fb_suspicious_conf = fb_suspicious_conf
@@ -148,7 +156,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         )
         self._s_penalty_use_surface = s_penalty_use_surface
         self._goal_use_surface = goal_use_surface
-
+      
         # camera 8-frame window / world-frame accumulation, switched by use_world_map
         self._use_world_map = use_world_map
         self._preprocessor = TSP3DInputPreprocessor(
@@ -161,6 +169,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             min_view_yaw=np.deg2rad(wm_min_view_yaw),
             max_map_voxels=wm_max_voxels,
             map_max_frames=wm_max_frames,
+            map_near_refresh_radius=wm_near_refresh_radius,
+            map_near_refresh_value=wm_near_refresh_value,
             max_points=fuse_max_points,
             cam_radius=cam_radius,
             cam_min_view_disp=cam_min_view_disp,
@@ -177,9 +187,18 @@ class TSP3DObjectNavPolicy(BasePolicy):
         # 3D visual grounding and vision-language evaluation clients
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
         self._itm_client = BLIP2ITMClient(port=int(os.environ.get("BLIP2ITM_PORT", "12182")))
+        self._vqa_client = BLIP2Client(port=int(os.environ.get("BLIP2_PORT", "12185"))) if use_vqa else None
         self._pointnav_policy = WrappedPointNavResNetPolicy(pointnav_policy_path)
         self._text_prompt = text_prompt
-
+        self._vqa_prompt = vqa_prompt
+        self._use_vqa = use_vqa
+        self._vqa_confirm_detections = partial(
+            vqa_confirm_detections,
+            use_vqa=self._use_vqa,
+            vqa_client=self._vqa_client,
+            vqa_prompt=self._vqa_prompt,
+        )
+  
         # Core 3D spatial representations
         height_range = max_obstacle_height - min_obstacle_height
         height_size = int(height_range / voxel_size) + 1
@@ -278,7 +297,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         camera_yaw = extract_yaw(tf_camera_to_episodic)
         # hFOV from sensor-derived focal length so the cone matches the actual frustum.
         cone_fov = get_fov(self._fx, self._depth_image_shape[1])
-        near_radius = self._fb_near_radius
+        near_radius = self._fb_near_radius # max_depth * 0.5
 
         for target_class in list(self._target_3d_memory.keys()):
             centroids = self._target_3d_memory[target_class]
@@ -576,7 +595,12 @@ class TSP3DObjectNavPolicy(BasePolicy):
         # Skip memory accumulation during initialization turning (repeated surfaces pollute memory).
         if not self._done_initializing:
             return detections
-        
+
+        # BLIP2 VQA false-positive confirmation (VLFM-aligned): drop detections
+        # whose visual answer does not start with 'yes' before they reach memory.
+        if self._use_vqa and self._vqa_client is not None:
+            self._vqa_confirm_detections(detections)
+
         # S-penalty gate cross-validation -> write passed detections to memory.
         pending = apply_s_penalty(
             detections, target_classes, robot_xyz,
@@ -778,7 +802,7 @@ class VLVMConfig:
     near_voxel: float = 0.01            # distance sampling: near-band voxel (m)
     mid_voxel: float = 0.02             # distance sampling: mid-band voxel (m)
     far_voxel: float = 0.05             # distance sampling: far-band voxel (m)
-    use_world_map: bool = False         # True = world-frame accumulation / False = camera 8-frame window (baseline)
+    use_world_map: bool = True          # True = world-frame accumulation / False = camera 8-frame window (baseline)
 
     # Phase 5b: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
     pcd_window_size: int = 8                # Number of frames fused for point-cloud accumulation; larger = more complete geometry but slower/staler.
@@ -787,7 +811,7 @@ class VLVMConfig:
     cam_radius: Optional[float] = None      # camera: send-side horizontal radius crop (m), None = no crop (baseline); align with wm_radius=6.0 -> 6.0
     cam_min_view_disp: float = 0.15         # camera: min displacement (m) to accept a frame into fusion, 0 = off; world uses wm_min_view_disp 0.15
     cam_min_view_yaw: float = 15.0           # camera: min yaw change (deg) to accept a frame into fusion, 0 = off; world uses wm_min_view_yaw 15.0
-    
+
     # Phase 5c: World-frame Local Map (TSP3DInputPreprocessor)
     wm_max_frames: Optional[int] = 8  # world: frame-window cap (keep voxels of the most recent N frames); None = all history
     wm_voxel_size: float = 0.02       # world: local map voxel size (m) for fixed-grid dedup
@@ -795,6 +819,8 @@ class VLVMConfig:
     wm_radius: Optional[float] = 6.0  # world: local map radius (m), None = no crop (only max_voxels hard cap); cam_radius=None is the symmetric case
     wm_min_view_disp: float = 0.15    # world: min displacement (m) to accept a frame into fusion
     wm_min_view_yaw: float = 15.0     # world: min yaw change (deg) to accept a frame into fusion
+    wm_near_refresh_radius: Optional[float] = 3.0  # world: near-field refresh radius (m). None=off (first-observation accounting); >0: re-observed near-field voxels are re-owned by the current frame (cam-style accounting, survives frame-window slide-out).
+    wm_near_refresh_value: bool = False  # world: also overwrite the stored point of refreshed near-field voxels with the current observation (cam-style sliding refresh of the value layer). False = value layer stays first.
     
     # Phase 5d: S-penalty (semantic-field cross-validation)
     enable_s_penalty: bool = True           # Master switch: c' = c * w_S(S) — multiply TSP3D confidence by a semantic-field weight (BLIP2 ITM, zero extra queries) to amplify TP/FP discrimination.
@@ -803,6 +829,10 @@ class VLVMConfig:
     s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection point.
     s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
+
+    # Phase 5e: BLIP2 VQA false-positive confirmation (VLFM-aligned)
+    use_vqa: bool = False                   # Ask BLIP2 'Is this a {obj}?' on each TSP3D detection; drop answers not starting with 'yes'. Requires the BLIP2 VQA server (vlfm.vlm.blip2) on BLIP2_PORT.
+    vqa_prompt: str = "Is this "            # VQA question prefix; full prompt = 'Question: {vqa_prompt}[a ]{obj}? Answer:'.
 
     @classmethod  # type: ignore
     @property

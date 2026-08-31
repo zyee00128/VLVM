@@ -11,6 +11,7 @@ from .local_map import WorldLocalMap
 from .pipeline import TSP3DInputPreprocessor
 from .sampling import cap_point_count, distance_adaptive_sample, voxelize_world
 from .sliding_window import TemporalPcdWindow
+from .vqa_confirmation import vqa_confirm_detections
 
 __all__ = [
     "WorldLocalMap",
@@ -19,4 +20,5 @@ __all__ = [
     "voxelize_world",
     "distance_adaptive_sample",
     "cap_point_count",
+    "vqa_confirm_detections",
 ]

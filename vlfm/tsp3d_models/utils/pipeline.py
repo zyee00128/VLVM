@@ -26,6 +26,8 @@ class TSP3DInputPreprocessor:
         min_view_yaw: float = np.deg2rad(15.0),
         max_map_voxels: int = 400000,
         map_max_frames: Optional[int] = 8,
+        map_near_refresh_radius: Optional[float] = None,
+        map_near_refresh_value: bool = False,
         # send-side post-processing (shared by both routes)
         max_points: int = 200000,
         cap_style: str = "random",  # "random" / "near_first"
@@ -47,6 +49,8 @@ class TSP3DInputPreprocessor:
                 min_view_yaw=min_view_yaw,
                 max_voxels=max_map_voxels,
                 max_frames=map_max_frames,
+                near_refresh_radius=map_near_refresh_radius,
+                near_refresh_value=map_near_refresh_value,
             )
             self._window: Optional[TemporalPcdWindow] = None
         else:

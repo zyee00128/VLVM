@@ -36,6 +36,8 @@ class WorldLocalMap:
         min_view_yaw: float = np.deg2rad(15.0),
         max_voxels: int = 400000,
         max_frames: Optional[int] = 8,
+        near_refresh_radius: Optional[float] = None,
+        near_refresh_value: bool = False,
     ) -> None:
         self.voxel_size = float(voxel_size)
         self.radius = float(radius) if radius is not None else None
@@ -43,6 +45,10 @@ class WorldLocalMap:
         self.min_view_yaw = float(min_view_yaw)
         self.max_voxels = int(max_voxels)
         self.max_frames = int(max_frames) if max_frames is not None else None
+        self.near_refresh_radius = (
+            float(near_refresh_radius) if near_refresh_radius is not None else None
+        )
+        self.near_refresh_value = bool(near_refresh_value)
 
         # B2 (stricter gating) and B3 (keyframe sampling) are KEPT as reference only.
         # To re-enable, uncomment the gating blocks below and wire params through
@@ -126,7 +132,8 @@ class WorldLocalMap:
         new_keys = _flat_key(vox)
         self._last_pose = np.asarray(robot_pose, dtype=np.float32).copy()
 
-        # Merge only unseen voxels (first observation wins)
+        # Merge only unseen voxels
+        refresh_keys = np.empty(0, dtype=np.int64)
         if self._keys.shape[0] == 0:
             order = np.argsort(new_keys, kind="stable")
             self._keys = new_keys[order]
@@ -136,6 +143,27 @@ class WorldLocalMap:
             is_dup = np.isin(new_keys, self._keys)
             new_only_keys = new_keys[~is_dup]
             new_only_pts = pts[~is_dup]
+            # Near-field refresh: re-observed near-field voxels are re-owned by the current frame.
+            if self.max_frames is not None and self.near_refresh_radius is not None:
+                dup_keys = new_keys[is_dup]
+                if dup_keys.shape[0] > 0:
+                    dup_pts = pts[is_dup]
+                    dist = np.linalg.norm(
+                        dup_pts[:, :2] - np.asarray(robot_pose)[:2], axis=1
+                    )
+                    refresh = dist <= self.near_refresh_radius
+                    refresh_keys = dup_keys[refresh]
+                    if refresh_keys.shape[0] > 0:
+                        for i in range(len(self._frame_keys)):
+                            fk = self._frame_keys[i]
+                            if len(fk) > 0:
+                                rm = np.isin(fk, refresh_keys)
+                                if rm.any():
+                                    self._frame_keys[i] = fk[~rm]
+                        # Value-layer refresh: overwrite the stored point with the current observation.
+                        if self.near_refresh_value:
+                            idx = np.searchsorted(self._keys, refresh_keys)
+                            self._points[idx] = dup_pts[refresh]
             if new_only_keys.shape[0] > 0:
                 all_keys = np.concatenate([self._keys, new_only_keys])
                 all_pts = np.concatenate([self._points, new_only_pts], axis=0)
@@ -145,7 +173,13 @@ class WorldLocalMap:
 
         # Keep only the most recent max_frames frames
         if self.max_frames is not None:
-            self._frame_keys.append(new_only_keys)
+            if refresh_keys.shape[0] > 0 and new_only_keys.shape[0] > 0:
+                current_keys = np.concatenate([new_only_keys, refresh_keys])
+            elif refresh_keys.shape[0] > 0:
+                current_keys = refresh_keys
+            else:
+                current_keys = new_only_keys
+            self._frame_keys.append(current_keys)
             while len(self._frame_keys) > self.max_frames:
                 oldest = self._frame_keys.popleft()
                 if len(oldest) > 0:

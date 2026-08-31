@@ -63,7 +63,7 @@ habitat_baselines:
       init_turn_steps: 12
       min_depth: 0.5
       max_depth: 5.0
-  
+
       pointnav_stop_radius: 0.90 # 0.90
       # Anti-hallucination fallback
       enable_fb: True
@@ -71,7 +71,7 @@ habitat_baselines:
       fb_hysteresis: 5
       fb_suspicious_hysteresis: 2
       fb_suspicious_conf: 0.75
-
+      # obstacle map
       om_style: "probabilistic" # probabilistic/ obstacle
       voxel_size: 0.05
       min_obstacle_height: 0.15
@@ -86,7 +86,7 @@ habitat_baselines:
       agent_radius: 0.18
       agent_height: 0.88
       nav_slice_height: 0.30
-
+      # value map
       vm_style: "region"  # "region" (V1) / "surface" (V2)
       h_lam: 0.3
       h_norm_max: 1.0
@@ -95,7 +95,7 @@ habitat_baselines:
       query_radius_m: 0.5
       query_z_min: 0.15
       query_z_max: 1.50
-
+      # TSP3D query
       sigma_tar: 0.70
       sigma_sce: 0.15
       tau: 0.15
@@ -103,15 +103,7 @@ habitat_baselines:
       near_field_sigma_scale: 0.8
       # TSP3D Input Processing
       use_raw_nlp: False
-      cap_style: random           # point cap - "random" (baseline) / "near_first"
-      distance_sample: False      # distance-adaptive sampling (dense near / sparse far)
-      near_dist: 1.5
-      mid_dist: 3.0
-      near_voxel: 0.01
-      mid_voxel: 0.02
-      far_voxel: 0.05
-      use_world_map: False
-
+      use_world_map: True
       pcd_window_size: 8
       fuse_voxel_size: 0.02
       fuse_max_points: 200000
@@ -121,9 +113,18 @@ habitat_baselines:
       wm_max_frames: 8
       wm_voxel_size: 0.02
       wm_max_voxels: 400000
-      wm_radius: 6.0
+      wm_radius: 6.0 # 5 ~ 7 m
       wm_min_view_disp: 0.15
       wm_min_view_yaw: 15.0
+      wm_near_refresh_radius: 3.0 # world: near-field refresh radius (m), null=off; >0: re-observed near-field voxels re-owned by current frame (cam-style accounting)
+      wm_near_refresh_value: False # world: also overwrite refreshed near-field voxel points with current observation (value-layer sliding refresh); False = value layer stays first
+      cap_style: random # point cap - "random" (baseline) / "near_first"
+      distance_sample: True # distance-adaptive sampling (dense near / sparse far)
+      near_dist: 1.5
+      mid_dist: 3.0
+      near_voxel: 0.01
+      mid_voxel: 0.02
+      far_voxel: 0.05
       # S-penalty
       enable_s_penalty: True
       s_penalty_thresh: 0.15
@@ -132,6 +133,9 @@ habitat_baselines:
       # near-surface point
       s_penalty_use_surface: True
       goal_use_surface: True
+      # BLIP2 VQA false-positive confirmation # 没用的东西
+      use_vqa: False
+      vqa_prompt: "Is this "
 
     ppo:
       clip_param: 0.2
