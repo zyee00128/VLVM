@@ -32,9 +32,9 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 set -o pipefail
 
 # ----------------- 输出目录与数据集 -----------------
-OUT_DIR="$PROJECT_ROOT/outputs/VLVM-V4.5"
+OUT_DIR="$PROJECT_ROOT/outputs/VLVM-V5"
 mkdir -p "$OUT_DIR"
-SCENES="[5cdEh9F2hJL]"   # HM3D 场景（数据集固定）
+SCENES="[TEEsavR23oF, mv2HUxq3B53, wcojb4TFT35]"   # HM3D val 三场景（Stage2 多场景基准，排除 Stage1 主场景 5cdEh9F2hJL）
 
 export TSP3D_DATA_PATH=${TSP3D_DATA_PATH:-/root/autodl-tmp/vlvm/data/tsp3d_models/}
 TSP3D_PORT=${TSP3D_PORT:-12186}
@@ -42,7 +42,7 @@ TSP3D_PORT=${TSP3D_PORT:-12186}
 # ----------------- 实验定义 -----------------
 # 格式: 标签 | 参数覆盖（多个 hydra 键=值，空格分隔；值含 { } 需单引号包裹）
 EXPERIMENTS=(
-    "wm_near_refresh_val|habitat_baselines.rl.policy.use_world_map=True habitat_baselines.rl.policy.wm_near_refresh_radius=3.0 habitat_baselines.rl.policy.wm_near_refresh_value=True"
+    "vlvm_stage2_base|"   # 空覆盖 = YAML 定稿配置（wm_near_refresh_val 全开：wm_near_refresh_radius=3.0 + wm_near_refresh_value=True + D3 + S-penalty）
 )
 
 # ----------------- 运行 -----------------
@@ -76,3 +76,5 @@ echo "================================================="
 echo "全部实验完成！"
 echo "日志目录: $OUT_DIR"
 echo "================================================="
+# bash ./scripts/launch_vlm_servers.sh
+# bash ./scripts/my_eval.sh

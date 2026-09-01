@@ -102,7 +102,7 @@ habitat_baselines:
       near_field_dist: 1.0
       near_field_sigma_scale: 0.8
       # TSP3D Input Processing
-      use_raw_nlp: False
+      use_vlfm_nlp: False
       use_world_map: True
       pcd_window_size: 8
       fuse_voxel_size: 0.02
@@ -117,7 +117,7 @@ habitat_baselines:
       wm_min_view_disp: 0.15
       wm_min_view_yaw: 15.0
       wm_near_refresh_radius: 3.0 # world: near-field refresh radius (m), null=off; >0: re-observed near-field voxels re-owned by current frame (cam-style accounting)
-      wm_near_refresh_value: False # world: also overwrite refreshed near-field voxel points with current observation (value-layer sliding refresh); False = value layer stays first
+      wm_near_refresh_value: True # world: also overwrite refreshed near-field voxel points with current observation (value-layer sliding refresh); False = value layer stays first
       cap_style: random # point cap - "random" (baseline) / "near_first"
       distance_sample: True # distance-adaptive sampling (dense near / sparse far)
       near_dist: 1.5
@@ -133,6 +133,7 @@ habitat_baselines:
       # near-surface point
       s_penalty_use_surface: True
       goal_use_surface: True
+      
       # BLIP2 VQA false-positive confirmation # 没用的东西
       use_vqa: False
       vqa_prompt: "Is this "

@@ -190,7 +190,7 @@ class ObjectDetections:
             return "No detections"
         return "\n".join(dets)
 
-    def filter_by_conf(self, conf_thresh: float, use_raw_nlp: bool = True) -> "ObjectDetections":
+    def filter_by_conf(self, conf_thresh: float, use_vlfm_nlp: bool = True) -> "ObjectDetections":
         """
         Filter detections in-place according to the confidence threshold.
 
@@ -198,7 +198,7 @@ class ObjectDetections:
             conf_thresh (float): Confidence threshold. A higher value keeps
                 fewer but more reliable detections, while a lower value keeps
                 more detections at the cost of more false positives.
-            use_raw_nlp (bool): Unused; kept for API compatibility.
+            use_vlfm_nlp (bool): Unused; kept for API compatibility.
         """
         if len(self.logits) == 0:
             return self
@@ -206,7 +206,7 @@ class ObjectDetections:
         self._filter(keep)
         return self
 
-    def filter_by_class(self, classes: List[str], use_raw_nlp: bool = True) -> "ObjectDetections":
+    def filter_by_class(self, classes: List[str], use_vlfm_nlp: bool = True) -> "ObjectDetections":
         """
         Filters detections in-place to keep only specified classes.
         """
@@ -230,7 +230,7 @@ class ObjectDetections:
                 raw_split = [p_lower.strip().replace(".", "")]
 
             # Determine active queries based on VLM NLP parsing settings
-            if use_raw_nlp:
+            if use_vlfm_nlp:
                 # Keep all split terms active
                 active_queries = raw_split
             else:

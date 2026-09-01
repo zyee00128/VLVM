@@ -4,7 +4,9 @@ data/
 # 实验日志 / TensorBoard
 lockfiles/
 md/
+results/
 outputs/
+outputs_Stage1/
 tb/
 
 # Python 缓存与构建产物 / 其他

@@ -1,7 +1,7 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import cv2
 import numpy as np
@@ -26,6 +26,13 @@ def log_episode_stats(episode_id: int, scene_id: str, infos: Dict) -> str:
     else:
         failure_cause = determine_failure_cause(infos)
         print(f"Episode {episode_id} in scene {scene} failed due to '{failure_cause}'.")
+
+    oracle_succ = compute_oracle_success(infos)
+    print(
+        f"[Oracle] Episode {episode_id} scene {scene} "
+        f"target '{infos.get('target_object', 'unknown')}' "
+        f"success={int(infos['success'])} oracle_success={oracle_succ}"
+    )
 
     if "ZSOS_LOG_DIR" in os.environ:
         infos_no_map = infos.copy()
@@ -81,6 +88,20 @@ def was_target_seen(infos: Dict[str, Any]) -> bool:
     return target_explored
 
 
+def compute_oracle_success(infos: Dict[str, Any]) -> int:
+    """Oracle Success Rate for a single episode.
+
+    Oracle = 1 if the target bbox was ever covered by the explored (fog-of-war)
+    area during the episode. fog_of_war is cumulative, so the final frame's state
+    is equivalent to "ever seen". Ground-truth signal, detector-agnostic (same
+    signal used by ``determine_failure_cause`` for ``false_negative``).
+    """
+    try:
+        return int(was_target_seen(infos))
+    except Exception:
+        return 0
+
+
 def was_false_positive(infos: Dict[str, Any]) -> bool:
     """Return whether the point goal target is within a bounding box."""
     target_bboxes_mask = infos["top_down_map"]["target_bboxes_mask"]
@@ -129,3 +150,76 @@ def remove_numpy_arrays(d: Any) -> Dict:
             new_dict[key] = value
 
     return new_dict
+
+
+def _point_in_target_bbox(
+    infos: Dict[str, Any], point_episodic_xy, dilated_mask=None
+) -> bool:
+    """Whether a world (episodic) point falls inside the dilated target bbox mask.
+
+    Uses the final-frame top_down_map's ``target_bboxes_mask`` (static GT), the
+    same coordinate transform as ``was_false_positive``. ``dilated_mask`` may be
+    precomputed to avoid re-dilating per call.
+    """
+    try:
+        if dilated_mask is None:
+            target_bboxes_mask = infos["top_down_map"]["target_bboxes_mask"]
+            dilated_mask = cv2.dilate(target_bboxes_mask, np.ones((10, 10)))
+        upper_bound = infos["top_down_map"]["upper_bound"]
+        lower_bound = infos["top_down_map"]["lower_bound"]
+        grid_resolution = infos["top_down_map"]["grid_resolution"]
+        tf_episodic_to_global = infos["top_down_map"]["tf_episodic_to_global"]
+
+        point_episodic_xyz = np.array(
+            [point_episodic_xy[0], point_episodic_xy[1], 0.0]
+        ).reshape(1, 3)
+        point_global_xyz = transform_points(tf_episodic_to_global, point_episodic_xyz)
+        point_global_habitat = xyz_to_habitat(point_global_xyz)
+        point_global_habitat_xy = point_global_habitat[:, [2, 0]]
+
+        grid_xy = sim_xy_to_grid_xy(
+            upper_bound,
+            lower_bound,
+            grid_resolution,
+            point_global_habitat_xy,
+            remove_duplicates=True,
+        )
+        return bool(dilated_mask[grid_xy[0, 0], grid_xy[0, 1]] != 0)
+    except Exception:
+        return False
+
+
+def aggregate_detect_stats(
+    infos: Dict[str, Any], detect_logs: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Detection-level statistics for one episode (TSP3D detections vs GT target bbox).
+
+    ``detect_logs`` entries: {conf, conf_amp, centroid, s, admitted} (from
+    ``apply_s_penalty(..., out_log=...)``).
+
+    Returns a dict with counts and per-detection score arrays.
+    """
+    total = len(detect_logs)
+    if total == 0:
+        return {"total": 0, "tp": 0, "fp": 0, "scores": [], "conf_amps": [], "tp_flags": [], "admitted": []}
+
+    try:
+        dilated_mask = cv2.dilate(
+            infos["top_down_map"]["target_bboxes_mask"], np.ones((10, 10))
+        )
+    except Exception:
+        dilated_mask = None
+
+    tp_flags = []
+    for det in detect_logs:
+        tp_flags.append(_point_in_target_bbox(infos, det["centroid"][:2], dilated_mask))
+    tp = int(sum(tp_flags))
+    return {
+        "total": total,
+        "tp": tp,
+        "fp": total - tp,
+        "scores": [float(d["conf"]) for d in detect_logs],
+        "conf_amps": [float(d.get("conf_amp", d["conf"])) for d in detect_logs],
+        "tp_flags": tp_flags,
+        "admitted": [bool(d.get("admitted", False)) for d in detect_logs],
+    }

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -65,10 +65,14 @@ def apply_s_penalty(
     use_surface: bool,
     goal_use_surface: bool,
     nlp_mode: bool,
+    out_log: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Tuple[float, np.ndarray, Optional[np.ndarray], List[str]]]:
     """S-penalty + admission gate for filtered detections.
 
     Returns [(conf_amp, centroid, near_surface, active_classes)].
+
+    If ``out_log`` is given, one dict per detection is appended for
+    detection-level diagnostics: {conf, conf_amp, centroid, s, admitted}.
     """
     import torch  # local import keeps the module torch-free at import time
 
@@ -90,7 +94,18 @@ def apply_s_penalty(
         s = query_semantic(s_pt[0], s_pt[1], cfg.radius_m)
         w_s, _ = compute_w_s(s, cfg)
         conf_amp = conf_f * w_s
-        if conf_amp < sigma_tar:
+        admitted = conf_amp >= sigma_tar
+        if out_log is not None:
+            out_log.append(
+                {
+                    "conf": conf_f,
+                    "conf_amp": conf_amp,
+                    "centroid": centroid_np,
+                    "s": s,
+                    "admitted": bool(admitted),
+                }
+            )
+        if not admitted:
             continue  # gate: reject
         # near-surface point stored for the nav goal (first-write fixed).
         near_surface = None

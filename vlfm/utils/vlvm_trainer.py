@@ -38,6 +38,190 @@ def extract_scalars_from_info(info: Dict[str, Any]) -> Dict[str, float]:
     return extract_scalars_from_info_habitat(info_filtered)
 
 
+CAUSE_COLS = ["success", "fp", "fn", "nv", "bad_stop", "timeout", "other"]
+
+
+def _cause_short(cause: str) -> str:
+    if cause == "did_not_fail":
+        return "success"
+    if cause == "false_positive":
+        return "fp"
+    if cause == "false_negative":
+        return "fn"
+    if cause == "bad_stop_true_positive":
+        return "bad_stop"
+    if cause == "timeout_true_positive":
+        return "timeout"
+    if isinstance(cause, str) and cause.startswith("never_saw"):
+        return "nv"
+    return "other"
+
+
+def _print_failure_cross_tab(episode_records: List[Dict[str, Any]]) -> None:
+    """Per-target (and per-scene x target) x failure-cause counts."""
+    print("=" * 66)
+    print("=== Failure-cause cross-tab ===")
+
+    def _tab(groups: Dict[str, List[Dict[str, Any]]]) -> None:
+        header = f"{'key':<20}" + "".join(f"{c:>9}" for c in CAUSE_COLS)
+        print(header)
+        for key in sorted(groups, key=lambda x: -len(groups[x])):
+            cnt = {c: 0 for c in CAUSE_COLS}
+            for r in groups[key]:
+                cnt[_cause_short(r.get("failure_cause", "other"))] += 1
+            print(f"{key:<20}" + "".join(f"{cnt[c]:>9}" for c in CAUSE_COLS))
+
+    by_target: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    by_scene: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in episode_records:
+        by_target[r["target_object"]].append(r)
+        by_scene[os.path.basename(r["scene_id"]).split(".")[0]].append(r)
+    _tab(by_target)
+    if len(by_scene) > 1:
+        for scene in sorted(by_scene):
+            print(f"-- scene {scene} --")
+            scene_targets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for r in by_scene[scene]:
+                scene_targets[r["target_object"]].append(r)
+            _tab(scene_targets)
+
+
+def _print_oracle_subset(episode_records: List[Dict[str, Any]]) -> None:
+    """Episodes where the target was ever seen (oracle=1) but not reached (success=0)."""
+    print("=" * 66)
+    print("=== Oracle subset (oracle_success=1 & success=0) ===")
+    total_oracle = sum(1 for r in episode_records if r.get("oracle_success") == 1)
+    subset = [
+        r
+        for r in episode_records
+        if r.get("oracle_success") == 1 and r.get("success") == 0
+    ]
+    print(
+        f"count: {len(subset)} / oracle_success={total_oracle} "
+        f"({len(subset) / max(1, total_oracle) * 100:.1f}% of oracle-success episodes)"
+    )
+    cnt = {c: 0 for c in CAUSE_COLS}
+    for r in subset:
+        cnt[_cause_short(r.get("failure_cause", "other"))] += 1
+    print("cause: " + ", ".join(f"{c}={cnt[c]}" for c in CAUSE_COLS if cnt[c]))
+    for r in sorted(subset, key=lambda x: os.path.basename(x["scene_id"])):
+        scene = os.path.basename(r["scene_id"]).split(".")[0]
+        steps = r.get("steps_count", 0.0)
+        print(
+            f"  {scene} | target={r['target_object']:<12} "
+            f"cause={r.get('failure_cause'):<44} steps={steps:.0f}"
+        )
+
+
+def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
+    """TSP3D detection-level precision + true/false-positive score distributions."""
+    stats = [r.get("detect_stats") for r in episode_records if r.get("detect_stats")]
+    if not stats:
+        return
+    total = sum(s["total"] for s in stats)
+    tp = sum(s["tp"] for s in stats)
+    fp = sum(s["fp"] for s in stats)
+    eps_with_tp = sum(1 for s in stats if s["tp"] > 0)
+    print("=" * 66)
+    print("=== Detection-level metrics (TSP3D) ===")
+    print(
+        f"total detections: {total}  (tp={tp} {tp / max(1, total) * 100:.1f}% / "
+        f"fp={fp} {fp / max(1, total) * 100:.1f}%)"
+    )
+    print(f"precision: {tp / max(1, total) * 100:.2f}%")
+    print(f"episodes with >=1 true-positive detection: {eps_with_tp}/{len(stats)}")
+
+    def _dist(name: str, arr) -> None:
+        if not arr:
+            return
+        a = np.array(arr, dtype=float)
+        print(
+            f"  {name:<18} n={len(a):>6}  min={a.min():.3f} mean={a.mean():.3f} "
+            f"p50={np.percentile(a, 50):.3f} p90={np.percentile(a, 90):.3f} max={a.max():.3f}"
+        )
+
+    scores_all = [v for s in stats for v in s.get("scores", [])]
+    conf_all = [v for s in stats for v in s.get("conf_amps", [])]
+    tp_scores = [
+        v for s in stats for v, f in zip(s.get("scores", []), s.get("tp_flags", [])) if f
+    ]
+    fp_scores = [
+        v for s in stats for v, f in zip(s.get("scores", []), s.get("tp_flags", [])) if not f
+    ]
+    _dist("maxscore (all)", scores_all)
+    _dist("c' (all)", conf_all)
+    _dist("maxscore (tp)", tp_scores)
+    _dist("maxscore (fp)", fp_scores)
+
+
+def _print_eval_breakdown(episode_records: List[Dict[str, Any]]) -> None:
+    """Print Oracle Success Rate + per-target + per-scene metric breakdowns.
+
+    Args:
+        episode_records: One dict per finished episode with keys: scene_id,
+            target_object, success, oracle_success, spl, soft_spl, steps_count.
+    """
+    n = len(episode_records)
+    if n == 0:
+        return
+
+    def _agg(recs: List[Dict[str, Any]]) -> Dict[str, float]:
+        return {
+            "success": float(np.mean([r["success"] for r in recs])),
+            "oracle_success": float(np.mean([r["oracle_success"] for r in recs])),
+            "spl": float(np.mean([r.get("spl", 0.0) for r in recs])),
+            "soft_spl": float(np.mean([r.get("soft_spl", 0.0) for r in recs])),
+            "steps": float(np.mean([r.get("steps_count", 0.0) for r in recs])),
+        }
+
+    def _print_table(title: str, groups: Dict[str, List[Dict[str, Any]]]) -> None:
+        has_steps = any(
+            r.get("steps_count", 0.0) > 0
+            for recs in groups.values()
+            for r in recs
+        )
+        print("=" * 66)
+        print(f"=== {title} ===")
+        header = (
+            f"{'key':<20}{'episodes':>9}{'success':>10}{'oracle':>10}"
+            f"{'spl':>10}{'soft_spl':>10}"
+        )
+        if has_steps:
+            header += f"{'avg_steps':>11}"
+        print(header)
+        for key in sorted(groups, key=lambda x: -len(groups[x])):
+            a = _agg(groups[key])
+            row = (
+                f"{key:<20}{len(groups[key]):>9}{a['success'] * 100:>9.1f}%"
+                f"{a['oracle_success'] * 100:>9.1f}%{a['spl']:>10.4f}{a['soft_spl']:>10.4f}"
+            )
+            if has_steps:
+                row += f"{a['steps']:>11.1f}"
+            print(row)
+
+    print("=" * 66)
+    print("=== Oracle Success Rate ===")
+    total_oracle = sum(r["oracle_success"] for r in episode_records)
+    print(
+        f"Oracle Success Rate: {total_oracle / n * 100:.2f}% "
+        f"({total_oracle} out of {n})"
+    )
+
+    by_target: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    by_scene: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in episode_records:
+        by_target[r["target_object"]].append(r)
+        by_scene[os.path.basename(r["scene_id"]).split(".")[0]].append(r)
+    _print_table("Per-target metrics", by_target)
+    if len(by_scene) > 1:
+        _print_table("Per-scene metrics (multi-scene run)", by_scene)
+
+    _print_failure_cross_tab(episode_records)
+    _print_oracle_subset(episode_records)
+    _print_detection_metrics(episode_records)
+    print("=" * 66)
+
+
 @baseline_registry.register_trainer(name="vlvm")
 class VLVMTrainer(PPOTrainer):
     envs: VectorEnv
@@ -126,6 +310,7 @@ class VLVMTrainer(PPOTrainer):
         )
         stats_episodes: Dict[Any, Any] = {}  # dict of dicts that stores stats per episode
         ep_eval_count: Dict[Any, int] = defaultdict(lambda: 0)
+        episode_records: List[Dict[str, Any]] = []  # per-episode records for breakdown aggregation
 
         rgb_frames: List[List[np.ndarray]] = [[] for _ in range(self.config.habitat_baselines.num_environments)]
         if len(self.config.habitat_baselines.eval.video_option) > 0:
@@ -300,7 +485,11 @@ class VLVMTrainer(PPOTrainer):
                     num_total += 1
                     print(f"Success rate: {num_successes / num_total * 100:.2f}% ({num_successes} out of {num_total})")
 
-                    from vlfm.utils.episode_stats_logger import log_episode_stats
+                    from vlfm.utils.episode_stats_logger import (
+                        aggregate_detect_stats,
+                        compute_oracle_success,
+                        log_episode_stats,
+                    )
 
                     try:
                         failure_cause = log_episode_stats(
@@ -318,6 +507,35 @@ class VLVMTrainer(PPOTrainer):
                             flush=True,
                         )
                         failure_cause = "Unknown"
+
+                    detect_stats = None
+                    try:
+                        detect_logs = (
+                            getattr(self._agent.actor_critic, "_detect_logs", None)
+                            or []
+                        )
+                        if detect_logs:
+                            detect_stats = aggregate_detect_stats(infos[i], detect_logs)
+                    except Exception:
+                        detect_stats = None
+
+                    episode_records.append(
+                        {
+                            "scene_id": current_episodes_info[i].scene_id,
+                            "target_object": str(
+                                infos[i].get("target_object", "unknown")
+                            ),
+                            "success": int(episode_stats["success"]),
+                            "oracle_success": compute_oracle_success(infos[i]),
+                            "failure_cause": failure_cause,
+                            "detect_stats": detect_stats,
+                            "spl": float(episode_stats.get("spl", 0.0)),
+                            "soft_spl": float(episode_stats.get("soft_spl", 0.0)),
+                            "steps_count": float(
+                                episode_stats.get("steps_count", 0.0)
+                            ),
+                        }
+                    )
 
                     if len(self.config.habitat_baselines.eval.video_option) > 0:
                         rgb_frames[i] = hab_vis.flush_frames(failure_cause)
@@ -388,6 +606,8 @@ class VLVMTrainer(PPOTrainer):
 
         for k, v in aggregated_stats.items():
             logger.info(f"Average episode {k}: {v:.4f}")
+
+        _print_eval_breakdown(episode_records)
 
         step_id = checkpoint_index
         if "extra_state" in ckpt_dict and "step" in ckpt_dict["extra_state"]:

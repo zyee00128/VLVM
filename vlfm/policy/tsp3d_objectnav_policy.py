@@ -62,7 +62,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             tau: float = 0.15,
             near_field_dist: float = 1.0,
             near_field_sigma_scale: float = 0.8,
-            use_raw_nlp: bool = False,
+            use_vlfm_nlp: bool = False,
             use_world_map: bool = False,
             wm_voxel_size: float = 0.02,
             wm_radius: float = 6.0,
@@ -128,7 +128,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._tau = tau
         self._near_field_dist = near_field_dist
         self._near_field_sigma_scale = near_field_sigma_scale
-        self._nlp_mode = use_raw_nlp
+        self._nlp_mode = use_vlfm_nlp
         self._pointnav_stop_radius = pointnav_stop_radius
         self._init_step_count = 0
         self._num_steps = 0
@@ -255,6 +255,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._pointnav_policy.reset()
         self._obstacle_map3d.reset()
         self._preprocessor.reset()
+        self._detect_logs = []  # per-detection logs for detection-level metrics
         self._did_reset = True
 
     # ==========================================================================
@@ -427,7 +428,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             sigma_tar=self._sigma_tar,
             sigma_sce=dynamic_sigma_sce,
             tau=self._tau,
-            use_raw_nlp=self._nlp_mode,
+            use_vlfm_nlp=self._nlp_mode,
         )
 
         return raw_preds, diagnostics
@@ -591,7 +592,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         detections.filter_by_conf(self._sigma_tar)
         target_classes = [c.strip() for c in self._target_object.split("|") if c.strip()]
-        detections.filter_by_class(target_classes, use_raw_nlp=self._nlp_mode)
+        detections.filter_by_class(target_classes, use_vlfm_nlp=self._nlp_mode)
         # Skip memory accumulation during initialization turning (repeated surfaces pollute memory).
         if not self._done_initializing:
             return detections
@@ -610,6 +611,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             use_surface=self._s_penalty_use_surface,
             goal_use_surface=self._goal_use_surface,
             nlp_mode=self._nlp_mode,
+            out_log=self._detect_logs,
         )
         for conf_amp, centroid_np, near_surface, active_classes in pending:
             for cls in active_classes:
@@ -794,7 +796,7 @@ class VLVMConfig:
     tau: float = 0.15                   # Soft-pruning temperature; higher = smoother/looser pruning, lower = harder thresholding.
     near_field_dist: float = 1.0        # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
     near_field_sigma_scale: float = 0.8 # Minimum voxel retention ratio near surfaces; higher = keep more voxels near obstacles.
-    use_raw_nlp: bool = False           # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
+    use_vlfm_nlp: bool = False           # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
     cap_style: str = "random"           # send-side point cap (shared): "random" (baseline) / "near_first" (near-field priority)
     distance_sample: bool = False       # distance-adaptive sampling (dense near / sparse far, shared post-processing)
     near_dist: float = 1.5              # distance sampling: near/mid band boundary (m)

@@ -68,7 +68,7 @@ class TSP3D:
             sigma_sce: float = 0.3, 
             sigma_tar: float = 0.05, 
             tau: float = 0.15,
-            use_raw_nlp: bool = True
+            use_vlfm_nlp: bool = True
         ) -> List[Dict[str, Any]]:
         """
         Use the TSP3D model to perform 3D object detection and visual grounding.
@@ -79,14 +79,14 @@ class TSP3D:
             sigma_sce (float): Scene voxel pruning threshold (TGP).
             sigma_tar (float): Target confidence threshold.
             tau (float): Soft-pruning temperature coefficient.
-            use_raw_nlp (bool): Whether to use raw natural language prompt formatting.
+            use_vlfm_nlp (bool): Whether to use raw natural language prompt formatting.
         Returns:
             List[Dict[str, Any]]: Detected 3D bounding boxes and scores.
         """
         if len(pcd) == 0:
             return [], {}
 
-        if use_raw_nlp:
+        if use_vlfm_nlp:
             # Multi-class synonym merging caption
             classes = [c.strip() for c in text.split(PROMPT_SEPARATOR) if c.strip()]
             if len(classes) > 1:
@@ -184,7 +184,7 @@ class TSP3DClient:
         sigma_sce: float = 0.3, 
         sigma_tar: float = 0.05, 
         tau: float = 0.15,
-        use_raw_nlp: bool = True
+        use_vlfm_nlp: bool = True
     ) -> List[Dict[str, Any]]:
         # Send point cloud as compact binary (float16) + base64, replacing the
         # slow tolist()+JSON-text serialization of the raw float32 array.
@@ -196,7 +196,7 @@ class TSP3DClient:
             "sigma_sce": sigma_sce,
             "sigma_tar": sigma_tar,
             "tau": tau,
-            "use_raw_nlp": use_raw_nlp
+            "use_vlfm_nlp": use_vlfm_nlp
         }
         response = send_request(self.url, **payload)
         return response.get("detections", []), response.get("diagnostics", {})
@@ -224,9 +224,9 @@ if __name__ == "__main__":
                 sigma_sce = payload.get("sigma_sce", 0.7)
                 sigma_tar = payload.get("sigma_tar", 0.3)
                 tau = payload.get("tau", 0.15)
-                use_raw_nlp = payload.get("use_raw_nlp", True)
+                use_vlfm_nlp = payload.get("use_vlfm_nlp", True)
 
-                detections, diagnostics = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_raw_nlp)
+                detections, diagnostics = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_vlfm_nlp)
                 return {"detections": detections, "diagnostics": diagnostics}
             return {}
 
