@@ -8,7 +8,6 @@ export TSP3D_DATA_PATH=${TSP3D_DATA_PATH:-/root/autodl-tmp/vlvm/data/tsp3d_model
 export TSP3D_CHECKPOINT=${TSP3D_CHECKPOINT:-data/tsp3d_models/tsp3d_scanrefer.pth}
 export TSP3D_PORT=${TSP3D_PORT:-12186}
 export BLIP2ITM_PORT=${BLIP2ITM_PORT:-12182}
-export BLIP2_PORT=${BLIP2_PORT:-12185}
 
 session_name=vlm_servers_${RANDOM}
 
@@ -17,13 +16,10 @@ tmux new-session -d -s ${session_name}
 
 # Split the window vertically
 tmux split-window -h -t ${session_name}:0
-# # Split off a third pane for the BLIP2 VQA server
-# tmux split-window -h -t ${session_name}:0.1
 
 # Run commands in each pane
 tmux send-keys -t ${session_name}:0.0 "${VLVM_PYTHON} -m vlfm.vlm.tsp3d --port ${TSP3D_PORT}" C-m
 tmux send-keys -t ${session_name}:0.1 "${VLVM_PYTHON} -m vlfm.vlm.blip2itm --port ${BLIP2ITM_PORT}" C-m
-# tmux send-keys -t ${session_name}:0.2 "${VLVM_PYTHON} -m vlfm.vlm.blip2 --port ${BLIP2_PORT}" C-m
 
 # 提示连接方法
 echo "Created tmux session '${session_name}'. You must wait up to 90 seconds for the model weights to finish being loaded."

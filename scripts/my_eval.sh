@@ -34,7 +34,8 @@ set -o pipefail
 # ----------------- 输出目录与数据集 -----------------
 OUT_DIR="$PROJECT_ROOT/outputs/VLVM-V5"
 mkdir -p "$OUT_DIR"
-SCENES="[TEEsavR23oF, mv2HUxq3B53, wcojb4TFT35]"   # HM3D val 三场景（Stage2 多场景基准，排除 Stage1 主场景 5cdEh9F2hJL）
+# SCENES="[TEEsavR23oF, mv2HUxq3B53, wcojb4TFT35]"
+SCENES="[5cdEh9F2hJL]"
 
 export TSP3D_DATA_PATH=${TSP3D_DATA_PATH:-/root/autodl-tmp/vlvm/data/tsp3d_models/}
 TSP3D_PORT=${TSP3D_PORT:-12186}
@@ -42,7 +43,8 @@ TSP3D_PORT=${TSP3D_PORT:-12186}
 # ----------------- 实验定义 -----------------
 # 格式: 标签 | 参数覆盖（多个 hydra 键=值，空格分隔；值含 { } 需单引号包裹）
 EXPERIMENTS=(
-    "vlvm_stage2_base|"   # 空覆盖 = YAML 定稿配置（wm_near_refresh_val 全开：wm_near_refresh_radius=3.0 + wm_near_refresh_value=True + D3 + S-penalty）
+    "panoramic_V2|habitat_baselines.rl.policy.fusion_style=panoramic"   # 全景融合（触发写死 and = 簇追踪+距离兜底，09-03 定稿）
+    # "Stage1 base|habitat_baselines.rl.policy.fusion_style=world"
 )
 
 # ----------------- 运行 -----------------

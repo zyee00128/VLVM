@@ -1,6 +1,5 @@
 import os
 from dataclasses import dataclass, fields
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
@@ -14,14 +13,12 @@ except Exception:
 from vlfm.obs_transformers.utils import image_resize
 from vlfm.policy.base_policy import BasePolicy
 from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
-from vlfm.utils.geometry_utils import rho_theta, extract_yaw, within_fov_cone, get_fov
+from vlfm.utils.geometry_utils import rho_theta, extract_yaw, within_fov_cone, get_fov, closest_point_within_threshold
 from vlfm.mapping.obstacle_map import ObstacleMap3D, ProbabilisticGrid
-from vlfm.vlm.blip2 import BLIP2Client
 from vlfm.vlm.blip2itm import BLIP2ITMClient
 from vlfm.vlm.tsp3d import TSP3DClient
 from vlfm.vlm.detections import ObjectDetections
 from vlfm.tsp3d_models.utils.pipeline import TSP3DInputPreprocessor
-from vlfm.tsp3d_models.utils.vqa_confirmation import vqa_confirm_detections
 from vlfm.tsp3d_models.utils.s_penalty import (SPenaltyConfig, apply_s_penalty, 
                                             near_surface_point, query_semantic_at)
 
@@ -63,7 +60,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             near_field_dist: float = 1.0,
             near_field_sigma_scale: float = 0.8,
             use_vlfm_nlp: bool = False,
-            use_world_map: bool = False,
+            fusion_style: str = "world",  # "camera" / "world" / "panoramic"
             wm_voxel_size: float = 0.02,
             wm_radius: float = 6.0,
             wm_min_view_disp: float = 0.15,
@@ -71,8 +68,14 @@ class TSP3DObjectNavPolicy(BasePolicy):
             wm_max_voxels: int = 400000,
             wm_max_frames: Optional[int] = 8, 
             wm_near_refresh_radius: Optional[float] = None,
-            wm_near_refresh_value: bool = False,
-            distance_sample: bool = False,
+            wm_near_refresh_value: bool = True,
+            panoramic_turn_steps: int = 6,
+            panoramic_voxel_size: float = 0.02,
+            panoramic_radius: Optional[float] = 6.0,
+            panoramic_max_points: int = 200000,
+            panoramic_min_move: float = 2.0,
+            panoramic_arrive_dist: float = 1.0,
+            distance_sample: bool = True,
             near_dist: float = 1.5,
             mid_dist: float = 3.0,
             near_voxel: float = 0.01,
@@ -97,8 +100,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_radius_m: float = 0.5,
             s_penalty_use_surface: bool = True,
             goal_use_surface: bool = True,
-            use_vqa: bool = False,
-            vqa_prompt: str = "Is this ",
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -140,9 +141,27 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._turn_left_action = torch.tensor([[2]], dtype=torch.long)
         self._target_3d_memory: Dict[str, List[np.ndarray]] = {}
         self._target_surface_memory: Dict[str, List[np.ndarray]] = {}  # per-centroid near-surface point
-        self._target_verify_state: Dict[str, List[Tuple[int, np.ndarray]]] = {}
+        # (num_obs, last robot xy, last robot yaw, c' = S-penalty score)
+        self._target_verify_state: Dict[str, List[Tuple[int, np.ndarray, float, float]]] = {}
         self._target_fallback_state: Dict[str, List[Dict[str, Any]]] = {}
         self._last_target_coord: Union[None, np.ndarray] = None
+
+        self._scan_turn_action = torch.tensor([[6]], dtype=torch.long)
+        self._panoramic_min_move = float(panoramic_min_move)
+        self._panoramic_arrive_dist = float(panoramic_arrive_dist)
+        self._panoramic_turn_steps = max(int(panoramic_turn_steps), 1)
+        self._panoramic_scan_angle_deg = 360.0 / self._panoramic_turn_steps
+        _expected_turns = max(1, int(round(self._panoramic_scan_angle_deg / 30.0)))
+        _env_turns = max(int(os.environ.get("TURN_LEFT_WIDE_TURNS", str(_expected_turns))), 1)
+        _total_deg = self._panoramic_turn_steps * _env_turns * 30.0
+        if _env_turns != _expected_turns or abs(_total_deg - 360.0) > 1e-6:
+            print(
+                f"[Panoramic] WARNING: panoramic_turn_steps={self._panoramic_turn_steps} "
+                f"rotates {_total_deg:.0f}° in total (env TURN_LEFT_WIDE_TURNS={_env_turns} "
+                f"= {_env_turns * 30}°/step; expected {_expected_turns} turns at "
+                f"{self._panoramic_scan_angle_deg:.1f}°/step); coverage is not a full 360°."
+            )
+        
         self._enable_fb = enable_fb
         self._fb_near_radius = max_depth * 0.5 # fb_near_radius
         self._fb_hysteresis = fb_hysteresis
@@ -156,11 +175,19 @@ class TSP3DObjectNavPolicy(BasePolicy):
         )
         self._s_penalty_use_surface = s_penalty_use_surface
         self._goal_use_surface = goal_use_surface
-      
-        # camera 8-frame window / world-frame accumulation, switched by use_world_map
-        self._use_world_map = use_world_map
+
+        # Scan state machine: True while an in-place panoramic scan is running
+        # (BaseITMPolicy uses it to skip per-step value-map updates during scans).
+        self._scan_in_progress = False
+        # S-penalty (c') candidates of the most recent TSP3D query; 
+        # the scan-end direction decision ranks them by c'.
+        self._last_pending: list = []
+        self._scan_value_views: list = []
+        # Fusion route selection: "camera" (temporal window) / "world" (incremental map) 
+        # / "panoramic" (single-position 360° spatial fusion) / "none" (no fusion mechanism).
+        self._fusion_style = fusion_style
         self._preprocessor = TSP3DInputPreprocessor(
-            fusion_style="world" if use_world_map else "camera",
+            fusion_style=fusion_style,
             window_size=pcd_window_size,
             fuse_voxel_size=fuse_voxel_size,
             map_voxel_size=wm_voxel_size,
@@ -182,23 +209,19 @@ class TSP3DObjectNavPolicy(BasePolicy):
             near_voxel=near_voxel,
             mid_voxel=mid_voxel,
             far_voxel=far_voxel,
+            panoramic_turn_steps=panoramic_turn_steps,
+            panoramic_voxel_size=panoramic_voxel_size,
+            panoramic_radius=panoramic_radius,
+            panoramic_max_points=panoramic_max_points,
+            panoramic_min_move=panoramic_min_move,
         )
 
         # 3D visual grounding and vision-language evaluation clients
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
         self._itm_client = BLIP2ITMClient(port=int(os.environ.get("BLIP2ITM_PORT", "12182")))
-        self._vqa_client = BLIP2Client(port=int(os.environ.get("BLIP2_PORT", "12185"))) if use_vqa else None
         self._pointnav_policy = WrappedPointNavResNetPolicy(pointnav_policy_path)
         self._text_prompt = text_prompt
-        self._vqa_prompt = vqa_prompt
-        self._use_vqa = use_vqa
-        self._vqa_confirm_detections = partial(
-            vqa_confirm_detections,
-            use_vqa=self._use_vqa,
-            vqa_client=self._vqa_client,
-            vqa_prompt=self._vqa_prompt,
-        )
-  
+
         # Core 3D spatial representations
         height_range = max_obstacle_height - min_obstacle_height
         height_size = int(height_range / voxel_size) + 1
@@ -252,6 +275,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._target_verify_state.clear()
         self._target_fallback_state.clear()
         self._last_target_coord = None
+        self._scan_in_progress = False
+        self._last_pending = []
+        self._scan_value_views = []
         self._pointnav_policy.reset()
         self._obstacle_map3d.reset()
         self._preprocessor.reset()
@@ -434,17 +460,17 @@ class TSP3DObjectNavPolicy(BasePolicy):
         return raw_preds, diagnostics
 
     def _accumulate_3d_target_memory(self, target_class: str, centroid: np.ndarray, confidence: float = 1.0, near_surface: Optional[np.ndarray] = None) -> None:
-        """Write detection into memory; EMA-merge within 0.5m; 
-        track suspicious (far/low-conf) + near-miss counter — fresh merge resets it, 
-        so drift-only hallucinated boxes get deleted near the FOV cone -> explore.
+        """
+        Write detection into memory. Drift-only hallucinated boxes get deleted near the FOV cone -> explore.
+        EMA-merge within 0.5m; track suspicious (far/low-conf) + near-miss counter —> fresh merge resets it;
         """
 
         robot_xy = self._observations_cache.get("robot_xy", np.zeros(2))
         robot_yaw = self._observations_cache.get("robot_heading", 0.0)
         robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
 
-        # Suspicious = far or low-conf (VLFM range_id != 1 analogue); two-tier gating:
-        # [sigma_tar, fb_suspicious_conf) deleted after 2 near-field misses, >= conf trusted (5).
+        # Suspicious = far or low-conf (VLFM range_id != 1 analogue); 
+        # two-tier gating: [sigma_tar, fb_suspicious_conf).
         if centroid.shape[0] >= 3:
             detect_dist = float(np.linalg.norm(centroid - robot_xyz))
         else:
@@ -454,7 +480,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         if target_class not in self._target_3d_memory:
             self._target_3d_memory[target_class] = [centroid]
             self._target_surface_memory[target_class] = [near_surface if near_surface is not None else centroid]
-            self._target_verify_state[target_class] = [(1, robot_xy.copy(), robot_yaw)]
+            self._target_verify_state[target_class] = [(1, robot_xy.copy(), float(robot_yaw), float(confidence))]
             self._target_fallback_state[target_class] = [{"suspicious": suspicious, "near_miss": 0}]
             return
 
@@ -468,60 +494,80 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 0.8 * self._target_3d_memory[target_class][closest_idx] + 0.2 * centroid
             )
             # Cross-frame consensus is strong evidence; hallucinated boxes drift and can't merge.
-            num_obs, _, _ = self._target_verify_state[target_class][closest_idx]
+            num_obs, _, _, old_conf = self._target_verify_state[target_class][closest_idx]
             num_obs += 1
+            # Keep the max c' over merges: a confirmed high-score detection stays high.
             self._target_verify_state[target_class][closest_idx] = (
-                num_obs, robot_xy.copy(), robot_yaw
+                num_obs, robot_xy.copy(), float(robot_yaw), max(old_conf, float(confidence))
             )
             # Fresh merge = real target: reset near-miss counter (drift-only boxes can't).
             self._target_fallback_state[target_class][closest_idx]["near_miss"] = 0
         else:
             self._target_3d_memory[target_class].append(centroid)
             self._target_surface_memory[target_class].append(near_surface if near_surface is not None else centroid)
-            self._target_verify_state[target_class].append((1, robot_xy.copy(), robot_yaw))
+            self._target_verify_state[target_class].append((1, robot_xy.copy(), float(robot_yaw), float(confidence)))
             self._target_fallback_state[target_class].append({"suspicious": suspicious, "near_miss": 0})
 
+
     def _get_target_object_location(self, position: np.ndarray) -> Union[None, np.ndarray]:
-        """Closest target centroid with hysteresis latch against switching:
-        keep current if new candidate is <0.1m away, or <0.5m while robot >2.0m away.
+        """Navigation goal among the memorized target candidates. Distance-latch keeps goal switches stable.
+
+        world/camera/none: closest centroid with a distance-latch.
+        
+        panoramic: rank candidates by their S-penalty score c';
+        nearest is the fallback when c' is missing.
         """
         target_classes = self._target_object.split("|")
-        valid_centroids = []
-        valid_goals = []
+        valid_centroids: List[np.ndarray] = []
+        valid_goals: List[np.ndarray] = []
+        valid_confs: List[Optional[float]] = []
 
         for cls in target_classes:
             if cls in self._target_3d_memory and len(self._target_3d_memory[cls]) > 0:
                 surf_list = self._target_surface_memory.get(cls, [])
+                verify_list = self._target_verify_state.get(cls, [])
                 for i, centroid in enumerate(self._target_3d_memory[cls]):
                     valid_centroids.append(np.array(centroid))
                     if self._goal_use_surface and i < len(surf_list):
                         valid_goals.append(np.array(surf_list[i]))
                     else:
                         valid_goals.append(np.array(centroid))
+                    conf = None
+                    if i < len(verify_list):
+                        v = verify_list[i]
+                        conf = float(v[3]) if len(v) >= 4 else None
+                    valid_confs.append(conf)
 
         if len(valid_centroids) == 0:
             return None
 
-        centroids = np.array(valid_centroids)
-        goals = np.array(valid_goals)
         robot_xy = np.asarray(position)[:2]
-        dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
+        if self._fusion_style == "panoramic" and any(c is not None for c in valid_confs):
+            # Rank by c' (highest = most target-matching); nearest as a tiebreak.
+            def _key(i: int) -> tuple:
+                conf_i = valid_confs[i] if valid_confs[i] is not None else -1.0
+                return (conf_i, -float(np.linalg.norm(valid_centroids[i][:2] - robot_xy)))
+            chosen_idx = int(max(range(len(valid_confs)), key=_key))
+        else:
+            centroids = np.array(valid_centroids)
+            dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
+            chosen_idx = int(np.argmin(dists_2d))
 
-        closest_idx = np.argmin(dists_2d)
-        closest_2d = goals[closest_idx][:2].copy()
+        chosen_2d = valid_goals[chosen_idx][:2].copy()
 
         if self._last_target_coord is None:
-            self._last_target_coord = closest_2d
+            self._last_target_coord = chosen_2d
             return self._last_target_coord
 
-        delta_dist = np.linalg.norm(closest_2d - self._last_target_coord)
-        dist_to_new = dists_2d[closest_idx]
+        # distance-latch: keep the current goal unless the switch is meaningful.
+        delta_dist = np.linalg.norm(chosen_2d - self._last_target_coord)
+        dist_to_new = float(np.linalg.norm(valid_centroids[chosen_idx][:2] - robot_xy))
         if delta_dist < 0.1:
             pass  # <0.1m from current target: keep
         elif delta_dist < 0.5 and dist_to_new > 2.0:
             pass  # <0.5m and robot >2m away: keep
         else:
-            self._last_target_coord = closest_2d
+            self._last_target_coord = chosen_2d
         return self._last_target_coord
 
     def _update_object_map(
@@ -555,13 +601,36 @@ class TSP3DObjectNavPolicy(BasePolicy):
         robot_yaw = self._observations_cache.get("robot_heading", 0.0)
 
         # Unified input pipeline: camera window / world map -> update -> prepare.
+        # (Panoramic route is driven separately by the policy scan state machine.)
         self._preprocessor.update(pcd, robot_xyz, robot_yaw)
         fused_pcd_local = self._preprocessor.prepare(
             robot_xyz,
             robot_yaw,
             camera_height=self._camera_height,
         )
-        raw_detections, _ = self._query_tsp3d_client(fused_pcd_local, self._target_object)
+
+        return self._query_and_process(
+            fused_pcd_local, robot_xyz, robot_yaw, pcd, rgb,
+            tf_camera_to_episodic, max_depth, fx, fy,
+        )
+
+    def _query_and_process(
+        self,
+        pcd_local: np.ndarray,
+        robot_xyz: np.ndarray,
+        robot_yaw: float,
+        pcd_world: np.ndarray,
+        image_rgb: np.ndarray,
+        tf_camera_to_episodic: np.ndarray,
+        max_depth: float,
+        fx: float,
+        fy: float,
+    ) -> ObjectDetections:
+        """
+        Query TSP3D on a local cloud, restore boxes to world frame, 
+        then run the full detection pipeline (filter -> S-penalty -> memory -> fallback).
+        """
+        raw_detections, _ = self._query_tsp3d_client(pcd_local, self._target_object)
 
         # Restore predicted boxes to global coordinates (inverse rotation + translation)
         valid_raw = [det for det in raw_detections if det.get("box_3d") is not None]
@@ -583,8 +652,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             boxes=boxes_3d_global,
             logits=logits,
             phrases=phrases,
-            pcd_source=pcd,
-            image_source=rgb,
+            pcd_source=pcd_world,
+            image_source=image_rgb,
             fx=fx,
             fy=fy,
             tf_camera_to_episodic=tf_camera_to_episodic
@@ -597,11 +666,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         if not self._done_initializing:
             return detections
 
-        # BLIP2 VQA false-positive confirmation (VLFM-aligned): drop detections
-        # whose visual answer does not start with 'yes' before they reach memory.
-        if self._use_vqa and self._vqa_client is not None:
-            self._vqa_confirm_detections(detections)
-
         # S-penalty gate cross-validation -> write passed detections to memory.
         pending = apply_s_penalty(
             detections, target_classes, robot_xyz,
@@ -613,11 +677,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
             nlp_mode=self._nlp_mode,
             out_log=self._detect_logs,
         )
+        # Keep this query's admitted candidates (c') for the scan-end direction decision.
+        self._last_pending = list(pending)
         for conf_amp, centroid_np, near_surface, active_classes in pending:
             for cls in active_classes:
                 self._accumulate_3d_target_memory(cls, centroid_np, confidence=conf_amp, near_surface=near_surface)
 
-        # VLFM-aligned: run anti-hallucination fallback every step (delete confirmed-false -> explore).
+        # Run anti-hallucination fallback every step (delete confirmed-false -> explore).
         if self._enable_fb:
             self._anti_hallucination_fallback(tf_camera_to_episodic, max_depth)
 
@@ -676,28 +742,40 @@ class TSP3DObjectNavPolicy(BasePolicy):
         deterministic: bool = False,
     ) -> Any:
         self._pre_step(observations, masks)
-
         object_map_rgbd = self._observations_cache["object_map_rgbd"]
         detections = []
-        for i, (rgb, depth, tf, min_depth, max_depth, fx, fy) in enumerate(object_map_rgbd):
-            pcd = self._get_shared_pcd(i)
-            detections.append(
-                self._update_object_map(rgb, depth, tf, min_depth, max_depth, fx, fy, pcd=pcd)
-            )
-        robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
-        goal_3d = self._get_target_object_location(robot_xyz)
 
-        # Exploration via habitat frontier_sensor (same 2D frontiers as VLFM).
-        if not self._done_initializing:
-            mode = "initialize"
-            action = self._initialize()
-        elif goal_3d is None:
-            mode = "explore"
-            action = self._explore(observations)
+        if self._fusion_style == "panoramic":
+            rgb, depth, tf, min_depth, max_depth, fx, fy = object_map_rgbd[0]
+            pcd = self._get_shared_pcd(0)
+            robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
+            robot_yaw = self._observations_cache.get("robot_heading", 0.0)
+            goal_3d = self._get_target_object_location(robot_xyz)
+            det, mode, action = self._act_panoramic(
+                observations, pcd, robot_xyz, robot_yaw, rgb, depth, tf,
+                min_depth, max_depth, fx, fy, goal_3d,
+            )
+            detections.append(det)
+
         else:
-            mode = "navigate"
-            print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
-            action = self._pointnav(goal_3d[:2], stop=True)
+            for i, (rgb, depth, tf, min_depth, max_depth, fx, fy) in enumerate(object_map_rgbd):
+                pcd = self._get_shared_pcd(i)
+                detections.append(
+                    self._update_object_map(rgb, depth, tf, min_depth, max_depth, fx, fy, pcd=pcd)
+                )
+            robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
+            goal_3d = self._get_target_object_location(robot_xyz)
+            # Exploration via habitat frontier_sensor.
+            if not self._done_initializing:
+                mode = "initialize"
+                action = self._initialize()
+            elif goal_3d is None:
+                mode = "explore"
+                action = self._explore(observations)
+            else:
+                mode = "navigate"
+                print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
+                action = self._pointnav(goal_3d[:2], stop=True)
 
         action_np = action.detach().cpu().numpy()[0]
         if len(action_np) == 1:
@@ -710,6 +788,180 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._did_reset = False
 
         return action, rnn_hidden_states
+
+    def _act_panoramic(
+        self,
+        observations: Dict,
+        pcd: np.ndarray,
+        robot_xyz: np.ndarray,
+        robot_yaw: float,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        tf: np.ndarray,
+        min_depth: float,
+        max_depth: float,
+        fx: float,
+        fy: float,
+        goal_3d: Union[None, np.ndarray],
+    ) -> Tuple[ObjectDetections, str, Tensor]:
+        """Panoramic route under a unified per-step decision (scan is an independent behavior, not a sub-state of explore).
+
+        Each step follows the priority below:
+          1. scan in progress   -> accumulate frame + wide-turn (no TSP3D);
+                                  at the last frame stitch 360° -> ONE query -> 
+                                  ``_after_scan_action`` (direction by c').
+          2. initialize         -> 12 x 30° in-place turns; each step also sends
+                                  a single frame to TSP3D; init counts as a scan
+                                  of the start pose.
+          3. decision layer (init done):
+             - target in memory            -> navigate (single-frame input);
+             - reached a NEW frontier      -> begin an independent 360° scan;
+             - otherwise                   -> explore (single-frame input, move
+                                              along the semantic value field).
+
+        - Obstacle map is updated every step.
+        - Mid-scan steps only accumulate the frame and turn with the scan-only wide-turn action (decoupled from the 30° nav turn).
+        - Value-map updates are skipped during scans (BaseITMPolicy checks ``_scan_in_progress``).
+        - Anti-hallucination fallback runs only on query steps.
+        """
+        pp = self._preprocessor
+        self._obstacle_map3d.update_map(
+            pcd=pcd, tf_camera_to_episodic=tf, depth=depth,
+            min_depth=min_depth, max_depth=max_depth, fx=fx, fy=fy,
+        )
+        empty_det = ObjectDetections(
+            boxes=[], logits=[], phrases=[], pcd_source=pcd, image_source=rgb,
+            fx=fx, fy=fy, tf_camera_to_episodic=tf,
+        )
+
+        # mid-scan: accumulate this frame, keep turning
+        if pp.is_scanning:
+            # Record this scan frame's view 
+            # so the whole 360° scan can refresh the semantic value field in ONE update at the scan end.
+            self._scan_value_views.append(
+                (rgb, depth, tf, min_depth, max_depth, float(self._camera_fov))
+            )
+            remaining = pp.continue_scan(pcd)
+            if remaining <= 0:
+                # Full turn done: stitch the 360° cloud and query TSP3D once,
+                # then pick the next direction from this scan's candidates.
+                pcd_local = pp.finish_scan(robot_xyz, robot_yaw, self._camera_height)
+                # Refresh the semantic value field once with ALL scan frames before the single TSP3D query.
+                _views = self._scan_value_views
+                self._scan_value_views = []
+                _value_updater = getattr(self, "_update_value_map", None)
+                if callable(_value_updater) and _views:
+                    self._observations_cache["value_map_rgbd"] = _views
+                    _value_updater()
+                det = self._query_and_process(
+                    pcd_local, robot_xyz, robot_yaw, pcd, rgb,
+                    tf, max_depth, fx, fy,
+                )
+                action = self._after_scan_action(observations, robot_xyz, robot_yaw)
+                # Scan finished -> next step resumes the unified decision flow.
+                self._scan_in_progress = False
+            else:
+                det = empty_det
+                action = self._scan_turn_action
+                self._scan_in_progress = True
+
+            mode = "scan"
+            return det, mode, action
+
+        # unified decision (scan not in progress)
+        self._scan_in_progress = False
+        if not self._done_initializing:
+            pp.set_scan_position(robot_xyz, robot_yaw)
+            pcd_local = pp.raw_frame(pcd, robot_xyz, robot_yaw, self._camera_height)
+            det = self._query_and_process(
+                pcd_local, robot_xyz, robot_yaw, pcd, rgb, tf, max_depth, fx, fy,
+            )
+            mode = "initialize"
+            action = self._initialize()
+        elif goal_3d is None:
+            if self._at_new_frontier(robot_xyz):
+                # Reached a NEW frontier point -> independent 360° scan.
+                # This step's view is the first slice of the scan.
+                self._scan_value_views.append(
+                    (rgb, depth, tf, min_depth, max_depth, float(self._camera_fov))
+                )
+                pp.begin_scan(pcd, robot_xyz, robot_yaw)
+                self._scan_in_progress = True
+                mode = "scan"
+                action = self._scan_turn_action
+                return empty_det, mode, action
+            # Travel step: send the raw single frame straight to TSP3D.
+            pcd_local = pp.raw_frame(pcd, robot_xyz, robot_yaw, self._camera_height)
+            det = self._query_and_process(
+                pcd_local, robot_xyz, robot_yaw, pcd, rgb, tf, max_depth, fx, fy,
+            )
+            mode = "explore"
+            action = self._explore(observations)
+        else:
+            mode = "navigate"
+            print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
+            pcd_local = pp.raw_frame(pcd, robot_xyz, robot_yaw, self._camera_height)
+            det = self._query_and_process(
+                pcd_local, robot_xyz, robot_yaw, pcd, rgb, tf, max_depth, fx, fy,
+            )
+            action = self._pointnav(goal_3d[:2], stop=True)
+        return det, mode, action
+
+    def _after_scan_action(self, observations: Dict, robot_xyz: np.ndarray, robot_yaw: float) -> Tensor:
+        """Direction right after a finished 360° scan, decided S-penalty style.
+
+        move toward the candidate with the HIGHEST c' so every advance direction best matches the target. 
+        With no admitted candidate, fall back to the semantic value field.
+        """
+        pending = getattr(self, "_last_pending", None) or []
+        if pending:
+            best = max(pending, key=lambda p: float(p[0]))  # highest c'
+            conf_amp, centroid, near_surface, _ = best
+            goal = near_surface if near_surface is not None else centroid
+            print(
+                f"[ScanEnd] best c'={conf_amp:.3f} goal={np.round(np.asarray(goal)[:2], 2)} "
+                "-> moving to target"
+            )
+            return self._pointnav(np.asarray(goal)[:2], stop=False)
+        return self._explore(observations)
+
+    def _at_new_frontier(self, robot_xyz: np.ndarray) -> bool:
+        """True when the robot has REACHED a NEW frontier point (scan trigger).
+        
+        ``panoramic_min_move`` still guards against re-scanning the same spot.
+        - frontier tracking (main path): a scan fires when the frontier cluster
+          the explore layer is pursuing disappears from ``frontier_sensor``.
+        - distance fallback (no tracked cluster yet): any frontier within
+          ``panoramic_arrive_dist`` -> scan, so a scan is never starved.
+        """
+        pp = self._preprocessor
+        frontiers = self._observations_cache.get("frontier_sensor")
+        if frontiers is None or len(frontiers) == 0:
+            return False
+        frontiers = np.asarray(frontiers, dtype=np.float32)
+        if frontiers.ndim != 2 or frontiers.shape[1] < 2:
+            return False
+        # Empty-frontier sentinel returned by the sensor is zeros((1, 2)).
+        if frontiers.shape == (1, 2) and float(np.abs(frontiers).max()) < 1e-6:
+            return False
+        if not pp.allow_scan(robot_xyz):
+            return False
+
+        robot_xy = np.asarray(robot_xyz)[:2]
+        # Frontier-tracking main path: fire only when the pursued cluster is gone
+        # from the current frontier list (reached + digested).
+        last = np.asarray(getattr(self, "_last_frontier", np.zeros(2)), dtype=np.float32)
+        if last.shape == (2,) and float(np.abs(last).max()) >= 1e-6:
+            # Still present (exact or within 0.5 m) -> keep advancing.
+            if closest_point_within_threshold(frontiers[:, :2], last, threshold=0.5) != -1:
+                return False
+            # The pursued cluster was digested -> genuinely reached a new boundary.
+            return True
+        # No tracked cluster yet (reset / navigation since last explore pick):
+        # distance-gate fallback so a scan is never starved.
+        dists = np.linalg.norm(frontiers[:, :2] - robot_xy, axis=1)
+        return float(dists.min()) <= self._panoramic_arrive_dist
+
 
     def _get_policy_info(self, detections: ObjectDetections) -> Dict[str, Any]:
         has_target = any(cls in self._target_3d_memory 
@@ -804,7 +1056,7 @@ class VLVMConfig:
     near_voxel: float = 0.01            # distance sampling: near-band voxel (m)
     mid_voxel: float = 0.02             # distance sampling: mid-band voxel (m)
     far_voxel: float = 0.05             # distance sampling: far-band voxel (m)
-    use_world_map: bool = True          # True = world-frame accumulation / False = camera 8-frame window (baseline)
+    fusion_style: str = "world"         # Fusion route: "camera" (8-frame temporal window) / "world" (incremental map) / "panoramic" (single-position 360° spatial fusion) / "none" (no fusion, raw single frame straight to TSP3D). Replaces the old use_world_map bool.
 
     # Phase 5b: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
     pcd_window_size: int = 8                # Number of frames fused for point-cloud accumulation; larger = more complete geometry but slower/staler.
@@ -823,18 +1075,24 @@ class VLVMConfig:
     wm_min_view_yaw: float = 15.0     # world: min yaw change (deg) to accept a frame into fusion
     wm_near_refresh_radius: Optional[float] = 3.0  # world: near-field refresh radius (m). None=off (first-observation accounting); >0: re-observed near-field voxels are re-owned by the current frame (cam-style accounting, survives frame-window slide-out).
     wm_near_refresh_value: bool = False  # world: also overwrite the stored point of refreshed near-field voxels with the current observation (cam-style sliding refresh of the value layer). False = value layer stays first.
-    
-    # Phase 5d: S-penalty (semantic-field cross-validation)
+
+    # Phase 5d: Panoramic Fusion
+    # Frontier-arrival-driven 360° spatial fusion. No temporal history, mid steps send single frames; a scan runs only when the robot reaches a NEW frontier point
+    # Scan rotation is decoupled from nav: mid-scan steps emit the scan-only wide-turn env action turn_left_wide (id 6).
+    panoramic_turn_steps: int = 6            # Frames (env steps) per 360° scan; rotation/step = 360/turn_steps (6 -> 60°).
+    panoramic_voxel_size: float = 0.02       # Local-frame voxel for intra-scan stitching dedup.
+    panoramic_radius: Optional[float] = 6.0  # Send-side horizontal radius crop (m) around the scan position.
+    panoramic_max_points: int = 200000       # Point cap for the panoramic / single-frame input.
+    panoramic_min_move: float = 2.0          # Min distance (m) from the last scan / init pose to allow another scan (new-frontier guard).
+    panoramic_arrive_dist: float = 1.0       # Frontier-arrival trigger radius (m): fallback gate when no frontier cluster is being tracked (no-cluster starvation guard). Main trigger = pursued-cluster disappearance (fixed "and" mechanism, 09-03).
+
+    # Phase 7: S-penalty (semantic-field cross-validation)
     enable_s_penalty: bool = True           # Master switch: c' = c * w_S(S) — multiply TSP3D confidence by a semantic-field weight (BLIP2 ITM, zero extra queries) to amplify TP/FP discrimination.
     s_penalty_thresh: float = 0.15          # S below this (ITM raw cosine scale ~0.10-0.15; measured min 0.084) -> apply penalty (w_S = floor).
     s_penalty_floor: float = 0.3            # Lower bound of the dynamic penalty weight w_S = max(floor, S/thresh) when S < thresh (non-zero -> keep recall; S->0 -> floor).
     s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection point.
     s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
-
-    # Phase 5e: BLIP2 VQA false-positive confirmation (VLFM-aligned)
-    use_vqa: bool = False                   # Ask BLIP2 'Is this a {obj}?' on each TSP3D detection; drop answers not starting with 'yes'. Requires the BLIP2 VQA server (vlfm.vlm.blip2) on BLIP2_PORT.
-    vqa_prompt: str = "Is this "            # VQA question prefix; full prompt = 'Question: {vqa_prompt}[a ]{obj}? Answer:'.
 
     @classmethod  # type: ignore
     @property

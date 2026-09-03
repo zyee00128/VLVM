@@ -194,8 +194,7 @@ def aggregate_detect_stats(
 ) -> Dict[str, Any]:
     """Detection-level statistics for one episode (TSP3D detections vs GT target bbox).
 
-    ``detect_logs`` entries: {conf, conf_amp, centroid, s, admitted} (from
-    ``apply_s_penalty(..., out_log=...)``).
+    ``detect_logs`` entries: {conf, conf_amp, centroid, s, admitted} (from apply_s_penalty(..., out_log=...)``).
 
     Returns a dict with counts and per-detection score arrays.
     """

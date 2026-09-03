@@ -1,6 +1,6 @@
 # Project VLVM: 3D Native 主动视觉语言导航系统
 
-> **阶段状态（2026-09-01）**：**Stage1 完结**——单场景 `5cdEh9F2hJL` 完成全部机制调优并定稿，定稿档 = `wm_near_refresh_val`（SR **0.4444** / spl 0.1538 / soft_spl 0.2029），全链路结果见 `Results_final.md` 与 `VLVM-S1/Results.md`。
+> **阶段状态（2026-09-01）**：**VLVM Stage1 完结**——单场景 `5cdEh9F2hJL` 完成全部机制调优并定稿，定稿档 = `wm_near_refresh_val`（SR **0.4444** / spl 0.1538 / soft_spl 0.2029）。
 
 ## 1. 项目背景与技术范式演进 (Project Background & Paradigm Shift)
 

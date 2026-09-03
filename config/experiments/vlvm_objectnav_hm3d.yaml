@@ -23,6 +23,17 @@ habitat:
   task:
     success_reward: 2.5
     slack_reward: -1e-3
+    
+    actions:
+      # Scan-only wide-turn action (VLVM panoramic): appended at the END of the
+      # discrete task-action space (id 6, after look_down), so stop/move_forward/
+      # turn_left/turn_right keep ids 0-3. Per-step rotation = turns x 30°, with
+      # turns auto-derived by run.py from rl.policy.panoramic_turn_steps
+      # (angle = 360/turn_steps, TURN_LEFT_WIDE_TURNS = angle/30).
+      # Do NOT export it manually.
+      turn_left_wide:
+        type: TurnLeftWideAction
+    
     lab_sensors:
       base_explorer:
         turn_angle: 30
@@ -103,7 +114,7 @@ habitat_baselines:
       near_field_sigma_scale: 0.8
       # TSP3D Input Processing
       use_vlfm_nlp: False
-      use_world_map: True
+      fusion_style: world # Fusion route: "camera" / "world" (=定稿 baseline) / "panoramic" / "none" (no fusion, single frame straight to TSP3D)
       pcd_window_size: 8
       fuse_voxel_size: 0.02
       fuse_max_points: 200000
@@ -116,10 +127,21 @@ habitat_baselines:
       wm_radius: 6.0 # 5 ~ 7 m
       wm_min_view_disp: 0.15
       wm_min_view_yaw: 15.0
-      wm_near_refresh_radius: 3.0 # world: near-field refresh radius (m), null=off; >0: re-observed near-field voxels re-owned by current frame (cam-style accounting)
-      wm_near_refresh_value: True # world: also overwrite refreshed near-field voxel points with current observation (value-layer sliding refresh); False = value layer stays first
+      wm_near_refresh_radius: 3.0
+      wm_near_refresh_value: True
+
+      # Panoramic fusion (frontier-arrival driven; scan rotation decoupled from nav 30°)
+      # 每步转角由单参数导出：scan_angle = 360/panoramic_turn_steps（忽略帧重叠）；
+      # run.py 自动换算 env 内部 TURN_LEFT_WIDE_TURNS=round(angle/30)
+      panoramic_turn_steps: 6
+      panoramic_voxel_size: 0.02
+      panoramic_max_points: 200000
+      panoramic_radius: 6.0
+      panoramic_min_move: 2.0
+      panoramic_arrive_dist: 1.0
+
       cap_style: random # point cap - "random" (baseline) / "near_first"
-      distance_sample: True # distance-adaptive sampling (dense near / sparse far)
+      distance_sample: True
       near_dist: 1.5
       mid_dist: 3.0
       near_voxel: 0.01
@@ -133,10 +155,6 @@ habitat_baselines:
       # near-surface point
       s_penalty_use_surface: True
       goal_use_surface: True
-      
-      # BLIP2 VQA false-positive confirmation # 没用的东西
-      use_vqa: False
-      vqa_prompt: "Is this "
 
     ppo:
       clip_param: 0.2

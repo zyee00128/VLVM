@@ -22,6 +22,7 @@ import vlfm.obs_transformers.resize  # noqa: F401
 import vlfm.measurements.traveled_stairs  # noqa: F401
 import vlfm.utils.vlvm_trainer  # noqa: F401
 import vlfm.policy.habitat_policy  # noqa: F401
+import vlfm.policy.scan_actions  # noqa: F401  (registers the scan-only wide-turn action before the env is built)
 
 
 class HabitatConfigPlugin(SearchPathPlugin):
@@ -50,6 +51,19 @@ def main(cfg: DictConfig) -> None:
             cfg.habitat.simulator.agents.main_agent.sim_sensors.pop("semantic_sensor")
         except KeyError:
             pass
+
+    # Single hyperparameter for the scan turn: a scan covers 360° in
+    # panoramic_turn_steps frames, so the rotation per step = 360/turn_steps and the
+    # env-side wide-turn action (TurnLeftWideAction) needs TURN_LEFT_WIDE_TURNS =
+    # round(360/(30*turn_steps)) 30°-turns per step. Derive it from the YAML value so
+    # users never touch the env var.
+    try:
+        _pol_cfg = cfg.habitat_baselines.rl.policy
+        _steps = max(int(_pol_cfg.get("panoramic_turn_steps", 6)), 1)
+        _turns = max(1, int(round(360.0 / (30.0 * _steps))))
+        os.environ["TURN_LEFT_WIDE_TURNS"] = str(_turns)
+    except Exception:
+        pass  # non-panoramic runs / config variants: keep the env-var default
 
     execute_exp(cfg, "eval" if cfg.habitat_baselines.evaluate else "train")
 
