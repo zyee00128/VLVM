@@ -114,7 +114,11 @@ habitat_baselines:
       near_field_sigma_scale: 0.8
       # TSP3D Input Processing
       use_vlfm_nlp: False
-      fusion_style: world # Fusion route: "camera" / "world" (=定稿 baseline) / "panoramic" / "none" (no fusion, single frame straight to TSP3D)
+      fusion_style: world # Fusion route: "camera" / "world" / "panoramic" / "none" (no fusion, single frame straight to TSP3D)
+      enable_scan: False
+      frontier_trigger: True
+      scan_min_gap: 90 
+      scan_opportunistic_after: 60
       pcd_window_size: 8
       fuse_voxel_size: 0.02
       fuse_max_points: 200000
@@ -129,17 +133,12 @@ habitat_baselines:
       wm_min_view_yaw: 15.0
       wm_near_refresh_radius: 3.0
       wm_near_refresh_value: True
-
-      # Panoramic fusion (frontier-arrival driven; scan rotation decoupled from nav 30°)
-      # 每步转角由单参数导出：scan_angle = 360/panoramic_turn_steps（忽略帧重叠）；
-      # run.py 自动换算 env 内部 TURN_LEFT_WIDE_TURNS=round(angle/30)
       panoramic_turn_steps: 6
       panoramic_voxel_size: 0.02
       panoramic_max_points: 200000
       panoramic_radius: 6.0
       panoramic_min_move: 2.0
       panoramic_arrive_dist: 1.0
-
       cap_style: random # point cap - "random" (baseline) / "near_first"
       distance_sample: True
       near_dist: 1.5
@@ -155,6 +154,38 @@ habitat_baselines:
       # near-surface point
       s_penalty_use_surface: True
       goal_use_surface: True
+      
+      # target-memory manager (M6/M7/M9; all OFF = world baseline)
+      merge_dist_thresh: 0.5
+      ema_weight_old: 0.8
+      enable_mechanism_7: False
+      exempt_near_radius: 1.0
+      exempt_min_merges: 1
+      enable_mechanism_6: False
+      free_erasure_radius: 0.3
+      free_erasure_min_explored: 5
+      free_erasure_free_ratio: 0.85
+      free_erasure_soft_only: True
+      enable_mechanism_9: False
+      # geometric admission gate (M2/M4/M8/M3; all OFF = world baseline)
+      geom_m2_near_reject: False
+      geom_m4_suspicious: False
+      geom_m8_occ_gate: False
+      geom_m3_density: False
+      geom_min_dist_reject: 1.0
+      geom_max_dist_trusted: 4.0
+      geom_edge_margin_px: 8
+      geom_min_occupied_voxels: 8
+      geom_min_occupancy_ratio: 0.001
+      geom_min_points_confirm: 150
+      geom_min_frames_confirm: 2
+      geom_cluster_merge_dist: 0.5
+      # soft-frontier bias (M5; OFF = world baseline)
+      m5_enable: False
+      m5_bias_weight: 0.60
+      m5_gaussian_sigma: 1.50
+      m5_max_influence_radius: 4.50
+      m5_normalize: False
 
     ppo:
       clip_param: 0.2

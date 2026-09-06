@@ -1,7 +1,7 @@
 from typing import Optional
 import numpy as np
 
-from .local_map import WorldLocalMap
+from .world_map import WorldLocalMap
 from .sliding_window import TemporalPcdWindow
 from .panoramic import PanoramicFusion, _to_camera_canonical
 from .sampling import cap_point_count, distance_adaptive_sample
@@ -205,9 +205,9 @@ class TSP3DInputPreprocessor:
     def finish_scan(self, robot_xyz: np.ndarray, robot_yaw: float, camera_height: float) -> np.ndarray:
         if self._panoramic is None:
             return np.empty((0, 6), dtype=np.float32)
-        return self._panoramic.finish_scan(robot_xyz, robot_yaw, camera_height)
+        return self._panoramic.finish_scan(robot_xyz, robot_yaw, camera_height, self._cap_style)
 
     def raw_frame(self, frame_pcd_world: np.ndarray, robot_xyz: np.ndarray, robot_yaw: float, camera_height: float) -> np.ndarray:
         if self._panoramic is None:
             return np.empty((0, 6), dtype=np.float32)
-        return self._panoramic.raw_frame(frame_pcd_world, robot_xyz, robot_yaw, camera_height)
+        return self._panoramic.raw_frame(frame_pcd_world, robot_xyz, robot_yaw, camera_height, self._cap_style)

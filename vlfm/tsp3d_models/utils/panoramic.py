@@ -24,13 +24,17 @@ def _round_dedup(pts_local: np.ndarray, voxel_size: float) -> np.ndarray:
     return pts_local[np.sort(idx)]
 
 
-def _cap_near_first(pts_local: np.ndarray, camera_pos_local: np.ndarray, max_points: int) -> np.ndarray:
+def _cap_point_count(pts_local: np.ndarray, camera_pos_local: np.ndarray, max_points: int, style: str = "near_first") -> np.ndarray:
     """Cap to max_points keeping the nearest points (deterministic near-field priority)."""
     if len(pts_local) <= max_points:
         return pts_local
-    dist = np.linalg.norm(pts_local[:, :3] - np.asarray(camera_pos_local)[:3], axis=1)
-    order = np.argsort(dist, kind="stable")
-    return pts_local[order[:max_points]]
+    if style == "near_first":
+        dist = np.linalg.norm(pts_local[:, :3] - np.asarray(camera_pos_local)[:3], axis=1)
+        order = np.argsort(dist, kind="stable")
+        return pts_local[order[:max_points]]
+    else:
+        idx = np.random.choice(len(pts_local), max_points, replace=False)
+        return pts_local[idx]
 
 
 class PanoramicFusion:
@@ -65,9 +69,7 @@ class PanoramicFusion:
     def scan_remaining(self) -> int:
         return self._scan_remaining
 
-    # ======================================================================
     # Scan-decision helpers (frontier-arrival trigger lives in the policy)
-    # ======================================================================
     def allow_scan(self, robot_xyz: np.ndarray) -> bool:
         """True if the robot has moved >= min_move from the last scan / init pose."""
         if self._last_scan_pos is None:
@@ -80,9 +82,7 @@ class PanoramicFusion:
         self._last_scan_pos = np.asarray(robot_xyz)[:2].copy()
         self._last_scan_yaw = float(robot_yaw)
 
-    # ======================================================================
     # Scan lifecycle (policy state machine drives the wide turns)
-    # ======================================================================
     def begin_scan(self, frame_pcd_world: np.ndarray, robot_xyz: np.ndarray, robot_yaw: float) -> None:
         """Start a scan with the current frame as the first slice."""
         self._scan_frames = [frame_pcd_world]
@@ -96,29 +96,25 @@ class PanoramicFusion:
         self._scan_remaining = max(self._scan_remaining - 1, 0)
         return self._scan_remaining
 
-    def finish_scan(self, robot_xyz: np.ndarray, robot_yaw: float, camera_height: float) -> np.ndarray:
+    def finish_scan(self, robot_xyz: np.ndarray, robot_yaw: float, camera_height: float, style: str) -> np.ndarray:
         """Stitch the accumulated frames into one local 360° cloud (send once)."""
-        local = self._build(self._scan_frames, robot_xyz, robot_yaw, camera_height)
+        local = self._build(self._scan_frames, robot_xyz, robot_yaw, camera_height, style="near_first")
         self._scan_frames = []
         self._scan_remaining = 0
         return local
 
-    # ======================================================================
     # Single-frame route (all non-scan steps)
-    # ======================================================================
-    def raw_frame(self, frame_pcd_world: np.ndarray, robot_xyz: np.ndarray, robot_yaw: float, camera_height: float) -> np.ndarray:
+    def raw_frame(self, frame_pcd_world: np.ndarray, robot_xyz: np.ndarray, robot_yaw: float, camera_height: float, style: str) -> np.ndarray:
         """Convert the current frame to a camera-canonical cloud (sent as-is)."""
-        return self._build([frame_pcd_world], robot_xyz, robot_yaw, camera_height)
+        return self._build([frame_pcd_world], robot_xyz, robot_yaw, camera_height, style="near_first")
 
-    # ======================================================================
-    # Core build
-    # ======================================================================
     def _build(
         self,
         frames: List[np.ndarray],
         robot_xyz: np.ndarray,
         robot_yaw: float,
         camera_height: float,
+        style: str = "near_first",
     ) -> np.ndarray:
         frames = [f for f in frames if f is not None and len(f) > 0]
         if not frames:
@@ -136,5 +132,5 @@ class PanoramicFusion:
         if len(local) == 0:
             return np.empty((0, 6), dtype=np.float32)
         camera_pos_local = np.array([0.0, 0.0, camera_height], dtype=np.float32)
-        local = _cap_near_first(local, camera_pos_local, self.max_points)
+        local = _cap_point_count(local, camera_pos_local, self.max_points, style)
         return local

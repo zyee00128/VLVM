@@ -10,17 +10,29 @@ try:
 except Exception:
     pass
 
-from vlfm.obs_transformers.utils import image_resize
-from vlfm.policy.base_policy import BasePolicy
-from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
-from vlfm.utils.geometry_utils import rho_theta, extract_yaw, within_fov_cone, get_fov, closest_point_within_threshold
-from vlfm.mapping.obstacle_map import ObstacleMap3D, ProbabilisticGrid
 from vlfm.vlm.blip2itm import BLIP2ITMClient
 from vlfm.vlm.tsp3d import TSP3DClient
 from vlfm.vlm.detections import ObjectDetections
+from vlfm.obs_transformers.utils import image_resize
+from vlfm.policy.base_policy import BasePolicy
+from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
+from vlfm.utils.geometry_utils import rho_theta, extract_yaw, get_fov, closest_point_within_threshold
+from vlfm.mapping.obstacle_map import ObstacleMap3D, ProbabilisticGrid
+from vlfm.tsp3d_models.utils.target_memory_manager import MemoryManagerConfig, TargetMemoryManager
+from vlfm.tsp3d_models.utils.target_geometric_gating import (
+    TargetGeometricGatingEngine,
+    FrustumAndDistanceConfig,
+    BoxOccupancyConfig,
+    BoxPointDensityConfig,
+)
+from vlfm.tsp3d_models.utils.soft_frontier_bias import SoftFrontierBiasConfig, SoftFrontierBiasEngine
 from vlfm.tsp3d_models.utils.pipeline import TSP3DInputPreprocessor
 from vlfm.tsp3d_models.utils.s_penalty import (SPenaltyConfig, apply_s_penalty, 
                                             near_surface_point, query_semantic_at)
+from vlfm.tsp3d_models.utils.scan_behavior import (
+    _act_panoramic,
+    _act_world_scan,
+)
 
 PROMPT_SEPARATOR = "|"
 
@@ -61,6 +73,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
             near_field_sigma_scale: float = 0.8,
             use_vlfm_nlp: bool = False,
             fusion_style: str = "world",  # "camera" / "world" / "panoramic"
+            enable_scan: bool = False,
+            frontier_trigger: bool = True,
+            scan_min_gap: int = 90,
+            scan_opportunistic_after: int = 60,
             wm_voxel_size: float = 0.02,
             wm_radius: float = 6.0,
             wm_min_view_disp: float = 0.15,
@@ -100,6 +116,37 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_radius_m: float = 0.5,
             s_penalty_use_surface: bool = True,
             goal_use_surface: bool = True,
+            # V7 target-memory manager (M6/M7/M9; default OFF)
+            merge_dist_thresh: float = 0.5,
+            ema_weight_old: float = 0.8,
+            enable_mechanism_7: bool = False,
+            exempt_near_radius: float = 1.0,
+            exempt_min_merges: int = 1,
+            enable_mechanism_6: bool = False,
+            free_erasure_radius: float = 0.3,
+            free_erasure_min_explored: int = 5,
+            free_erasure_free_ratio: float = 0.85,
+            free_erasure_soft_only: bool = True,
+            enable_mechanism_9: bool = False,
+            # V7 geometric admission gate (M2/M4/M8/M3; default OFF)
+            geom_m2_near_reject: bool = False,
+            geom_m4_suspicious: bool = False,
+            geom_m8_occ_gate: bool = False,
+            geom_m3_density: bool = False,
+            geom_min_dist_reject: float = 1.0,
+            geom_max_dist_trusted: float = 4.0,
+            geom_edge_margin_px: int = 8,
+            geom_min_occupied_voxels: int = 8,
+            geom_min_occupancy_ratio: float = 0.001,
+            geom_min_points_confirm: int = 150,
+            geom_min_frames_confirm: int = 2,
+            geom_cluster_merge_dist: float = 0.5,
+            # V7 soft-frontier bias (M5; default OFF)
+            m5_enable: bool = False,
+            m5_bias_weight: float = 0.60,
+            m5_gaussian_sigma: float = 1.50,
+            m5_max_influence_radius: float = 4.50,
+            m5_normalize: bool = False,
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -176,16 +223,90 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._s_penalty_use_surface = s_penalty_use_surface
         self._goal_use_surface = goal_use_surface
 
+        # V7 target-memory lifecycle manager (native fallback + M6/M7/M9).
+        # Operates IN PLACE on the four memory dicts above so goal selection,
+        # policy_info and evaluation logging keep reading the same structures.
+        self._memory_manager = TargetMemoryManager(MemoryManagerConfig(
+            enable_fallback=enable_fb,
+            fb_near_radius=self._fb_near_radius,
+            fb_hysteresis=self._fb_hysteresis,
+            fb_suspicious_hysteresis=self._fb_suspicious_hysteresis,
+            fb_suspicious_conf=self._fb_suspicious_conf,
+            enable_mechanism_7=enable_mechanism_7,
+            exempt_near_radius=exempt_near_radius,
+            exempt_min_merges=exempt_min_merges,
+            enable_mechanism_6=enable_mechanism_6,
+            free_erasure_radius=free_erasure_radius,
+            free_erasure_min_explored=free_erasure_min_explored,
+            free_erasure_free_ratio=free_erasure_free_ratio,
+            free_erasure_soft_only=free_erasure_soft_only,
+            enable_mechanism_9=enable_mechanism_9,
+            merge_dist_thresh=merge_dist_thresh,
+            ema_weight_old=ema_weight_old,
+        ))
+        self._memory_manager.bind(
+            self._target_3d_memory, self._target_surface_memory,
+            self._target_verify_state, self._target_fallback_state,
+        )
+
+        # V7 geometric admission gate (module 1: M2/M4/M8/M3, default OFF).
+        # Runs BEFORE the S-penalty gate inside `_query_and_process`.
+        self._geom_gate_engine = TargetGeometricGatingEngine(
+            frustum_cfg=FrustumAndDistanceConfig(
+                enable_near_reject=geom_m2_near_reject,
+                enable_suspicious=geom_m4_suspicious,
+                min_dist_reject=geom_min_dist_reject,
+                max_dist_trusted=geom_max_dist_trusted,
+                edge_margin_px=geom_edge_margin_px,
+                img_w=self._depth_image_shape[1],
+                img_h=self._depth_image_shape[0],
+            ),
+            occ_cfg=BoxOccupancyConfig(
+                enable=geom_m8_occ_gate,
+                min_occupied_voxels=geom_min_occupied_voxels,
+                min_occupancy_ratio=geom_min_occupancy_ratio,
+            ),
+            density_cfg=BoxPointDensityConfig(
+                enable=geom_m3_density,
+                min_points_confirm=geom_min_points_confirm,
+                min_frames_confirm=geom_min_frames_confirm,
+                cluster_merge_dist=geom_cluster_merge_dist,
+            ),
+        )
+
+        # V7 soft-frontier bias engine (M5, default OFF).
+        # Suspicious single-observation targets are soft (explore-attraction only,
+        # never hard-locked); their Gaussian attraction is added to the exploration
+        # frontier scores in `BaseITMPolicy._sort_frontiers_by_value`.
+        self._m5_engine = SoftFrontierBiasEngine(SoftFrontierBiasConfig(
+            enable=m5_enable,
+            bias_weight=m5_bias_weight,
+            gaussian_sigma=m5_gaussian_sigma,
+            max_influence_radius=m5_max_influence_radius,
+            normalize_output=m5_normalize,
+        ))
+
+        # Fusion route selection: "camera" (temporal window) / "world" (incremental map) 
+        # / "panoramic" (single-position 360° spatial fusion) / "none" (no fusion mechanism).
+        self._fusion_style = fusion_style
+        self._enable_scan = bool(enable_scan)
+        self._frontier_trigger = bool(frontier_trigger)
+        self._scan_min_gap = max(int(scan_min_gap), 1)
+        self._scan_opportunistic_after = max(int(scan_opportunistic_after), 0)
+        self._last_scan_step: int = -10**9
+        self._last_lock_step: int = 0
         # Scan state machine: True while an in-place panoramic scan is running
-        # (BaseITMPolicy uses it to skip per-step value-map updates during scans).
         self._scan_in_progress = False
         # S-penalty (c') candidates of the most recent TSP3D query; 
         # the scan-end direction decision ranks them by c'.
         self._last_pending: list = []
         self._scan_value_views: list = []
-        # Fusion route selection: "camera" (temporal window) / "world" (incremental map) 
-        # / "panoramic" (single-position 360° spatial fusion) / "none" (no fusion mechanism).
-        self._fusion_style = fusion_style
+        self._scan_pos: Optional[np.ndarray] = None     # last scan / init pose (min-move novelty guard)
+        self._scan_remaining: int = 0                   # remaining in-place turn frames of a scan
+        self._scan_pcd_frames: list = []                # world-frame pcd slices of the in-progress scan
+        self._scan_voxel_size = float(panoramic_voxel_size)
+        self._scan_radius = float(panoramic_radius) if panoramic_radius is not None else None
+        self._scan_max_points = int(panoramic_max_points)
         self._preprocessor = TSP3DInputPreprocessor(
             fusion_style=fusion_style,
             window_size=pcd_window_size,
@@ -275,9 +396,16 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._target_verify_state.clear()
         self._target_fallback_state.clear()
         self._last_target_coord = None
+        self._memory_manager.reset()  # clears M9 lock (memory dicts cleared above)
+        self._geom_gate_engine.reset()  # clears M3 cluster accumulators (module 1)
         self._scan_in_progress = False
         self._last_pending = []
         self._scan_value_views = []
+        self._scan_pos = None
+        self._scan_remaining = 0
+        self._scan_pcd_frames = []
+        self._last_scan_step = -10**9
+        self._last_lock_step = 0
         self._pointnav_policy.reset()
         self._obstacle_map3d.reset()
         self._preprocessor.reset()
@@ -312,68 +440,37 @@ class TSP3DObjectNavPolicy(BasePolicy):
         subclasses override to query the value map."""
         return query_semantic_at(x, y, radius_m)
 
-    def _anti_hallucination_fallback(self, tf_camera_to_episodic: np.ndarray, max_depth: float) -> None:
-        """VLFM-aligned anti-hallucination fallback (centroid version).
+    def _query_tsp3d_client(
+        self,
+        aligned_pcd: np.ndarray,
+        target_query: str
+    ) -> List[Dict[str, Any]]:
+        """Query TSP3D, scaling the pruning threshold when extremely close to surfaces."""
+        if len(aligned_pcd) == 0:
+            return [], {}
 
-        Increment the miss counter of centroids inside the near-field FOV cone that got
-        no fresh re-detection; delete past the hysteresis threshold. 
-        Fresh merges reset the counter, so only drift-only (hallucinated)
-        boxes are ever deleted -> fall back to explore.
-        """
-        camera_pos = tf_camera_to_episodic[:3, 3]
-        camera_yaw = extract_yaw(tf_camera_to_episodic)
-        # hFOV from sensor-derived focal length so the cone matches the actual frustum.
-        cone_fov = get_fov(self._fx, self._depth_image_shape[1])
-        near_radius = self._fb_near_radius # max_depth * 0.5
+        camera_height = getattr(self, "_camera_height", 0.88)
+        camera_pos_local = np.array([0.0, 0.0, camera_height])
+        pcd_pts = aligned_pcd[:, :3]
+        dists = np.linalg.norm(pcd_pts - camera_pos_local, axis=1)
+        min_dist = np.min(dists) if len(dists) > 0 else 10.0
 
-        for target_class in list(self._target_3d_memory.keys()):
-            centroids = self._target_3d_memory[target_class]
-            states = self._target_fallback_state.get(target_class, [])
-            if len(states) != len(centroids):
-                # Defensive: keep state in sync with centroids
-                states = [{"suspicious": False, "near_miss": 0} for _ in centroids]
-                self._target_fallback_state[target_class] = states
+        # Adaptive soft-pruning adjustment near obstacle surfaces
+        dynamic_sigma_sce = self._sigma_sce
+        if min_dist < self._near_field_dist:
+            scale = max(self._near_field_sigma_scale, min_dist / self._near_field_dist)
+            dynamic_sigma_sce = self._sigma_sce * scale
 
-            keep_c, keep_v, keep_s = [], [], []
-            surfaces = self._target_surface_memory.get(target_class, [])
-            keep_surf = []
+        raw_preds, diagnostics = self._tsp3d_client.predict(
+            pcd=aligned_pcd,
+            text=target_query,
+            sigma_tar=self._sigma_tar,
+            sigma_sce=dynamic_sigma_sce,
+            tau=self._tau,
+            use_vlfm_nlp=self._nlp_mode,
+        )
 
-            for idx, centroid in enumerate(centroids):
-                # Inside the near-field confirmation cone?
-                if centroid.shape[0] >= 3:
-                    query_pt = centroid.reshape(1, 3)
-                else:
-                    query_pt = np.append(centroid, 0.5).reshape(1, 3)
-                in_cone = within_fov_cone(camera_pos, camera_yaw, cone_fov, near_radius, query_pt)
-                if len(in_cone) > 0:
-                    states[idx]["near_miss"] += 1
-                    thr = (
-                        self._fb_suspicious_hysteresis
-                        if states[idx]["suspicious"]
-                        else self._fb_hysteresis
-                    )
-                    if states[idx]["near_miss"] >= thr:
-                        print(f"[AntiHallucination] Deleted {target_class} centroid "
-                              f"{np.round(centroid, 3)} (suspicious={states[idx]['suspicious']}, "
-                              f"near_miss={states[idx]['near_miss']}) -> fallback to explore")
-                        continue  # drop this centroid
-                keep_c.append(centroid)
-                keep_surf.append(surfaces[idx] if idx < len(surfaces) else centroid)
-                keep_v.append(self._target_verify_state[target_class][idx])
-                keep_s.append(states[idx])
-
-            self._target_3d_memory[target_class] = keep_c
-            self._target_surface_memory[target_class] = keep_surf
-            self._target_verify_state[target_class] = keep_v
-            self._target_fallback_state[target_class] = keep_s
-
-        # Drop emptied classes (no target -> explore)
-        for target_class in list(self._target_3d_memory.keys()):
-            if len(self._target_3d_memory[target_class]) == 0:
-                del self._target_3d_memory[target_class]
-                self._target_surface_memory.pop(target_class, None)
-                self._target_verify_state.pop(target_class, None)
-                self._target_fallback_state.pop(target_class, None)
+        return raw_preds, diagnostics
 
     def _project_rgbd_to_3d_point_cloud(
         self,
@@ -427,107 +524,125 @@ class TSP3DObjectNavPolicy(BasePolicy):
             rgb, depth, fx, fy, tf, min_depth, max_depth
         )
 
-    def _query_tsp3d_client(
+    def _geom_gate(
         self,
-        aligned_pcd: np.ndarray,
-        target_query: str
-    ) -> List[Dict[str, Any]]:
-        """Query TSP3D, scaling the pruning threshold when extremely close to surfaces."""
-        if len(aligned_pcd) == 0:
-            return [], {}
-        
-        camera_height = getattr(self, "_camera_height", 0.88)
-        camera_pos_local = np.array([0.0, 0.0, camera_height])
-        pcd_pts = aligned_pcd[:, :3]
-        dists = np.linalg.norm(pcd_pts - camera_pos_local, axis=1)
-        min_dist = np.min(dists) if len(dists) > 0 else 10.0
-
-        # Adaptive soft-pruning adjustment near obstacle surfaces
-        dynamic_sigma_sce = self._sigma_sce
-        if min_dist < self._near_field_dist:
-            scale = max(self._near_field_sigma_scale, min_dist / self._near_field_dist)
-            dynamic_sigma_sce = self._sigma_sce * scale
-
-        raw_preds, diagnostics = self._tsp3d_client.predict(
-            pcd=aligned_pcd,
-            text=target_query,
-            sigma_tar=self._sigma_tar,
-            sigma_sce=dynamic_sigma_sce,
-            tau=self._tau,
-            use_vlfm_nlp=self._nlp_mode,
-        )
-
-        return raw_preds, diagnostics
-
-    def _accumulate_3d_target_memory(self, target_class: str, centroid: np.ndarray, confidence: float = 1.0, near_surface: Optional[np.ndarray] = None) -> None:
+        detections: ObjectDetections,
+        pcd_world: np.ndarray,
+        tf_camera_to_episodic: np.ndarray,
+        fx: float,
+        fy: float,
+    ) -> Tuple[ObjectDetections, List[Any]]:
         """
-        Write detection into memory. Drift-only hallucinated boxes get deleted near the FOV cone -> explore.
-        EMA-merge within 0.5m; track suspicious (far/low-conf) + near-miss counter —> fresh merge resets it;
+        Geometric admission gate (M2/M4/M8/M3) on the current candidates.
+
+        REJECTED (M2 near-field / M8 empty-air) and (when M3 is on) unconfirmed
+        SOFT_ACCUMULATING detections are dropped before S-penalty. 
+        Returns ``(filtered, meta)`` where ``meta[i]`` is True 
+        when M4 flagged the kept detection suspicious, else None.
         """
-
-        robot_xy = self._observations_cache.get("robot_xy", np.zeros(2))
-        robot_yaw = self._observations_cache.get("robot_heading", 0.0)
-        robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
-
-        # Suspicious = far or low-conf (VLFM range_id != 1 analogue); 
-        # two-tier gating: [sigma_tar, fb_suspicious_conf).
-        if centroid.shape[0] >= 3:
-            detect_dist = float(np.linalg.norm(centroid - robot_xyz))
-        else:
-            detect_dist = float(np.linalg.norm(centroid - robot_xyz[:2]))
-        suspicious = (confidence < self._fb_suspicious_conf) or (detect_dist > self._max_depth * 0.95)
-
-        if target_class not in self._target_3d_memory:
-            self._target_3d_memory[target_class] = [centroid]
-            self._target_surface_memory[target_class] = [near_surface if near_surface is not None else centroid]
-            self._target_verify_state[target_class] = [(1, robot_xy.copy(), float(robot_yaw), float(confidence))]
-            self._target_fallback_state[target_class] = [{"suspicious": suspicious, "near_miss": 0}]
-            return
-
-        existing_centroids = np.array(self._target_3d_memory[target_class])
-        dists = np.linalg.norm(existing_centroids - centroid, axis=1)
-        closest_idx = np.argmin(dists)
-
-        # EMA-merge observations within 0.5m
-        if dists[closest_idx] < 0.5:
-            self._target_3d_memory[target_class][closest_idx] = (
-                0.8 * self._target_3d_memory[target_class][closest_idx] + 0.2 * centroid
+        engine = self._geom_gate_engine
+        n = detections.num_detections
+        if n == 0:
+            return detections, []
+        boxes_np = detections.boxes.detach().cpu().numpy()
+        logits_np = detections.logits.detach().cpu().numpy()
+        keep = np.ones(n, dtype=bool)
+        meta: List[Any] = []
+        m3_on = engine.density_acc.cfg.enable
+        for i in range(n):
+            status, _cluster, diag = engine.process_detection(
+                target_class=detections.phrases[i],
+                box_corners=boxes_np[i],
+                current_frame_pcd=pcd_world,
+                obstacle_map_3d=self._obstacle_map3d,
+                tf_camera_to_episodic=tf_camera_to_episodic,
+                fx=fx,
+                fy=fy,
+                confidence=float(logits_np[i]),
+                step=self._num_steps,
             )
-            # Cross-frame consensus is strong evidence; hallucinated boxes drift and can't merge.
-            num_obs, _, _, old_conf = self._target_verify_state[target_class][closest_idx]
-            num_obs += 1
-            # Keep the max c' over merges: a confirmed high-score detection stays high.
-            self._target_verify_state[target_class][closest_idx] = (
-                num_obs, robot_xy.copy(), float(robot_yaw), max(old_conf, float(confidence))
-            )
-            # Fresh merge = real target: reset near-miss counter (drift-only boxes can't).
-            self._target_fallback_state[target_class][closest_idx]["near_miss"] = 0
-        else:
-            self._target_3d_memory[target_class].append(centroid)
-            self._target_surface_memory[target_class].append(near_surface if near_surface is not None else centroid)
-            self._target_verify_state[target_class].append((1, robot_xy.copy(), float(robot_yaw), float(confidence)))
-            self._target_fallback_state[target_class].append({"suspicious": suspicious, "near_miss": 0})
+            drop = (status == "REJECTED") or (m3_on and status == "SOFT_ACCUMULATING")
+            keep[i] = not drop
+            meta.append(bool(diag.get("is_suspicious", False)) if not drop else None)
+        kept_meta = [m for m, k in zip(meta, keep) if k]
+        if not keep.all():
+            detections.filter_by_mask(keep)
+        return detections, kept_meta
+
+    def _is_soft_record(self, cls: str, i: int) -> bool:
+        """
+        M5 soft-to-hard: a record is SOFT if it is suspicious (low-confidence /
+        geometrically suspect) AND seen in a single frame (num_obs == 1).
+
+        Such records attract exploration (Gaussian frontier bias) but are never
+        hard navigation goals. Multi-frame or trusted records are HARD.
+        """
+        ver = self._target_verify_state.get(cls)
+        fb = self._target_fallback_state.get(cls)
+        if not ver or i >= len(ver) or not fb or i >= len(fb):
+            return False
+        num_obs = int(ver[i][0])
+        susp = bool(fb[i].get("suspicious", False))
+        return susp and num_obs <= 1
+
+    def _get_soft_targets(self) -> List[Dict[str, Any]]:
+        """
+        Soft targets for the M5 frontier bias: suspicious single-frame records
+        across all memorized classes.
+        Returns [{centroid: 3D np.ndarray, confidence: float}] 
+        to feed SoftFrontierBiasEngine.apply_bias_and_rank.
+        """
+        soft: List[Dict[str, Any]] = []
+        for cls, centroids in self._target_3d_memory.items():
+            for i in range(len(centroids)):
+                if not self._is_soft_record(cls, i):
+                    continue
+                conf = 1.0
+                ver = self._target_verify_state.get(cls)
+                if ver and i < len(ver) and len(ver[i]) >= 4:
+                    conf = float(ver[i][3])
+                soft.append({
+                    "centroid": np.asarray(centroids[i], dtype=np.float64),
+                    "confidence": conf,
+                })
+        return soft
 
 
     def _get_target_object_location(self, position: np.ndarray) -> Union[None, np.ndarray]:
-        """Navigation goal among the memorized target candidates. Distance-latch keeps goal switches stable.
+        """
+        Navigation goal among the memorized target candidates. 
+        Distance-latch keeps goal switches stable.
 
         world/camera/none: closest centroid with a distance-latch.
-        
-        panoramic: rank candidates by their S-penalty score c';
-        nearest is the fallback when c' is missing.
+        panoramic: rank candidates by their S-penalty score c'; nearest is the fallback when c' is missing.
+
+        M9: while a target is locked, its goal is returned every step (identity frozen);
+        the lock auto-clears when the record is deleted -> re-select normally.
         """
+        # M9: navigate identity freeze.
+        if self._memory_manager.config.enable_mechanism_9:
+            locked = self._memory_manager.locked_goal()
+            if locked is not None:
+                self._last_target_coord = locked.copy()
+                return self._last_target_coord
+
         target_classes = self._target_object.split("|")
         valid_centroids: List[np.ndarray] = []
         valid_goals: List[np.ndarray] = []
         valid_confs: List[Optional[float]] = []
+        valid_owners: List[Tuple[str, int]] = []   # (class, in-class index) per candidate
 
         for cls in target_classes:
             if cls in self._target_3d_memory and len(self._target_3d_memory[cls]) > 0:
                 surf_list = self._target_surface_memory.get(cls, [])
                 verify_list = self._target_verify_state.get(cls, [])
                 for i, centroid in enumerate(self._target_3d_memory[cls]):
+                    # M5 soft-to-hard: suspicious single-view records are soft
+                    # (attract exploration only), never hard navigation goals.
+                    if self._m5_engine.config.enable and self._is_soft_record(cls, i):
+                        continue
                     valid_centroids.append(np.array(centroid))
+                    valid_owners.append((cls, i))
                     if self._goal_use_surface and i < len(surf_list):
                         valid_goals.append(np.array(surf_list[i]))
                     else:
@@ -557,17 +672,23 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         if self._last_target_coord is None:
             self._last_target_coord = chosen_2d
-            return self._last_target_coord
-
-        # distance-latch: keep the current goal unless the switch is meaningful.
-        delta_dist = np.linalg.norm(chosen_2d - self._last_target_coord)
-        dist_to_new = float(np.linalg.norm(valid_centroids[chosen_idx][:2] - robot_xy))
-        if delta_dist < 0.1:
-            pass  # <0.1m from current target: keep
-        elif delta_dist < 0.5 and dist_to_new > 2.0:
-            pass  # <0.5m and robot >2m away: keep
         else:
-            self._last_target_coord = chosen_2d
+            # distance-latch: keep the current goal unless the switch is meaningful.
+            delta_dist = np.linalg.norm(chosen_2d - self._last_target_coord)
+            dist_to_new = float(np.linalg.norm(valid_centroids[chosen_idx][:2] - robot_xy))
+            if delta_dist < 0.1:
+                pass  # <0.1m from current target: keep
+            elif delta_dist < 0.5 and dist_to_new > 2.0:
+                pass  # <0.5m and robot >2m away: keep
+            else:
+                self._last_target_coord = chosen_2d
+
+        # M9: freeze the identity of the first target we commit to navigate to
+        # (a non-None goal enters the navigate branch in `act`).
+        if self._memory_manager.config.enable_mechanism_9 and not self._memory_manager.is_locked():
+            owner_cls, owner_idx = valid_owners[chosen_idx]
+            self._memory_manager.lock_target(owner_cls, owner_idx)
+
         return self._last_target_coord
 
     def _update_object_map(
@@ -666,7 +787,17 @@ class TSP3DObjectNavPolicy(BasePolicy):
         if not self._done_initializing:
             return detections
 
+        # V7 geometric admission gate (module 1; mechanisms 2/8/4/3, default OFF).
+        #   REJECTED (M2 near-field / M8 empty-air)   -> dropped before S-penalty;
+        #   M3 ON & SOFT (unconfirmed density)         -> dropped (must HARD-confirm);
+        #   is_suspicious (M4 far / frustum-edge)      -> forwarded to memory write
+        #     as a suspicious_override (quicker near-field cleanup).
+        geom_meta: Optional[List[Any]] = None
+        if self._geom_gate_engine.enabled:
+            detections, geom_meta = self._geom_gate(detections, pcd_world, tf_camera_to_episodic, fx, fy)
+
         # S-penalty gate cross-validation -> write passed detections to memory.
+        admitted_meta: List[Any] = []
         pending = apply_s_penalty(
             detections, target_classes, robot_xyz,
             query_semantic=self._query_semantic_at,
@@ -676,16 +807,31 @@ class TSP3DObjectNavPolicy(BasePolicy):
             goal_use_surface=self._goal_use_surface,
             nlp_mode=self._nlp_mode,
             out_log=self._detect_logs,
+            per_det_meta=geom_meta,
+            meta_out=admitted_meta,
         )
         # Keep this query's admitted candidates (c') for the scan-end direction decision.
         self._last_pending = list(pending)
-        for conf_amp, centroid_np, near_surface, active_classes in pending:
+        for (conf_amp, centroid_np, near_surface, active_classes), susp in zip(pending, admitted_meta):
             for cls in active_classes:
-                self._accumulate_3d_target_memory(cls, centroid_np, confidence=conf_amp, near_surface=near_surface)
+                self._memory_manager.accumulate(
+                    cls, centroid_np, confidence=conf_amp, near_surface=near_surface,
+                    robot_xyz=robot_xyz, robot_yaw=robot_yaw, max_depth=max_depth,
+                    suspicious_override=bool(susp) if susp is not None else None,
+                )
 
-        # Run anti-hallucination fallback every step (delete confirmed-false -> explore).
-        if self._enable_fb:
-            self._anti_hallucination_fallback(tf_camera_to_episodic, max_depth)
+        # Target-memory lifecycle every step (delete confirmed-false -> explore).
+        # The manager internally runs M6 free-space erasure + the native
+        # anti-hallucination fallback (M7 exemption), each independently switched
+        # through the policy / YAML config (defaults preserve the world baseline).
+        camera_pos = tf_camera_to_episodic[:3, 3]
+        camera_yaw = extract_yaw(tf_camera_to_episodic)
+        cone_fov = get_fov(self._fx, self._depth_image_shape[1])
+        self._memory_manager.step(
+            camera_pos, camera_yaw, cone_fov,
+            obstacle_map_3d=self._obstacle_map3d,
+            robot_xyz=robot_xyz,
+        )
 
         return detections
 
@@ -751,31 +897,45 @@ class TSP3DObjectNavPolicy(BasePolicy):
             robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
             robot_yaw = self._observations_cache.get("robot_heading", 0.0)
             goal_3d = self._get_target_object_location(robot_xyz)
-            det, mode, action = self._act_panoramic(
-                observations, pcd, robot_xyz, robot_yaw, rgb, depth, tf,
+            det, mode, action = _act_panoramic(
+                self, observations, pcd, robot_xyz, robot_yaw, rgb, depth, tf,
                 min_depth, max_depth, fx, fy, goal_3d,
             )
             detections.append(det)
 
         else:
-            for i, (rgb, depth, tf, min_depth, max_depth, fx, fy) in enumerate(object_map_rgbd):
-                pcd = self._get_shared_pcd(i)
-                detections.append(
-                    self._update_object_map(rgb, depth, tf, min_depth, max_depth, fx, fy, pcd=pcd)
+            if self._fusion_style == "world" and self._enable_scan:
+                # World temporal fusion + frontier-arrival 360° scan.
+                rgb, depth, tf, min_depth, max_depth, fx, fy = object_map_rgbd[0]
+                pcd = self._get_shared_pcd(0)
+                robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
+                robot_yaw = self._observations_cache.get("robot_heading", 0.0)
+                goal_3d = self._get_target_object_location(robot_xyz)
+                det, mode, action = _act_world_scan(
+                    self, observations, pcd, robot_xyz, robot_yaw, rgb, depth, tf,
+                    min_depth, max_depth, fx, fy, goal_3d,
                 )
-            robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
-            goal_3d = self._get_target_object_location(robot_xyz)
-            # Exploration via habitat frontier_sensor.
-            if not self._done_initializing:
-                mode = "initialize"
-                action = self._initialize()
-            elif goal_3d is None:
-                mode = "explore"
-                action = self._explore(observations)
+                detections.append(det)
+            
             else:
-                mode = "navigate"
-                print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
-                action = self._pointnav(goal_3d[:2], stop=True)
+                for i, (rgb, depth, tf, min_depth, max_depth, fx, fy) in enumerate(object_map_rgbd):
+                    pcd = self._get_shared_pcd(i)
+                    detections.append(
+                        self._update_object_map(rgb, depth, tf, min_depth, max_depth, fx, fy, pcd=pcd)
+                    )
+                robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
+                goal_3d = self._get_target_object_location(robot_xyz)
+                # Exploration via habitat frontier_sensor.
+                if not self._done_initializing:
+                    mode = "initialize"
+                    action = self._initialize()
+                elif goal_3d is None:
+                    mode = "explore"
+                    action = self._explore(observations)
+                else:
+                    mode = "navigate"
+                    print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
+                    action = self._pointnav(goal_3d[:2], stop=True)
 
         action_np = action.detach().cpu().numpy()[0]
         if len(action_np) == 1:
@@ -788,180 +948,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._did_reset = False
 
         return action, rnn_hidden_states
-
-    def _act_panoramic(
-        self,
-        observations: Dict,
-        pcd: np.ndarray,
-        robot_xyz: np.ndarray,
-        robot_yaw: float,
-        rgb: np.ndarray,
-        depth: np.ndarray,
-        tf: np.ndarray,
-        min_depth: float,
-        max_depth: float,
-        fx: float,
-        fy: float,
-        goal_3d: Union[None, np.ndarray],
-    ) -> Tuple[ObjectDetections, str, Tensor]:
-        """Panoramic route under a unified per-step decision (scan is an independent behavior, not a sub-state of explore).
-
-        Each step follows the priority below:
-          1. scan in progress   -> accumulate frame + wide-turn (no TSP3D);
-                                  at the last frame stitch 360° -> ONE query -> 
-                                  ``_after_scan_action`` (direction by c').
-          2. initialize         -> 12 x 30° in-place turns; each step also sends
-                                  a single frame to TSP3D; init counts as a scan
-                                  of the start pose.
-          3. decision layer (init done):
-             - target in memory            -> navigate (single-frame input);
-             - reached a NEW frontier      -> begin an independent 360° scan;
-             - otherwise                   -> explore (single-frame input, move
-                                              along the semantic value field).
-
-        - Obstacle map is updated every step.
-        - Mid-scan steps only accumulate the frame and turn with the scan-only wide-turn action (decoupled from the 30° nav turn).
-        - Value-map updates are skipped during scans (BaseITMPolicy checks ``_scan_in_progress``).
-        - Anti-hallucination fallback runs only on query steps.
-        """
-        pp = self._preprocessor
-        self._obstacle_map3d.update_map(
-            pcd=pcd, tf_camera_to_episodic=tf, depth=depth,
-            min_depth=min_depth, max_depth=max_depth, fx=fx, fy=fy,
-        )
-        empty_det = ObjectDetections(
-            boxes=[], logits=[], phrases=[], pcd_source=pcd, image_source=rgb,
-            fx=fx, fy=fy, tf_camera_to_episodic=tf,
-        )
-
-        # mid-scan: accumulate this frame, keep turning
-        if pp.is_scanning:
-            # Record this scan frame's view 
-            # so the whole 360° scan can refresh the semantic value field in ONE update at the scan end.
-            self._scan_value_views.append(
-                (rgb, depth, tf, min_depth, max_depth, float(self._camera_fov))
-            )
-            remaining = pp.continue_scan(pcd)
-            if remaining <= 0:
-                # Full turn done: stitch the 360° cloud and query TSP3D once,
-                # then pick the next direction from this scan's candidates.
-                pcd_local = pp.finish_scan(robot_xyz, robot_yaw, self._camera_height)
-                # Refresh the semantic value field once with ALL scan frames before the single TSP3D query.
-                _views = self._scan_value_views
-                self._scan_value_views = []
-                _value_updater = getattr(self, "_update_value_map", None)
-                if callable(_value_updater) and _views:
-                    self._observations_cache["value_map_rgbd"] = _views
-                    _value_updater()
-                det = self._query_and_process(
-                    pcd_local, robot_xyz, robot_yaw, pcd, rgb,
-                    tf, max_depth, fx, fy,
-                )
-                action = self._after_scan_action(observations, robot_xyz, robot_yaw)
-                # Scan finished -> next step resumes the unified decision flow.
-                self._scan_in_progress = False
-            else:
-                det = empty_det
-                action = self._scan_turn_action
-                self._scan_in_progress = True
-
-            mode = "scan"
-            return det, mode, action
-
-        # unified decision (scan not in progress)
-        self._scan_in_progress = False
-        if not self._done_initializing:
-            pp.set_scan_position(robot_xyz, robot_yaw)
-            pcd_local = pp.raw_frame(pcd, robot_xyz, robot_yaw, self._camera_height)
-            det = self._query_and_process(
-                pcd_local, robot_xyz, robot_yaw, pcd, rgb, tf, max_depth, fx, fy,
-            )
-            mode = "initialize"
-            action = self._initialize()
-        elif goal_3d is None:
-            if self._at_new_frontier(robot_xyz):
-                # Reached a NEW frontier point -> independent 360° scan.
-                # This step's view is the first slice of the scan.
-                self._scan_value_views.append(
-                    (rgb, depth, tf, min_depth, max_depth, float(self._camera_fov))
-                )
-                pp.begin_scan(pcd, robot_xyz, robot_yaw)
-                self._scan_in_progress = True
-                mode = "scan"
-                action = self._scan_turn_action
-                return empty_det, mode, action
-            # Travel step: send the raw single frame straight to TSP3D.
-            pcd_local = pp.raw_frame(pcd, robot_xyz, robot_yaw, self._camera_height)
-            det = self._query_and_process(
-                pcd_local, robot_xyz, robot_yaw, pcd, rgb, tf, max_depth, fx, fy,
-            )
-            mode = "explore"
-            action = self._explore(observations)
-        else:
-            mode = "navigate"
-            print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
-            pcd_local = pp.raw_frame(pcd, robot_xyz, robot_yaw, self._camera_height)
-            det = self._query_and_process(
-                pcd_local, robot_xyz, robot_yaw, pcd, rgb, tf, max_depth, fx, fy,
-            )
-            action = self._pointnav(goal_3d[:2], stop=True)
-        return det, mode, action
-
-    def _after_scan_action(self, observations: Dict, robot_xyz: np.ndarray, robot_yaw: float) -> Tensor:
-        """Direction right after a finished 360° scan, decided S-penalty style.
-
-        move toward the candidate with the HIGHEST c' so every advance direction best matches the target. 
-        With no admitted candidate, fall back to the semantic value field.
-        """
-        pending = getattr(self, "_last_pending", None) or []
-        if pending:
-            best = max(pending, key=lambda p: float(p[0]))  # highest c'
-            conf_amp, centroid, near_surface, _ = best
-            goal = near_surface if near_surface is not None else centroid
-            print(
-                f"[ScanEnd] best c'={conf_amp:.3f} goal={np.round(np.asarray(goal)[:2], 2)} "
-                "-> moving to target"
-            )
-            return self._pointnav(np.asarray(goal)[:2], stop=False)
-        return self._explore(observations)
-
-    def _at_new_frontier(self, robot_xyz: np.ndarray) -> bool:
-        """True when the robot has REACHED a NEW frontier point (scan trigger).
-        
-        ``panoramic_min_move`` still guards against re-scanning the same spot.
-        - frontier tracking (main path): a scan fires when the frontier cluster
-          the explore layer is pursuing disappears from ``frontier_sensor``.
-        - distance fallback (no tracked cluster yet): any frontier within
-          ``panoramic_arrive_dist`` -> scan, so a scan is never starved.
-        """
-        pp = self._preprocessor
-        frontiers = self._observations_cache.get("frontier_sensor")
-        if frontiers is None or len(frontiers) == 0:
-            return False
-        frontiers = np.asarray(frontiers, dtype=np.float32)
-        if frontiers.ndim != 2 or frontiers.shape[1] < 2:
-            return False
-        # Empty-frontier sentinel returned by the sensor is zeros((1, 2)).
-        if frontiers.shape == (1, 2) and float(np.abs(frontiers).max()) < 1e-6:
-            return False
-        if not pp.allow_scan(robot_xyz):
-            return False
-
-        robot_xy = np.asarray(robot_xyz)[:2]
-        # Frontier-tracking main path: fire only when the pursued cluster is gone
-        # from the current frontier list (reached + digested).
-        last = np.asarray(getattr(self, "_last_frontier", np.zeros(2)), dtype=np.float32)
-        if last.shape == (2,) and float(np.abs(last).max()) >= 1e-6:
-            # Still present (exact or within 0.5 m) -> keep advancing.
-            if closest_point_within_threshold(frontiers[:, :2], last, threshold=0.5) != -1:
-                return False
-            # The pursued cluster was digested -> genuinely reached a new boundary.
-            return True
-        # No tracked cluster yet (reset / navigation since last explore pick):
-        # distance-gate fallback so a scan is never starved.
-        dists = np.linalg.norm(frontiers[:, :2] - robot_xy, axis=1)
-        return float(dists.min()) <= self._panoramic_arrive_dist
-
 
     def _get_policy_info(self, detections: ObjectDetections) -> Dict[str, Any]:
         has_target = any(cls in self._target_3d_memory 
@@ -1049,6 +1035,7 @@ class VLVMConfig:
     near_field_dist: float = 1.0        # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
     near_field_sigma_scale: float = 0.8 # Minimum voxel retention ratio near surfaces; higher = keep more voxels near obstacles.
     use_vlfm_nlp: bool = False           # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
+
     cap_style: str = "random"           # send-side point cap (shared): "random" (baseline) / "near_first" (near-field priority)
     distance_sample: bool = False       # distance-adaptive sampling (dense near / sparse far, shared post-processing)
     near_dist: float = 1.5              # distance sampling: near/mid band boundary (m)
@@ -1057,6 +1044,10 @@ class VLVMConfig:
     mid_voxel: float = 0.02             # distance sampling: mid-band voxel (m)
     far_voxel: float = 0.05             # distance sampling: far-band voxel (m)
     fusion_style: str = "world"         # Fusion route: "camera" (8-frame temporal window) / "world" (incremental map) / "panoramic" (single-position 360° spatial fusion) / "none" (no fusion, raw single frame straight to TSP3D). Replaces the old use_world_map bool.
+    enable_scan: bool = False           # world+scan integration: frontier-arrival 360° scans are a BYPASS independent of the WorldLocalMap; only active when fusion_style=world. False = pure world baseline.
+    scan_min_gap: int = 90              # Sparse-scan cooldown (env steps) between two frontier scans (last-resort, 09-04); >= scan_min_gap steps after the last scan end before a new scan may fire.
+    scan_opportunistic_after: int = 60   # Opportunistic scan: if >0, also fire a scan when explore runs this many env steps without locking a nav goal (hunts the target on long empty travels). 0 = off.
+    frontier_trigger: bool = True       # Frontier-arrival scan on/off; False = opportunistic-only (no frontier scans).
 
     # Phase 5b: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
     pcd_window_size: int = 8                # Number of frames fused for point-cloud accumulation; larger = more complete geometry but slower/staler.
@@ -1093,6 +1084,40 @@ class VLVMConfig:
     s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection point.
     s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
+
+    # Phase 7b: V7 target-memory lifecycle manager (M6/M7/M9; all default OFF = world baseline)
+    merge_dist_thresh: float = 0.5          # cross-view EMA merge distance threshold (m)
+    ema_weight_old: float = 0.8             # cross-view EMA smoothing (old * w + new * (1 - w))
+    enable_mechanism_7: bool = False        # M7: near-field confirmation exemption (keep trusted target parked next to the robot)
+    exempt_near_radius: float = 1.0         # M7: robot-target distance below which a trusted target is exempt (m)
+    exempt_min_merges: int = 1              # M7: min num_obs of a (trusted) target to be exempt
+    enable_mechanism_6: bool = False        # M6: line-of-sight free-space erasure (single-step ghost removal)
+    free_erasure_radius: float = 0.3        # M6: box half-side (m) around the centroid to inspect
+    free_erasure_min_explored: int = 5      # M6: min explored voxels in the box to trust "this space was seen"
+    free_erasure_free_ratio: float = 0.85   # M6: free-voxel ratio above which the box is judged "pure air"
+    free_erasure_soft_only: bool = True     # M6: True = erase suspicious targets only (conservative, V7 doc warning)
+    enable_mechanism_9: bool = False        # M9: navigate identity freeze (locked target survives until deleted)
+
+    # Phase 7c: V7 geometric admission gate (module 1; M2/M4/M8/M3; all default OFF = world baseline)
+    geom_m2_near_reject: bool = False       # M2: near-field hard reject (< geom_min_dist_reject)
+    geom_m4_suspicious: bool = False        # M4: far / frustum-edge detections flagged suspicious (memory override)
+    geom_m8_occ_gate: bool = False          # M8: box must have occupied-voxel support in the 3D grid
+    geom_m3_density: bool = False           # M3: box-internal point accumulation must HARD-confirm (>=points & >=frames)
+    geom_min_dist_reject: float = 1.0       # M2: near-field reject radius (m)
+    geom_max_dist_trusted: float = 4.0      # M4: beyond this distance (m) a detection is suspicious
+    geom_edge_margin_px: int = 8            # M4: 2D-projection edge-touch margin (px)
+    geom_min_occupied_voxels: int = 8       # M8: min occupied voxels supporting the box
+    geom_min_occupancy_ratio: float = 0.001  # M8: min occupied/(box volume) ratio
+    geom_min_points_confirm: int = 150      # M3: min accumulated in-box points to confirm
+    geom_min_frames_confirm: int = 2        # M3: min observation frames to confirm
+    geom_cluster_merge_dist: float = 0.5    # M3: cross-frame cluster association radius (m)
+
+    # Phase 7d: V7 soft-frontier bias (module 3; M5; default OFF = world baseline)
+    m5_enable: bool = False                 # Soft->Hard switch: suspicious single-frame records attract exploration (Gaussian frontier bias) but never hard-lock navigation.
+    m5_bias_weight: float = 0.60            # Gaussian attraction strength relative to the base frontier value (S + lambda*H1).
+    m5_gaussian_sigma: float = 1.50         # Gaussian sigma (m); two_sigma_sq = 2*sigma^2 = 4.5 -> attraction decays to exp(-0.5)~0.61 at 1.5 m.
+    m5_max_influence_radius: float = 4.50   # Truncation radius (m); 4.5 = 3*sigma (exp(-4.5)~0.011, decayed).
+    m5_normalize: bool = False              # Min-max normalize the biased scores (keeps the base value scale otherwise).
 
     @classmethod  # type: ignore
     @property

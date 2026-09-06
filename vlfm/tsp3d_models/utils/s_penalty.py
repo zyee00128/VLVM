@@ -66,6 +66,8 @@ def apply_s_penalty(
     goal_use_surface: bool,
     nlp_mode: bool,
     out_log: Optional[List[Dict[str, Any]]] = None,
+    per_det_meta: Optional[List[Any]] = None,
+    meta_out: Optional[List[Any]] = None,
 ) -> List[Tuple[float, np.ndarray, Optional[np.ndarray], List[str]]]:
     """S-penalty + admission gate for filtered detections.
 
@@ -73,11 +75,18 @@ def apply_s_penalty(
 
     If ``out_log`` is given, one dict per detection is appended for
     detection-level diagnostics: {conf, conf_amp, centroid, s, admitted}.
+
+    ``per_det_meta`` is copied item-by-item into ``meta_out`` 
+    for each ADMITTED detection (V7 geometric-gate hook).
     """
     import torch  # local import keeps the module torch-free at import time
 
     pending = []
-    for centroid, conf, box in zip(detections.centroids, detections.logits, detections.boxes):
+    if per_det_meta is not None:
+        assert len(per_det_meta) == len(detections.boxes), "per_det_meta length mismatch"
+    for k, (centroid, conf, box) in enumerate(
+        zip(detections.centroids, detections.logits, detections.boxes)
+    ):
         centroid_np = centroid.cpu().numpy()
         box_np = np.asarray(box, dtype=np.float64) if box is not None else None
         conf_f = float(conf.cpu().numpy()) if torch.is_tensor(conf) else float(conf)
@@ -112,4 +121,6 @@ def apply_s_penalty(
         if goal_use_surface and box_np is not None:
             near_surface = near_surface_point(box_np, robot_xyz)
         pending.append((conf_amp, centroid_np, near_surface, active_classes))
+        if meta_out is not None:
+            meta_out.append(per_det_meta[k] if per_det_meta is not None else None)
     return pending

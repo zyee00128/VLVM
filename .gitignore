@@ -1,5 +1,9 @@
 # 数据与权重
 data/
+ft_datasets/
+
+# 微调代码
+ft_pipeline/
 
 # 实验日志 / TensorBoard
 lockfiles/

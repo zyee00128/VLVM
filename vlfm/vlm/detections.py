@@ -248,6 +248,21 @@ class ObjectDetections:
         self._filter(keep)
         return self
 
+    def filter_by_mask(self, keep) -> "ObjectDetections":
+        """
+        In-place filter with an explicit boolean mask (e.g. geometric admission gate).
+
+        Args:
+            keep: bool mask (numpy / torch) of length == num_detections.
+        """
+        if len(self.logits) == 0:
+            return self
+        if not torch.is_tensor(keep):
+            keep = torch.as_tensor(np.asarray(keep, dtype=bool))
+        keep = keep.to(device=self.logits.device)
+        self._filter(keep)
+        return self
+
     def _filter(self, keep: torch.Tensor) -> None:
         """Filters detections in-place."""
         # Return early if no detections to filter
