@@ -154,6 +154,64 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
     _dist("maxscore (fp)", fp_scores)
 
 
+def _print_fn_trace(episode_records: List[Dict[str, Any]]) -> None:
+    """P3 recall-side diagnosis (bed/tv fn): per-fn-episode detection trace.
+
+    Distinguishes a *threshold* problem (the true target's detections only appear
+    below sigma_tar) from a *gate* problem (true detections dropped by the
+    geometric/density gate) or a *lock/admission* problem (kept but never admitted
+    to memory). Only populated when diag_enable=True (world + diag run).
+    """
+    fn = [
+        r for r in episode_records
+        if r.get("diag_trace") and _cause_short(r.get("failure_cause", "other")) == "fn"
+    ]
+    if not fn:
+        return
+    print("=" * 66)
+    print("=== P3 fn-episode detection trace (recall diagnosis, diag_enable=True) ===")
+    print(f"fn episodes with diag trace: {len(fn)}")
+
+    tot = {"below_sigma": {"n": 0, "tp": 0}, "geom_reject": {"n": 0, "tp": 0}}
+    kept_tot = {"n": 0, "tp": 0, "admit_tp": 0}
+    print(
+        f"{'scene':<12}{'target':<12}{'steps':>6}  "
+        f"{'below_sigma n/tp':>16}{'geom_drop n/tp':>16}{'kept_admit/tp':>16}"
+    )
+    for r in sorted(fn, key=lambda x: os.path.basename(x["scene_id"])):
+        scene = os.path.basename(r["scene_id"]).split(".")[0]
+        d = r.get("diag_trace", {})
+        ds = r.get("detect_stats") or {}
+        bs = d.get("below_sigma", {})
+        gr = d.get("geom_reject", {})
+        tp_flags = ds.get("tp_flags", [])
+        admitted = ds.get("admitted", [])
+        admit_tp = sum(1 for f, a in zip(tp_flags, admitted) if f and a)
+        print(
+            f"{scene:<12}{str(r['target_object']):<12}{r.get('steps_count', 0):>6.0f}  "
+            f"{bs.get('tp', 0):>6}/{bs.get('n', 0):<9}"
+            f"{gr.get('tp', 0):>6}/{gr.get('n', 0):<9}"
+            f"{admit_tp:>6}/{ds.get('tp', 0):<9}"
+        )
+        for k in tot:
+            tot[k]["n"] += d.get(k, {}).get("n", 0)
+            tot[k]["tp"] += d.get(k, {}).get("tp", 0)
+        kept_tot["n"] += ds.get("total", 0)
+        kept_tot["tp"] += ds.get("tp", 0)
+        kept_tot["admit_tp"] += admit_tp
+    print(
+        "totals: "
+        f"below_sigma tp/n = {tot['below_sigma']['tp']}/{tot['below_sigma']['n']} | "
+        f"geom_drop tp/n = {tot['geom_reject']['tp']}/{tot['geom_reject']['n']} | "
+        f"kept (post-gate) tp/n = {kept_tot['tp']}/{kept_tot['n']}, admitted tp = {kept_tot['admit_tp']}"
+    )
+    print(
+        "read: below_sigma tp>0 -> threshold problem (true det under sigma_tar); "
+        "geom_drop tp>0 -> gate problem; kept tp>0 but admit_tp==0 -> S-penalty/admission "
+        "problem; kept tp==0 -> never detected in view (query/model miss)."
+    )
+
+
 def _print_eval_breakdown(episode_records: List[Dict[str, Any]]) -> None:
     """Print Oracle Success Rate + per-target + per-scene metric breakdowns.
 
@@ -219,6 +277,7 @@ def _print_eval_breakdown(episode_records: List[Dict[str, Any]]) -> None:
     _print_failure_cross_tab(episode_records)
     _print_oracle_subset(episode_records)
     _print_detection_metrics(episode_records)
+    _print_fn_trace(episode_records)
     print("=" * 66)
 
 
@@ -487,6 +546,7 @@ class VLVMTrainer(PPOTrainer):
 
                     from vlfm.utils.episode_stats_logger import (
                         aggregate_detect_stats,
+                        aggregate_diag_trace,
                         compute_oracle_success,
                         log_episode_stats,
                     )
@@ -519,6 +579,17 @@ class VLVMTrainer(PPOTrainer):
                     except Exception:
                         detect_stats = None
 
+                    diag_trace = None
+                    try:
+                        diag_logs = (
+                            getattr(self._agent.actor_critic, "_diag_logs", None)
+                            or []
+                        )
+                        if diag_logs:
+                            diag_trace = aggregate_diag_trace(infos[i], diag_logs)
+                    except Exception:
+                        diag_trace = None
+
                     episode_records.append(
                         {
                             "scene_id": current_episodes_info[i].scene_id,
@@ -529,6 +600,7 @@ class VLVMTrainer(PPOTrainer):
                             "oracle_success": compute_oracle_success(infos[i]),
                             "failure_cause": failure_cause,
                             "detect_stats": detect_stats,
+                            "diag_trace": diag_trace,
                             "spl": float(episode_stats.get("spl", 0.0)),
                             "soft_spl": float(episode_stats.get("soft_spl", 0.0)),
                             "steps_count": float(

@@ -31,6 +31,12 @@ class TSP3D:
     ):
         self.device = device
         self.voxel_size = voxel_size
+        # P0 determinism (V7.1): the inference head samples CBA candidates /
+        # keep-layer padding with torch.randperm (global torch RNG). Seed once per
+        # predict() with a monotonic counter so two identical runs get bit-stable
+        # detection outputs. Base comes from env TSP3D_SEED (default 0).
+        self._infer_seed_base = int(os.environ.get("TSP3D_SEED", "0"))
+        self._n_infer = 0
 
         # Initialize the core 3D language grounding model BeaUTyDETR
         self.model = BeaUTyDETR(d_model=d_model, voxel_size=voxel_size,
@@ -68,7 +74,8 @@ class TSP3D:
             sigma_sce: float = 0.3, 
             sigma_tar: float = 0.05, 
             tau: float = 0.15,
-            use_vlfm_nlp: bool = True
+            use_vlfm_nlp: bool = True,
+            conf_floor: Optional[float] = None
         ) -> List[Dict[str, Any]]:
         """
         Use the TSP3D model to perform 3D object detection and visual grounding.
@@ -80,11 +87,18 @@ class TSP3D:
             sigma_tar (float): Target confidence threshold.
             tau (float): Soft-pruning temperature coefficient.
             use_vlfm_nlp (bool): Whether to use raw natural language prompt formatting.
+            conf_floor (Optional[float]): Return-filter floor (diagnostics). When
+                set, candidates down to this confidence are returned instead of the
+                sigma_tar filter; the caller must still enforce sigma_tar for decisions.
         Returns:
             List[Dict[str, Any]]: Detected 3D bounding boxes and scores.
         """
         if len(pcd) == 0:
             return [], {}
+        # P0 determinism: fix the global torch RNG for this query's head sampling.
+        torch.manual_seed((self._infer_seed_base + self._n_infer) & 0x7FFFFFFF)
+        self._n_infer += 1
+        min_conf = conf_floor if conf_floor is not None else sigma_tar
 
         if use_vlfm_nlp:
             # Multi-class synonym merging caption
@@ -149,7 +163,7 @@ class TSP3D:
                         conf = float(scores_np[i, 0])
                     else:
                         conf = float(scores_np[i])
-                    if conf >= sigma_tar:
+                    if conf >= min_conf:
                         # box: (8, 3)
                         formatted_detections.append({
                             "box_3d": box.tolist(),
@@ -184,7 +198,8 @@ class TSP3DClient:
         sigma_sce: float = 0.3, 
         sigma_tar: float = 0.05, 
         tau: float = 0.15,
-        use_vlfm_nlp: bool = True
+        use_vlfm_nlp: bool = True,
+        conf_floor: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         # Send point cloud as compact binary (float16) + base64, replacing the
         # slow tolist()+JSON-text serialization of the raw float32 array.
@@ -196,7 +211,8 @@ class TSP3DClient:
             "sigma_sce": sigma_sce,
             "sigma_tar": sigma_tar,
             "tau": tau,
-            "use_vlfm_nlp": use_vlfm_nlp
+            "use_vlfm_nlp": use_vlfm_nlp,
+            "conf_floor": conf_floor,
         }
         response = send_request(self.url, **payload)
         return response.get("detections", []), response.get("diagnostics", {})
@@ -225,8 +241,9 @@ if __name__ == "__main__":
                 sigma_tar = payload.get("sigma_tar", 0.3)
                 tau = payload.get("tau", 0.15)
                 use_vlfm_nlp = payload.get("use_vlfm_nlp", True)
+                conf_floor = payload.get("conf_floor", None)
 
-                detections, diagnostics = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_vlfm_nlp)
+                detections, diagnostics = self.predict(pcd, text, sigma_sce, sigma_tar, tau, use_vlfm_nlp, conf_floor)
                 return {"detections": detections, "diagnostics": diagnostics}
             return {}
 

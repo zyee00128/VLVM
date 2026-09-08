@@ -16,23 +16,27 @@ from vlfm.vlm.detections import ObjectDetections
 from vlfm.obs_transformers.utils import image_resize
 from vlfm.policy.base_policy import BasePolicy
 from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
-from vlfm.utils.geometry_utils import rho_theta, extract_yaw, get_fov, closest_point_within_threshold
+from vlfm.utils.geometry_utils import rho_theta, extract_yaw, get_fov
 from vlfm.mapping.obstacle_map import ObstacleMap3D, ProbabilisticGrid
-from vlfm.tsp3d_models.utils.target_memory_manager import MemoryManagerConfig, TargetMemoryManager
-from vlfm.tsp3d_models.utils.target_geometric_gating import (
-    TargetGeometricGatingEngine,
-    FrustumAndDistanceConfig,
-    BoxOccupancyConfig,
-    BoxPointDensityConfig,
-)
-from vlfm.tsp3d_models.utils.soft_frontier_bias import SoftFrontierBiasConfig, SoftFrontierBiasEngine
+
 from vlfm.tsp3d_models.utils.pipeline import TSP3DInputPreprocessor
-from vlfm.tsp3d_models.utils.s_penalty import (SPenaltyConfig, apply_s_penalty, 
-                                            near_surface_point, query_semantic_at)
+from vlfm.tsp3d_models.utils.s_penalty import (
+    SPenaltyConfig, 
+    apply_s_penalty, 
+    query_semantic_at,
+)
 from vlfm.tsp3d_models.utils.scan_behavior import (
     _act_panoramic,
     _act_world_scan,
 )
+from vlfm.tsp3d_models.utils.target_memory_manager import MemoryManagerConfig, TargetMemoryManager
+from vlfm.tsp3d_models.utils.target_geometric_gating import (
+    TargetGeometricGatingEngine,
+    BoxOccupancyConfig,
+    BoxPointDensityConfig,
+)
+from vlfm.tsp3d_models.utils.near_field_docking import NearFieldDockingConfig, NearFieldDockingEngine
+
 
 PROMPT_SEPARATOR = "|"
 
@@ -104,6 +108,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             cam_min_view_disp: float = 0.0,
             cam_min_view_yaw: float = 0.0,
             cap_style: str = "random",
+            det_seed: int = 0,
             pointnav_stop_radius: float = 0.30,
             enable_fb: bool = True,
             fb_near_radius: float = 2.5,
@@ -116,37 +121,34 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_radius_m: float = 0.5,
             s_penalty_use_surface: bool = True,
             goal_use_surface: bool = True,
-            # V7 target-memory manager (M6/M7/M9; default OFF)
+            # target-memory manager
             merge_dist_thresh: float = 0.5,
             ema_weight_old: float = 0.8,
-            enable_mechanism_7: bool = False,
+            enable_near_field_exempt: bool = False,
             exempt_near_radius: float = 1.0,
             exempt_min_merges: int = 1,
-            enable_mechanism_6: bool = False,
+            enable_free_space_erasure: bool = False,
             free_erasure_radius: float = 0.3,
             free_erasure_min_explored: int = 5,
             free_erasure_free_ratio: float = 0.85,
             free_erasure_soft_only: bool = True,
-            enable_mechanism_9: bool = False,
-            # V7 geometric admission gate (M2/M4/M8/M3; default OFF)
-            geom_m2_near_reject: bool = False,
-            geom_m4_suspicious: bool = False,
-            geom_m8_occ_gate: bool = False,
-            geom_m3_density: bool = False,
-            geom_min_dist_reject: float = 1.0,
-            geom_max_dist_trusted: float = 4.0,
-            geom_edge_margin_px: int = 8,
-            geom_min_occupied_voxels: int = 8,
-            geom_min_occupancy_ratio: float = 0.001,
-            geom_min_points_confirm: int = 150,
-            geom_min_frames_confirm: int = 2,
-            geom_cluster_merge_dist: float = 0.5,
-            # V7 soft-frontier bias (M5; default OFF)
-            m5_enable: bool = False,
-            m5_bias_weight: float = 0.60,
-            m5_gaussian_sigma: float = 1.50,
-            m5_max_influence_radius: float = 4.50,
-            m5_normalize: bool = False,
+            # geometric admission module
+            enable_occ_consistency: bool = False,
+            occ_min_voxels: int = 8,
+            occ_min_ratio: float = 0.001,
+            enable_density_gate: bool = False,
+            density_occ_support: bool = True,
+            density_min_points: int = 150,
+            density_min_frames: int = 2,
+            density_cluster_merge_dist: float = 0.5,
+            density_min_view_span_deg: float = 0.0,
+            # near-field camera pitch-down
+            pitch: bool = False,
+            pitch_trigger_dist: float = 1.5,
+            pitch_max_down_steps: int = 1,
+            # P3 diagnostics (off = default world behaviour)
+            diag_enable: bool = False,
+            diag_conf_floor: float = 0.30,
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -186,6 +188,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._did_reset = False
         self._stop_action = torch.tensor([[0]], dtype=torch.long)
         self._turn_left_action = torch.tensor([[2]], dtype=torch.long)
+        self._look_up_action = torch.tensor([[4]], dtype=torch.long)
+        self._look_down_action = torch.tensor([[5]], dtype=torch.long)
         self._target_3d_memory: Dict[str, List[np.ndarray]] = {}
         self._target_surface_memory: Dict[str, List[np.ndarray]] = {}  # per-centroid near-surface point
         # (num_obs, last robot xy, last robot yaw, c' = S-penalty score)
@@ -223,24 +227,21 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._s_penalty_use_surface = s_penalty_use_surface
         self._goal_use_surface = goal_use_surface
 
-        # V7 target-memory lifecycle manager (native fallback + M6/M7/M9).
-        # Operates IN PLACE on the four memory dicts above so goal selection,
-        # policy_info and evaluation logging keep reading the same structures.
+        # target-memory lifecycle manager (native fallback).
         self._memory_manager = TargetMemoryManager(MemoryManagerConfig(
             enable_fallback=enable_fb,
             fb_near_radius=self._fb_near_radius,
             fb_hysteresis=self._fb_hysteresis,
             fb_suspicious_hysteresis=self._fb_suspicious_hysteresis,
             fb_suspicious_conf=self._fb_suspicious_conf,
-            enable_mechanism_7=enable_mechanism_7,
+            enable_near_field_exempt=enable_near_field_exempt,
             exempt_near_radius=exempt_near_radius,
             exempt_min_merges=exempt_min_merges,
-            enable_mechanism_6=enable_mechanism_6,
+            enable_free_space_erasure=enable_free_space_erasure,
             free_erasure_radius=free_erasure_radius,
             free_erasure_min_explored=free_erasure_min_explored,
             free_erasure_free_ratio=free_erasure_free_ratio,
             free_erasure_soft_only=free_erasure_soft_only,
-            enable_mechanism_9=enable_mechanism_9,
             merge_dist_thresh=merge_dist_thresh,
             ema_weight_old=ema_weight_old,
         ))
@@ -249,48 +250,44 @@ class TSP3DObjectNavPolicy(BasePolicy):
             self._target_verify_state, self._target_fallback_state,
         )
 
-        # V7 geometric admission gate (module 1: M2/M4/M8/M3, default OFF).
+        # geometric admission gate.
         # Runs BEFORE the S-penalty gate inside `_query_and_process`.
         self._geom_gate_engine = TargetGeometricGatingEngine(
-            frustum_cfg=FrustumAndDistanceConfig(
-                enable_near_reject=geom_m2_near_reject,
-                enable_suspicious=geom_m4_suspicious,
-                min_dist_reject=geom_min_dist_reject,
-                max_dist_trusted=geom_max_dist_trusted,
-                edge_margin_px=geom_edge_margin_px,
-                img_w=self._depth_image_shape[1],
-                img_h=self._depth_image_shape[0],
-            ),
             occ_cfg=BoxOccupancyConfig(
-                enable=geom_m8_occ_gate,
-                min_occupied_voxels=geom_min_occupied_voxels,
-                min_occupancy_ratio=geom_min_occupancy_ratio,
+                enable=enable_occ_consistency,
+                min_occupied_voxels=occ_min_voxels,
+                min_occupancy_ratio=occ_min_ratio,
             ),
             density_cfg=BoxPointDensityConfig(
-                enable=geom_m3_density,
-                min_points_confirm=geom_min_points_confirm,
-                min_frames_confirm=geom_min_frames_confirm,
-                cluster_merge_dist=geom_cluster_merge_dist,
+                enable=enable_density_gate,
+                min_points_confirm=density_min_points,
+                min_frames_confirm=density_min_frames,
+                cluster_merge_dist=density_cluster_merge_dist,
+                use_occupancy_support=density_occ_support,
+                min_view_span_deg=density_min_view_span_deg,
             ),
         )
 
-        # V7 soft-frontier bias engine (M5, default OFF).
-        # Suspicious single-observation targets are soft (explore-attraction only,
-        # never hard-locked); their Gaussian attraction is added to the exploration
-        # frontier scores in `BaseITMPolicy._sort_frontiers_by_value`.
-        self._m5_engine = SoftFrontierBiasEngine(SoftFrontierBiasConfig(
-            enable=m5_enable,
-            bias_weight=m5_bias_weight,
-            gaussian_sigma=m5_gaussian_sigma,
-            max_influence_radius=m5_max_influence_radius,
-            normalize_output=m5_normalize,
+        # near-field pitch-down engine: keeps low targets
+        # inside the near-field FOV so TSP3D can re-detect / merge while approaching.
+        self._pitch_engine = NearFieldDockingEngine(NearFieldDockingConfig(
+            pitch_enable=pitch,
+            pitch_trigger_dist=pitch_trigger_dist,
+            pitch_max_down_steps=pitch_max_down_steps,
         ))
+        self._nav_aim_xyz: Optional[np.ndarray] = None     # 3D aim (incl. z) of the chosen target
+        self._pitch_cam_down: int = 0                         # current camera pitch-down steps (module 4)
 
         # Fusion route selection: "camera" (temporal window) / "world" (incremental map) 
         # / "panoramic" (single-position 360° spatial fusion) / "none" (no fusion mechanism).
         self._fusion_style = fusion_style
         self._enable_scan = bool(enable_scan)
         self._frontier_trigger = bool(frontier_trigger)
+        self._det_seed = int(det_seed)
+        self._rng_step = 0            # monotonic numpy-RNG seed counter (never reset; P0 determinism)
+        self._diag_enable = bool(diag_enable)
+        self._diag_conf_floor = float(diag_conf_floor)
+        self._diag_logs: List[Dict[str, Any]] = []
         self._scan_min_gap = max(int(scan_min_gap), 1)
         self._scan_opportunistic_after = max(int(scan_opportunistic_after), 0)
         self._last_scan_step: int = -10**9
@@ -396,8 +393,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._target_verify_state.clear()
         self._target_fallback_state.clear()
         self._last_target_coord = None
-        self._memory_manager.reset()  # clears M9 lock (memory dicts cleared above)
-        self._geom_gate_engine.reset()  # clears M3 cluster accumulators (module 1)
+        self._geom_gate_engine.reset()
         self._scan_in_progress = False
         self._last_pending = []
         self._scan_value_views = []
@@ -409,7 +405,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._pointnav_policy.reset()
         self._obstacle_map3d.reset()
         self._preprocessor.reset()
-        self._detect_logs = []  # per-detection logs for detection-level metrics
+        self._detect_logs = []
+        self._diag_logs = []
+        self._nav_aim_xyz = None
+        self._pitch_cam_down = 0
         self._did_reset = True
 
     # ==========================================================================
@@ -443,7 +442,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
     def _query_tsp3d_client(
         self,
         aligned_pcd: np.ndarray,
-        target_query: str
+        target_query: str,
+        conf_floor: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Query TSP3D, scaling the pruning threshold when extremely close to surfaces."""
         if len(aligned_pcd) == 0:
@@ -468,6 +468,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             sigma_sce=dynamic_sigma_sce,
             tau=self._tau,
             use_vlfm_nlp=self._nlp_mode,
+            conf_floor=conf_floor,
         )
 
         return raw_preds, diagnostics
@@ -528,84 +529,47 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self,
         detections: ObjectDetections,
         pcd_world: np.ndarray,
-        tf_camera_to_episodic: np.ndarray,
-        fx: float,
-        fy: float,
-    ) -> Tuple[ObjectDetections, List[Any]]:
-        """
-        Geometric admission gate (M2/M4/M8/M3) on the current candidates.
-
-        REJECTED (M2 near-field / M8 empty-air) and (when M3 is on) unconfirmed
-        SOFT_ACCUMULATING detections are dropped before S-penalty. 
-        Returns ``(filtered, meta)`` where ``meta[i]`` is True 
-        when M4 flagged the kept detection suspicious, else None.
+        robot_xyz: Optional[np.ndarray] = None,
+        diag_out: Optional[List[Dict[str, Any]]] = None,
+    ) -> ObjectDetections:
+        """Geometric admission on the current candidates.
+        REJECTED (empty-air) and (when the density gate is on) unconfirmed
+        SOFT_ACCUMULATING detections are dropped before the S-penalty gate.
+        ``diag_out`` (optional, P3 diagnostics) collects dropped candidates as
+        {conf, conf_amp, centroid, stage='geom_reject', reason=status}.
         """
         engine = self._geom_gate_engine
         n = detections.num_detections
         if n == 0:
-            return detections, []
+            return detections
         boxes_np = detections.boxes.detach().cpu().numpy()
         logits_np = detections.logits.detach().cpu().numpy()
         keep = np.ones(n, dtype=bool)
-        meta: List[Any] = []
-        m3_on = engine.density_acc.cfg.enable
+        density_on = engine.density_acc.cfg.enable
         for i in range(n):
-            status, _cluster, diag = engine.process_detection(
+            status, _cluster, _diag = engine.process_detection(
                 target_class=detections.phrases[i],
                 box_corners=boxes_np[i],
                 current_frame_pcd=pcd_world,
                 obstacle_map_3d=self._obstacle_map3d,
-                tf_camera_to_episodic=tf_camera_to_episodic,
-                fx=fx,
-                fy=fy,
                 confidence=float(logits_np[i]),
                 step=self._num_steps,
+                robot_xyz=robot_xyz,
             )
-            drop = (status == "REJECTED") or (m3_on and status == "SOFT_ACCUMULATING")
+            drop = (status == "REJECTED") or (density_on and status == "SOFT_ACCUMULATING")
+            if drop and diag_out is not None:
+                diag_out.append({
+                    "conf": float(logits_np[i]),
+                    "conf_amp": float(logits_np[i]),
+                    "centroid": np.mean(boxes_np[i], axis=0),
+                    "stage": "geom_reject",
+                    "reason": status,
+                    "admitted": False,
+                })
             keep[i] = not drop
-            meta.append(bool(diag.get("is_suspicious", False)) if not drop else None)
-        kept_meta = [m for m, k in zip(meta, keep) if k]
         if not keep.all():
             detections.filter_by_mask(keep)
-        return detections, kept_meta
-
-    def _is_soft_record(self, cls: str, i: int) -> bool:
-        """
-        M5 soft-to-hard: a record is SOFT if it is suspicious (low-confidence /
-        geometrically suspect) AND seen in a single frame (num_obs == 1).
-
-        Such records attract exploration (Gaussian frontier bias) but are never
-        hard navigation goals. Multi-frame or trusted records are HARD.
-        """
-        ver = self._target_verify_state.get(cls)
-        fb = self._target_fallback_state.get(cls)
-        if not ver or i >= len(ver) or not fb or i >= len(fb):
-            return False
-        num_obs = int(ver[i][0])
-        susp = bool(fb[i].get("suspicious", False))
-        return susp and num_obs <= 1
-
-    def _get_soft_targets(self) -> List[Dict[str, Any]]:
-        """
-        Soft targets for the M5 frontier bias: suspicious single-frame records
-        across all memorized classes.
-        Returns [{centroid: 3D np.ndarray, confidence: float}] 
-        to feed SoftFrontierBiasEngine.apply_bias_and_rank.
-        """
-        soft: List[Dict[str, Any]] = []
-        for cls, centroids in self._target_3d_memory.items():
-            for i in range(len(centroids)):
-                if not self._is_soft_record(cls, i):
-                    continue
-                conf = 1.0
-                ver = self._target_verify_state.get(cls)
-                if ver and i < len(ver) and len(ver[i]) >= 4:
-                    conf = float(ver[i][3])
-                soft.append({
-                    "centroid": np.asarray(centroids[i], dtype=np.float64),
-                    "confidence": conf,
-                })
-        return soft
+        return detections
 
 
     def _get_target_object_location(self, position: np.ndarray) -> Union[None, np.ndarray]:
@@ -614,35 +578,20 @@ class TSP3DObjectNavPolicy(BasePolicy):
         Distance-latch keeps goal switches stable.
 
         world/camera/none: closest centroid with a distance-latch.
-        panoramic: rank candidates by their S-penalty score c'; nearest is the fallback when c' is missing.
-
-        M9: while a target is locked, its goal is returned every step (identity frozen);
-        the lock auto-clears when the record is deleted -> re-select normally.
+        panoramic: rank candidates by their S-penalty score c'; 
+                   nearest is the fallback when c' is missing.
         """
-        # M9: navigate identity freeze.
-        if self._memory_manager.config.enable_mechanism_9:
-            locked = self._memory_manager.locked_goal()
-            if locked is not None:
-                self._last_target_coord = locked.copy()
-                return self._last_target_coord
-
         target_classes = self._target_object.split("|")
         valid_centroids: List[np.ndarray] = []
         valid_goals: List[np.ndarray] = []
         valid_confs: List[Optional[float]] = []
-        valid_owners: List[Tuple[str, int]] = []   # (class, in-class index) per candidate
 
         for cls in target_classes:
             if cls in self._target_3d_memory and len(self._target_3d_memory[cls]) > 0:
                 surf_list = self._target_surface_memory.get(cls, [])
                 verify_list = self._target_verify_state.get(cls, [])
                 for i, centroid in enumerate(self._target_3d_memory[cls]):
-                    # M5 soft-to-hard: suspicious single-view records are soft
-                    # (attract exploration only), never hard navigation goals.
-                    if self._m5_engine.config.enable and self._is_soft_record(cls, i):
-                        continue
                     valid_centroids.append(np.array(centroid))
-                    valid_owners.append((cls, i))
                     if self._goal_use_surface and i < len(surf_list):
                         valid_goals.append(np.array(surf_list[i]))
                     else:
@@ -654,6 +603,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     valid_confs.append(conf)
 
         if len(valid_centroids) == 0:
+            self._nav_aim_xyz = None
             return None
 
         robot_xy = np.asarray(position)[:2]
@@ -669,6 +619,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
             chosen_idx = int(np.argmin(dists_2d))
 
         chosen_2d = valid_goals[chosen_idx][:2].copy()
+        # 3D aim (incl. z) for pitch.
+        chosen_goal3 = np.asarray(valid_goals[chosen_idx], dtype=np.float64)
+        if chosen_goal3.shape[0] < 3:
+            chosen_goal3 = np.asarray(valid_centroids[chosen_idx], dtype=np.float64)
 
         if self._last_target_coord is None:
             self._last_target_coord = chosen_2d
@@ -683,11 +637,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             else:
                 self._last_target_coord = chosen_2d
 
-        # M9: freeze the identity of the first target we commit to navigate to
-        # (a non-None goal enters the navigate branch in `act`).
-        if self._memory_manager.config.enable_mechanism_9 and not self._memory_manager.is_locked():
-            owner_cls, owner_idx = valid_owners[chosen_idx]
-            self._memory_manager.lock_target(owner_cls, owner_idx)
+        # Pitch aim (3D, incl. z) for the near-field camera look-down.
+        self._nav_aim_xyz = chosen_goal3
 
         return self._last_target_coord
 
@@ -751,7 +702,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
         Query TSP3D on a local cloud, restore boxes to world frame, 
         then run the full detection pipeline (filter -> S-penalty -> memory -> fallback).
         """
-        raw_detections, _ = self._query_tsp3d_client(pcd_local, self._target_object)
+        raw_detections, _ = self._query_tsp3d_client(
+            pcd_local, self._target_object,
+            conf_floor=self._diag_conf_floor if self._diag_enable else None,
+        )
 
         # Restore predicted boxes to global coordinates (inverse rotation + translation)
         valid_raw = [det for det in raw_detections if det.get("box_3d") is not None]
@@ -780,6 +734,22 @@ class TSP3DObjectNavPolicy(BasePolicy):
             tf_camera_to_episodic=tf_camera_to_episodic
         )
 
+        if self._diag_enable:
+            # P3 diagnostics: log raw detections below sigma_tar (the server returns
+            # candidates down to diag_conf_floor when enabled). They never enter the
+            # decision pipeline (filter_by_conf below still drops them at sigma_tar).
+            for det, box_g in zip(valid_raw, boxes_3d_global):
+                conf_i = float(det.get("confidence", 0.0))
+                if conf_i < self._sigma_tar:
+                    self._diag_logs.append({
+                        "conf": conf_i,
+                        "conf_amp": conf_i,
+                        "centroid": np.mean(np.asarray(box_g), axis=0),
+                        "stage": "below_sigma",
+                        "reason": "below_sigma_tar",
+                        "admitted": False,
+                    })
+
         detections.filter_by_conf(self._sigma_tar)
         target_classes = [c.strip() for c in self._target_object.split("|") if c.strip()]
         detections.filter_by_class(target_classes, use_vlfm_nlp=self._nlp_mode)
@@ -787,14 +757,12 @@ class TSP3DObjectNavPolicy(BasePolicy):
         if not self._done_initializing:
             return detections
 
-        # V7 geometric admission gate (module 1; mechanisms 2/8/4/3, default OFF).
-        #   REJECTED (M2 near-field / M8 empty-air)   -> dropped before S-penalty;
-        #   M3 ON & SOFT (unconfirmed density)         -> dropped (must HARD-confirm);
-        #   is_suspicious (M4 far / frustum-edge)      -> forwarded to memory write
-        #     as a suspicious_override (quicker near-field cleanup).
-        geom_meta: Optional[List[Any]] = None
+        # REJECTED (empty-air) -> dropped before S-penalty
         if self._geom_gate_engine.enabled:
-            detections, geom_meta = self._geom_gate(detections, pcd_world, tf_camera_to_episodic, fx, fy)
+            detections = self._geom_gate(
+                detections, pcd_world, robot_xyz=robot_xyz,
+                diag_out=self._diag_logs if self._diag_enable else None,
+            )
 
         # S-penalty gate cross-validation -> write passed detections to memory.
         admitted_meta: List[Any] = []
@@ -807,7 +775,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             goal_use_surface=self._goal_use_surface,
             nlp_mode=self._nlp_mode,
             out_log=self._detect_logs,
-            per_det_meta=geom_meta,
+            per_det_meta=None,
             meta_out=admitted_meta,
         )
         # Keep this query's admitted candidates (c') for the scan-end direction decision.
@@ -819,11 +787,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     robot_xyz=robot_xyz, robot_yaw=robot_yaw, max_depth=max_depth,
                     suspicious_override=bool(susp) if susp is not None else None,
                 )
-
-        # Target-memory lifecycle every step (delete confirmed-false -> explore).
-        # The manager internally runs M6 free-space erasure + the native
-        # anti-hallucination fallback (M7 exemption), each independently switched
-        # through the policy / YAML config (defaults preserve the world baseline).
+        # Target Memory Manager
         camera_pos = tf_camera_to_episodic[:3, 3]
         camera_yaw = extract_yaw(tf_camera_to_episodic)
         cone_fov = get_fov(self._fx, self._depth_image_shape[1])
@@ -879,6 +843,27 @@ class TSP3DObjectNavPolicy(BasePolicy):
         action = self._pointnav_policy.act(obs_pointnav, masks, deterministic=True)
         return action
 
+    def _nav_action(self, robot_xyz: np.ndarray) -> Optional[torch.Tensor]:
+        """Pitch: one look_down step while the near-field pitch target is not reached."""
+        eng = self._pitch_engine
+        aim = self._nav_aim_xyz
+        if not eng.config.pitch_enable or aim is None or len(aim) < 3:
+            return None
+        robot = np.asarray(robot_xyz, dtype=np.float64).reshape(-1)
+        target = int(eng.desired_pitch_at(aim, robot, camera_z=self._camera_height)[0])
+        if target <= self._pitch_cam_down:
+            return None
+        self._pitch_cam_down += 1
+        return self._look_down_action
+
+    def _restore_action(self) -> Optional[torch.Tensor]:
+        """Pitch: one look_up step to level the camera after leaving navigate."""
+        eng = self._pitch_engine
+        if not eng.config.pitch_enable or self._pitch_cam_down <= 0:
+            return None
+        self._pitch_cam_down -= 1
+        return self._look_up_action
+
     def act(
         self,
         observations: Dict,
@@ -887,6 +872,15 @@ class TSP3DObjectNavPolicy(BasePolicy):
         masks: Tensor,
         deterministic: bool = False,
     ) -> Any:
+        # P0 determinism (V7.1): reseed numpy once per env step with a monotonic
+        # counter, so every np.random consumer of this step (send-side point cap,
+        # density-cluster subsample, ...) is reproducible run-to-run. The counter
+        # is never reset across episodes; two identical runs reproduce identical
+        # seed sequences -> bit-stable detection totals. Distribution semantics
+        # of the random cap are preserved (uniform random subset per step).
+        np.random.seed((self._det_seed + self._rng_step) & 0x7FFFFFFF)
+        self._rng_step += 1
+
         self._pre_step(observations, masks)
         object_map_rgbd = self._observations_cache["object_map_rgbd"]
         detections = []
@@ -930,12 +924,24 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     mode = "initialize"
                     action = self._initialize()
                 elif goal_3d is None:
-                    mode = "explore"
-                    action = self._explore(observations)
+                    # Pitch: level the camera before resuming explore after a down-pitch.
+                    pitch_act = self._restore_action()
+                    if pitch_act is not None:
+                        mode = "pitch_restore"
+                        action = pitch_act
+                    else:
+                        mode = "explore"
+                        action = self._explore(observations)
                 else:
                     mode = "navigate"
                     print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
-                    action = self._pointnav(goal_3d[:2], stop=True)
+                    # Pitch: near-field pitch-down (look down over 1 step while approaching a low target).
+                    pitch_act = self._nav_action(robot_xyz)
+                    if pitch_act is not None:
+                        mode = "pitch_down"
+                        action = pitch_act
+                    else:
+                        action = self._pointnav(goal_3d[:2], stop=True)
 
         action_np = action.detach().cpu().numpy()[0]
         if len(action_np) == 1:
@@ -1037,7 +1043,8 @@ class VLVMConfig:
     use_vlfm_nlp: bool = False           # Use raw NLP prompt formatting; True = multi-class synonym merging, False = use only the primary class.
 
     cap_style: str = "random"           # send-side point cap (shared): "random" (baseline) / "near_first" (near-field priority)
-    distance_sample: bool = False       # distance-adaptive sampling (dense near / sparse far, shared post-processing)
+    det_seed: int = 0                   # P0 determinism (V7.1): base of the per-step numpy reseed; also set TSP3D_SEED for the model RNG. Same config -> bit-stable double-run.
+    distance_sample: bool = True        # distance-adaptive sampling (dense near / sparse far, shared post-processing)
     near_dist: float = 1.5              # distance sampling: near/mid band boundary (m)
     mid_dist: float = 3.0               # distance sampling: mid/far band boundary (m)
     near_voxel: float = 0.01            # distance sampling: near-band voxel (m)
@@ -1055,7 +1062,7 @@ class VLVMConfig:
     fuse_max_points: int = 200000           # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
     cam_radius: Optional[float] = None      # camera: send-side horizontal radius crop (m), None = no crop (baseline); align with wm_radius=6.0 -> 6.0
     cam_min_view_disp: float = 0.15         # camera: min displacement (m) to accept a frame into fusion, 0 = off; world uses wm_min_view_disp 0.15
-    cam_min_view_yaw: float = 15.0           # camera: min yaw change (deg) to accept a frame into fusion, 0 = off; world uses wm_min_view_yaw 15.0
+    cam_min_view_yaw: float = 15.0          # camera: min yaw change (deg) to accept a frame into fusion, 0 = off; world uses wm_min_view_yaw 15.0
 
     # Phase 5c: World-frame Local Map (TSP3DInputPreprocessor)
     wm_max_frames: Optional[int] = 8  # world: frame-window cap (keep voxels of the most recent N frames); None = all history
@@ -1068,8 +1075,6 @@ class VLVMConfig:
     wm_near_refresh_value: bool = False  # world: also overwrite the stored point of refreshed near-field voxels with the current observation (cam-style sliding refresh of the value layer). False = value layer stays first.
 
     # Phase 5d: Panoramic Fusion
-    # Frontier-arrival-driven 360° spatial fusion. No temporal history, mid steps send single frames; a scan runs only when the robot reaches a NEW frontier point
-    # Scan rotation is decoupled from nav: mid-scan steps emit the scan-only wide-turn env action turn_left_wide (id 6).
     panoramic_turn_steps: int = 6            # Frames (env steps) per 360° scan; rotation/step = 360/turn_steps (6 -> 60°).
     panoramic_voxel_size: float = 0.02       # Local-frame voxel for intra-scan stitching dedup.
     panoramic_radius: Optional[float] = 6.0  # Send-side horizontal radius crop (m) around the scan position.
@@ -1085,39 +1090,37 @@ class VLVMConfig:
     s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
 
-    # Phase 7b: V7 target-memory lifecycle manager (M6/M7/M9; all default OFF = world baseline)
+    # Phase 7b: target-memory lifecycle (all default OFF = world baseline)
     merge_dist_thresh: float = 0.5          # cross-view EMA merge distance threshold (m)
     ema_weight_old: float = 0.8             # cross-view EMA smoothing (old * w + new * (1 - w))
-    enable_mechanism_7: bool = False        # M7: near-field confirmation exemption (keep trusted target parked next to the robot)
-    exempt_near_radius: float = 1.0         # M7: robot-target distance below which a trusted target is exempt (m)
-    exempt_min_merges: int = 1              # M7: min num_obs of a (trusted) target to be exempt
-    enable_mechanism_6: bool = False        # M6: line-of-sight free-space erasure (single-step ghost removal)
-    free_erasure_radius: float = 0.3        # M6: box half-side (m) around the centroid to inspect
-    free_erasure_min_explored: int = 5      # M6: min explored voxels in the box to trust "this space was seen"
-    free_erasure_free_ratio: float = 0.85   # M6: free-voxel ratio above which the box is judged "pure air"
-    free_erasure_soft_only: bool = True     # M6: True = erase suspicious targets only (conservative, V7 doc warning)
-    enable_mechanism_9: bool = False        # M9: navigate identity freeze (locked target survives until deleted)
+    enable_near_field_exempt: bool = False  # keep a trusted target parked next to the robot from deletion
+    exempt_near_radius: float = 1.0         # robot-target distance below which a trusted target is exempt (m)
+    exempt_min_merges: int = 1              # min merges of a trusted target to be exempt
+    enable_free_space_erasure: bool = False # single-step ghost removal via the occupancy grid
+    free_erasure_radius: float = 0.3        # box half-side (m) around the centroid to inspect
+    free_erasure_min_explored: int = 5      # min explored voxels in the box to trust "this space was seen"
+    free_erasure_free_ratio: float = 0.85   # free-voxel ratio above which the box is judged "pure air"
+    free_erasure_soft_only: bool = True     # True = erase suspicious targets only (conservative)
 
-    # Phase 7c: V7 geometric admission gate (module 1; M2/M4/M8/M3; all default OFF = world baseline)
-    geom_m2_near_reject: bool = False       # M2: near-field hard reject (< geom_min_dist_reject)
-    geom_m4_suspicious: bool = False        # M4: far / frustum-edge detections flagged suspicious (memory override)
-    geom_m8_occ_gate: bool = False          # M8: box must have occupied-voxel support in the 3D grid
-    geom_m3_density: bool = False           # M3: box-internal point accumulation must HARD-confirm (>=points & >=frames)
-    geom_min_dist_reject: float = 1.0       # M2: near-field reject radius (m)
-    geom_max_dist_trusted: float = 4.0      # M4: beyond this distance (m) a detection is suspicious
-    geom_edge_margin_px: int = 8            # M4: 2D-projection edge-touch margin (px)
-    geom_min_occupied_voxels: int = 8       # M8: min occupied voxels supporting the box
-    geom_min_occupancy_ratio: float = 0.001  # M8: min occupied/(box volume) ratio
-    geom_min_points_confirm: int = 150      # M3: min accumulated in-box points to confirm
-    geom_min_frames_confirm: int = 2        # M3: min observation frames to confirm
-    geom_cluster_merge_dist: float = 0.5    # M3: cross-frame cluster association radius (m)
+    # Phase 7c: geometric admission module (occ-consistency + density gates; default OFF)
+    enable_occ_consistency: bool = False    # box must have occupied-voxel support in the 3D grid
+    occ_min_voxels: int = 8                 # occ gate: min occupied voxels supporting the box
+    occ_min_ratio: float = 0.001            # occ gate: min occupied/(box volume) ratio
+    enable_density_gate: bool = False       # density x occupancy fusion gate (occ support OR density HARD-confirm)
+    density_occ_support: bool = True        # density gate: occupancy support as parallel spatio-temporal evidence
+    density_min_points: int = 150           # density gate: min accumulated in-box points to confirm
+    density_min_frames: int = 2             # density gate: min observation frames to confirm
+    density_cluster_merge_dist: float = 0.5 # density gate: cross-frame cluster association radius (m)
+    density_min_view_span_deg: float = 0.0  # density path: required multi-view azimuth span (deg, 0=off)
 
-    # Phase 7d: V7 soft-frontier bias (module 3; M5; default OFF = world baseline)
-    m5_enable: bool = False                 # Soft->Hard switch: suspicious single-frame records attract exploration (Gaussian frontier bias) but never hard-lock navigation.
-    m5_bias_weight: float = 0.60            # Gaussian attraction strength relative to the base frontier value (S + lambda*H1).
-    m5_gaussian_sigma: float = 1.50         # Gaussian sigma (m); two_sigma_sq = 2*sigma^2 = 4.5 -> attraction decays to exp(-0.5)~0.61 at 1.5 m.
-    m5_max_influence_radius: float = 4.50   # Truncation radius (m); 4.5 = 3*sigma (exp(-4.5)~0.011, decayed).
-    m5_normalize: bool = False              # Min-max normalize the biased scores (keeps the base value scale otherwise).
+    # Phase 7e: V7 near-field camera pitch-down (module 4; default OFF = world baseline)
+    pitch: bool = False                  # Near-field camera pitch-down when approaching a low target.
+    pitch_trigger_dist: float = 1.5      # Pitch: only look down within this 2D distance (m) to the aim point.
+    pitch_max_down_steps: int = 1        # Pitch: max look_down steps (tilt 30 deg each).
+
+    # Phase 7f: P3 recall-side diagnostics (off = default world behaviour; never changes decisions)
+    diag_enable: bool = False            # record below-sigma_tar + geom-gate-dropped detections for fn (bed) cause analysis
+    diag_conf_floor: float = 0.30        # server return floor (diagnostics only); client still filters at sigma_tar
 
     @classmethod  # type: ignore
     @property

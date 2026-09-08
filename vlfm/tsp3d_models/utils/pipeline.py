@@ -7,8 +7,10 @@ from .panoramic import PanoramicFusion, _to_camera_canonical
 from .sampling import cap_point_count, distance_adaptive_sample
 
 class TSP3DInputPreprocessor:
-    """End-to-end input adaptation: fusion (camera window or world map) -> 
-    unified send-side post-processing (distance sampling / point cap)."""
+    """
+    End-to-end input adaptation: fusion (camera window or world map) -> 
+    unified send-side post-processing (distance sampling / point cap).
+    """
 
     def __init__(
         self,

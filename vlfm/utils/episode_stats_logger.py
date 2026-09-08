@@ -222,3 +222,39 @@ def aggregate_detect_stats(
         "tp_flags": tp_flags,
         "admitted": [bool(d.get("admitted", False)) for d in detect_logs],
     }
+
+
+def aggregate_diag_trace(
+    infos: Dict[str, Any], diag_logs: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Label P3 diagnostic traces (below-sigma_tar / geom-gate-dropped detections)
+    against the GT target bbox, per stage.
+
+    ``diag_logs`` entries: {conf, conf_amp, centroid, stage, admitted} where stage
+    is ``below_sigma`` or ``geom_reject`` (populated only when diag_enable=True in
+    the policy). Returns per-stage {n, tp, conf[]} so fn (bed) episodes can be
+    attributed to a threshold miss vs a gate drop.
+    """
+    out = {
+        "below_sigma": {"n": 0, "tp": 0, "conf": []},
+        "geom_reject": {"n": 0, "tp": 0, "conf": []},
+    }
+    if not diag_logs:
+        return out
+    try:
+        dilated_mask = cv2.dilate(
+            infos["top_down_map"]["target_bboxes_mask"], np.ones((10, 10))
+        )
+    except Exception:
+        dilated_mask = None
+    for det in diag_logs:
+        stage = det.get("stage")
+        if stage not in out:
+            continue
+        out[stage]["n"] += 1
+        out[stage]["conf"].append(float(det.get("conf", 0.0)))
+        if dilated_mask is not None and _point_in_target_bbox(
+            infos, det["centroid"][:2], dilated_mask
+        ):
+            out[stage]["tp"] += 1
+    return out

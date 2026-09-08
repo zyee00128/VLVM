@@ -243,20 +243,7 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         if len(frontiers) == 0:
             return np.empty((0, 2)), []
         values = self._score_frontiers(frontiers)
-        
-        # V7 M5 soft-frontier bias: add Gaussian attraction of SOFT targets
-        # (suspicious single-frame records) to the exploration scores and re-rank.
-        m5 = getattr(self, "_m5_engine", None)
-        if m5 is not None and m5.config.enable:
-            soft_targets = self._get_soft_targets()
-            if soft_targets:
-                sorted_frontiers, sorted_scores, _diag = m5.apply_bias_and_rank(
-                    np.asarray(frontiers),
-                    np.asarray(values, dtype=np.float64),
-                    soft_targets,
-                )
-                return sorted_frontiers[:, :2], sorted_scores.tolist()
-            
+
         sorted_inds = np.argsort([-v for v in values])
         sorted_values = [values[i] for i in sorted_inds]
         sorted_frontiers = np.array([frontiers[i] for i in sorted_inds])

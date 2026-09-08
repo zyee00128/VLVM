@@ -194,7 +194,7 @@ class WorldLocalMap:
         self,
         robot_xyz: np.ndarray,
         robot_yaw: float,
-        z_offset: float = 0.0,  # 当前发送点云的 z 基准与 TSP3D 训练分布一致，平移破坏对齐
+        z_offset: float = 0.0,  # world z sent to TSP3D must match its training distribution
     ) -> np.ndarray:
         if self._keys.shape[0] == 0:
             return np.empty((0, 6), dtype=np.float32)
