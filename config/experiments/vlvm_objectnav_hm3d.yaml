@@ -114,17 +114,8 @@ habitat_baselines:
       near_field_sigma_scale: 0.8
       # TSP3D Input Processing
       use_vlfm_nlp: False
-      fusion_style: world # Fusion route: "camera" / "world" / "panoramic" / "none" (no fusion, single frame straight to TSP3D)
-      enable_scan: False
-      frontier_trigger: True
-      scan_min_gap: 90 
-      scan_opportunistic_after: 60
-      pcd_window_size: 8
-      fuse_voxel_size: 0.02
+      fusion_style: world # world-frame incremental fusion (the final route)
       fuse_max_points: 200000
-      cam_radius: null
-      cam_min_view_disp: 0.15
-      cam_min_view_yaw: 15.0
       wm_max_frames: 8
       wm_voxel_size: 0.02
       wm_max_voxels: 400000
@@ -133,20 +124,17 @@ habitat_baselines:
       wm_min_view_yaw: 15.0
       wm_near_refresh_radius: 3.0
       wm_near_refresh_value: True
-      panoramic_turn_steps: 6
-      panoramic_voxel_size: 0.02
-      panoramic_max_points: 200000
-      panoramic_radius: 6.0
-      panoramic_min_move: 2.0
-      panoramic_arrive_dist: 1.0
       cap_style: random # point cap - "random" (baseline) / "near_first"
-      det_seed: 0 # P0 determinism: per-step numpy reseed base (same config -> bit-stable double-run)
+      det_seed: 0 # per-step numpy reseed base (same config -> bit-stable double-run)
       distance_sample: True
       near_dist: 1.5
       mid_dist: 3.0
       near_voxel: 0.01
       mid_voxel: 0.02
       far_voxel: 0.05
+
+      merge_dist_thresh: 0.5
+      ema_weight_old: 0.8
       # S-penalty
       enable_s_penalty: True
       s_penalty_thresh: 0.15
@@ -155,35 +143,30 @@ habitat_baselines:
       # near-surface point
       s_penalty_use_surface: True
       goal_use_surface: True
-
-      # target-memory manager
-      merge_dist_thresh: 0.5
-      ema_weight_old: 0.8
-      enable_near_field_exempt: False
-      exempt_near_radius: 1.0
-      exempt_min_merges: 1
-      enable_free_space_erasure: False
-      free_erasure_radius: 0.3
-      free_erasure_min_explored: 5
-      free_erasure_free_ratio: 0.85
-      free_erasure_soft_only: True
       # geometric admission module (occ-consistency + density gates)
-      enable_occ_consistency: False
+      enable_occ_consistency: True
       occ_min_voxels: 8
       occ_min_ratio: 0.001
-      enable_density_gate: False
+      enable_density_gate: True
       density_occ_support: True
       density_min_points: 150
       density_min_frames: 2
       density_cluster_merge_dist: 0.5
-      density_min_view_span_deg: 0.0
-      # near-field camera pitch-down
-      pitch: False
-      pitch_trigger_dist: 1.5
-      pitch_max_down_steps: 1
-      # P3 recall-side diagnostics (off = world baseline; never changes decisions)
-      diag_enable: False
-      diag_conf_floor: 0.30
+      density_min_view_span_deg: 20.0
+
+
+      # new GD auxiliary mechanism: independent proposer + vote (final: ON, every_n=5)
+      gdp_enable: True
+      gdp_port: 12181
+      gdp_caption_style: vocab
+      gdp_box_thr: 0.4
+      gdp_max_boxes: 2
+      gdp_weak_guard: True
+      gdp_merge_dist: 0.5
+      gdp_merge_iau: 0.3
+      gdp_every_n: 5
+      lock_min_obs: 2
+
 
     ppo:
       clip_param: 0.2

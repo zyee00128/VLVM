@@ -3,10 +3,20 @@ import numpy as np
 import torch
 from typing import List, Optional, Union, Dict, Any
 
+try:
+    from torchvision.ops import box_convert
+except ImportError:  # e.g. client-only usage without torchvision.ops
+    box_convert = None
+
 class ObjectDetections:
     """
     Provides a consistent format for object detections generated 
     by both object detection and grounding models.
+
+    Supports two flavours:
+      - 3D boxes: shape (N, 8, 3) corners (TSP3D path; original behaviour).
+      - 2D boxes: shape (N, 4) in `fmt` (default "cxcywh"); converted to xyxy
+        on construction (Grounding-DINO path: normalized cxcywh -> xyxy).
     """
 
     def __init__(
@@ -19,19 +29,22 @@ class ObjectDetections:
         fx: Optional[float] = None,
         fy: Optional[float] = None,
         tf_camera_to_episodic: Optional[np.ndarray] = None,
+        fmt: str = "cxcywh",
     ) -> None:
         """
         Args:
-            boxes: 3D bounding boxes.
-                      - If list or ndarray, shape should be (N, 8, 3) corners.
-                      - Can also be a torch.Tensor.
-            logits: Confidence score of each 3D box, shape (N,).
+            boxes: Bounding boxes.
+                      - 3D: list/ndarray/Tensor of shape (N, 8, 3) corners.
+                      - 2D: Tensor/ndarray of shape (N, 4) in `fmt`; converted
+                        to xyxy (Grounding-DINO returns normalized cxcywh).
+            logits: Confidence score of each detection, shape (N,).
             phrases: Text label or query associated with each box.
             pcd_source: Optional 3D point cloud source, shape (M, 6).
             image_source: Optional 2D source image.
             fx: Camera intrinsic focal length along the x-axis.
             fy: Camera intrinsic focal length along the y-axis.
             tf_camera_to_episodic: Camera to episodic coordinates transformation matrix.
+            fmt: 2D box input format ("cxcywh" / "xywh" / "xyxy"); ignored for 3D.
         """
         self.phrases = list(phrases)
         self.pcd_source = pcd_source
@@ -56,6 +69,16 @@ class ObjectDetections:
         else:
             raise TypeError("Unsupported type for boxes. Expected list, ndarray or Tensor.")
 
+        # 2D (image) support: shape (N, 4) in `fmt` -> xyxy.
+        # Lets Grounding-DINO detections (normalized cxcywh) share this container.
+        self._is_2d = self.boxes.dim() == 2 and self.boxes.shape[-1] == 4
+        if self._is_2d and self.boxes.shape[0] > 0 and fmt != "xyxy":
+            if box_convert is None:
+                raise ImportError(
+                    "torchvision.ops.box_convert is required for non-xyxy 2D boxes."
+                )
+            self.boxes = box_convert(boxes=self.boxes, in_fmt=fmt, out_fmt="xyxy")
+
         # Normalize confidence scores to (N,) torch.Tensor
         if isinstance(logits, list):
             self.logits = torch.tensor(logits, dtype=torch.float32)
@@ -75,10 +98,16 @@ class ObjectDetections:
     @property
     def annotated_frame(self) -> Optional[np.ndarray]:
         """
-        If camera parameters and the original image are provided, dynamically
-        compute the 3D projection and return the image annotated with 3D wireframe boxes.
+        2D detections: draw rectangles on the source image.
+        3D detections: perspective-project the 12 edges of each 3D box.
         """
         if self._annotated_frame is not None:
+            return self._annotated_frame
+
+        if self._is_2d:
+            if self.image_source is None or len(self.boxes) == 0:
+                return self.image_source
+            self._annotated_frame = self._render_2d_boxes()
             return self._annotated_frame
 
         if (
@@ -89,9 +118,36 @@ class ObjectDetections:
             or len(self.boxes) == 0
         ):
             return self.image_source
-
         self._annotated_frame = self._render_3d_wireframes()
         return self._annotated_frame
+
+    def _render_2d_boxes(self) -> np.ndarray:
+        """
+        Draw 2D xyxy boxes (normalized coords auto de-normalized) on the image.
+        """
+        img = self.image_source
+        if torch.is_tensor(img):
+            img = img.detach().cpu().numpy()
+        img = img.copy()
+        H, W = img.shape[:2]
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        for box, score, phrase in zip(self.boxes, self.logits, self.phrases):
+            b = box.detach().cpu().numpy().astype(float)
+            if b.max() <= 1.0:  # normalized -> pixels
+                b = b * np.array([W, H, W, H])
+            x1, y1, x2, y2 = [int(round(v)) for v in b]
+            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 255, 0), thickness=2)
+            label = f"{phrase}: {int(float(score) * 100)}%"
+            cv2.putText(
+                img_bgr, label, (x1, max(0, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), thickness=2, lineType=cv2.LINE_AA
+            )
+            cv2.putText(
+                img_bgr, label, (x1, max(0, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), thickness=1, lineType=cv2.LINE_AA
+            )
+        return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
     def _render_3d_wireframes(self) -> np.ndarray:
         """
@@ -167,8 +223,12 @@ class ObjectDetections:
         Automatically compute and return the spatial centroids of all 3D bounding boxes.
 
         Returns:
-            torch.Tensor: Spatial physical centroids of shape (N, 3).
+            torch.Tensor: Spatial physical centroids of shape (N, 3). 
+            Empty for 2D detections (image-space boxes have no 3D centroid).
         """
+        if self._is_2d:
+            return torch.empty((0, 3), dtype=torch.float32)
+        
         if len(self.boxes) == 0:
             return torch.empty((0, 3), dtype=torch.float32)
         # Average the 8 vertices of each (N, 8, 3) box to get the (N, 3) centroid
@@ -181,6 +241,13 @@ class ObjectDetections:
 
     def __repr__(self) -> str:
         """Print each detection's class, score, and box"""
+        if self._is_2d:
+            dets = [
+                f"[{phrase}] Conf: {logit:.2f} | Box: [{b[0]:.3f}, {b[1]:.3f}, {b[2]:.3f}, {b[3]:.3f}]"
+                for phrase, logit, b in zip(self.phrases, self.logits, self.boxes)
+            ]
+            return "No detections" if len(dets) == 0 else "\n".join(dets)
+        
         centroids = self.centroids
         dets = [
             f"[{phrase}] Conf: {logit:.2f} | Centroid: [{c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f}]"
@@ -188,7 +255,9 @@ class ObjectDetections:
         ]
         if len(dets) == 0:
             return "No detections"
+        
         return "\n".join(dets)
+
 
     def filter_by_conf(self, conf_thresh: float, use_vlfm_nlp: bool = True) -> "ObjectDetections":
         """
@@ -274,6 +343,7 @@ class ObjectDetections:
         self.phrases = [p for i, p in enumerate(self.phrases) if keep[i].item()]
         self._annotated_frame = None
 
+
     def to_json(self) -> dict:
         """
         Converts the object detections to a JSON serializable format.
@@ -302,10 +372,15 @@ class ObjectDetections:
             image_source (Optional[np.ndarray], optional): Optionally provide the
                 original image source. Defaults to None.
         """
+        boxes = torch.tensor(json_dict["boxes"], dtype=torch.float32)
+        # 2D boxes were already converted to xyxy before serialization; 
+        # pass fmt="xyxy" to avoid a second conversion. 3D boxes ignore fmt.
+        is_2d = boxes.dim() == 2 and boxes.shape[-1] == 4
         return cls(
-            boxes=torch.tensor(json_dict["boxes"], dtype=torch.float32),
+            boxes=boxes,
             logits=torch.tensor(json_dict["logits"], dtype=torch.float32),
             phrases=json_dict["phrases"],
             pcd_source=pcd_source,
             image_source=image_source,
+            fmt="xyxy" if is_2d else "cxcywh",
         )

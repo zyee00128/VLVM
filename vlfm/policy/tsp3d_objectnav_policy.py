@@ -25,17 +25,24 @@ from vlfm.tsp3d_models.utils.s_penalty import (
     apply_s_penalty, 
     query_semantic_at,
 )
-from vlfm.tsp3d_models.utils.scan_behavior import (
-    _act_panoramic,
-    _act_world_scan,
-)
 from vlfm.tsp3d_models.utils.target_memory_manager import MemoryManagerConfig, TargetMemoryManager
 from vlfm.tsp3d_models.utils.target_geometric_gating import (
     TargetGeometricGatingEngine,
     BoxOccupancyConfig,
     BoxPointDensityConfig,
 )
-from vlfm.tsp3d_models.utils.near_field_docking import NearFieldDockingConfig, NearFieldDockingEngine
+from vlfm.tsp3d_models.grounding_dino import (
+    BOTH,
+    GD,
+    CameraView,
+    GdProposalConfig,
+    GdProposer,
+    Tsp3dCandidate,
+    admit_as_suspicious,
+    attach_votes,
+    is_lockable,
+    should_run,
+)
 
 
 PROMPT_SEPARATOR = "|"
@@ -76,11 +83,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             near_field_dist: float = 1.0,
             near_field_sigma_scale: float = 0.8,
             use_vlfm_nlp: bool = False,
-            fusion_style: str = "world",  # "camera" / "world" / "panoramic"
-            enable_scan: bool = False,
-            frontier_trigger: bool = True,
-            scan_min_gap: int = 90,
-            scan_opportunistic_after: int = 60,
+            fusion_style: str = "world",  # world-frame incremental fusion (final route)
             wm_voxel_size: float = 0.02,
             wm_radius: float = 6.0,
             wm_min_view_disp: float = 0.15,
@@ -89,24 +92,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
             wm_max_frames: Optional[int] = 8, 
             wm_near_refresh_radius: Optional[float] = None,
             wm_near_refresh_value: bool = True,
-            panoramic_turn_steps: int = 6,
-            panoramic_voxel_size: float = 0.02,
-            panoramic_radius: Optional[float] = 6.0,
-            panoramic_max_points: int = 200000,
-            panoramic_min_move: float = 2.0,
-            panoramic_arrive_dist: float = 1.0,
             distance_sample: bool = True,
             near_dist: float = 1.5,
             mid_dist: float = 3.0,
             near_voxel: float = 0.01,
             mid_voxel: float = 0.02,
             far_voxel: float = 0.05,
-            pcd_window_size: int = 8,
-            fuse_voxel_size: float = 0.02,
             fuse_max_points: int = 200000,
-            cam_radius: Optional[float] = None,
-            cam_min_view_disp: float = 0.0,
-            cam_min_view_yaw: float = 0.0,
             cap_style: str = "random",
             det_seed: int = 0,
             pointnav_stop_radius: float = 0.30,
@@ -121,34 +113,35 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_radius_m: float = 0.5,
             s_penalty_use_surface: bool = True,
             goal_use_surface: bool = True,
-            # target-memory manager
-            merge_dist_thresh: float = 0.5,
-            ema_weight_old: float = 0.8,
-            enable_near_field_exempt: bool = False,
-            exempt_near_radius: float = 1.0,
-            exempt_min_merges: int = 1,
-            enable_free_space_erasure: bool = False,
-            free_erasure_radius: float = 0.3,
-            free_erasure_min_explored: int = 5,
-            free_erasure_free_ratio: float = 0.85,
-            free_erasure_soft_only: bool = True,
             # geometric admission module
-            enable_occ_consistency: bool = False,
+            enable_occ_consistency: bool = True,
             occ_min_voxels: int = 8,
             occ_min_ratio: float = 0.001,
-            enable_density_gate: bool = False,
+            enable_density_gate: bool = True,
             density_occ_support: bool = True,
             density_min_points: int = 150,
             density_min_frames: int = 2,
             density_cluster_merge_dist: float = 0.5,
-            density_min_view_span_deg: float = 0.0,
-            # near-field camera pitch-down
-            pitch: bool = False,
-            pitch_trigger_dist: float = 1.5,
-            pitch_max_down_steps: int = 1,
-            # P3 diagnostics (off = default world behaviour)
-            diag_enable: bool = False,
-            diag_conf_floor: float = 0.30,
+            density_min_view_span_deg: float = 20.0,
+
+            # target-memory manager
+            merge_dist_thresh: float = 0.5,
+            ema_weight_old: float = 0.8,
+            # GD single-vote lock criterion: a `gd` entry needs this many observations
+            # (with `weak_guard` on) before it may trigger explore -> navigate.
+            lock_min_obs: int = 2,
+
+            # new GD auxiliary mechanism (§3.6): independent proposer + frame-level vote
+            gdp_enable: bool = True,
+            gdp_every_n: int = 5,
+            gdp_box_thr: float = 0.4,
+            gdp_caption_style: str = "vocab",
+            gdp_max_boxes: int = 2,
+            gdp_weak_guard: bool = True,
+            gdp_merge_dist: float = 0.5,
+            gdp_merge_iau: float = 0.3,
+            gdp_port: int = 12181,
+
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -197,142 +190,86 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._target_fallback_state: Dict[str, List[Dict[str, Any]]] = {}
         self._last_target_coord: Union[None, np.ndarray] = None
 
-        self._scan_turn_action = torch.tensor([[6]], dtype=torch.long)
-        self._panoramic_min_move = float(panoramic_min_move)
-        self._panoramic_arrive_dist = float(panoramic_arrive_dist)
-        self._panoramic_turn_steps = max(int(panoramic_turn_steps), 1)
-        self._panoramic_scan_angle_deg = 360.0 / self._panoramic_turn_steps
-        _expected_turns = max(1, int(round(self._panoramic_scan_angle_deg / 30.0)))
-        _env_turns = max(int(os.environ.get("TURN_LEFT_WIDE_TURNS", str(_expected_turns))), 1)
-        _total_deg = self._panoramic_turn_steps * _env_turns * 30.0
-        if _env_turns != _expected_turns or abs(_total_deg - 360.0) > 1e-6:
-            print(
-                f"[Panoramic] WARNING: panoramic_turn_steps={self._panoramic_turn_steps} "
-                f"rotates {_total_deg:.0f}° in total (env TURN_LEFT_WIDE_TURNS={_env_turns} "
-                f"= {_env_turns * 30}°/step; expected {_expected_turns} turns at "
-                f"{self._panoramic_scan_angle_deg:.1f}°/step); coverage is not a full 360°."
-            )
-        
-        self._enable_fb = enable_fb
-        self._fb_near_radius = max_depth * 0.5 # fb_near_radius
-        self._fb_hysteresis = fb_hysteresis
-        self._fb_suspicious_hysteresis = fb_suspicious_hysteresis
-        self._fb_suspicious_conf = fb_suspicious_conf
-        self._s_penalty_cfg = SPenaltyConfig(
-            enable=enable_s_penalty,
-            thresh=s_penalty_thresh,
-            floor=s_penalty_floor,
-            radius_m=s_penalty_radius_m,
+        # Mechanism initialisation
+        self._init_spatial_representations(
+            om_style=om_style,
+            voxel_size=voxel_size,
+            min_obstacle_height=min_obstacle_height,
+            max_obstacle_height=max_obstacle_height,
+            agent_radius=agent_radius,
+            nav_slice_height=nav_slice_height,
+            agent_height=agent_height,
+            hole_area_thresh=hole_area_thresh,
+            obstacle_map_area_threshold=obstacle_map_area_threshold,
+            log_odds_occ=log_odds_occ,
+            log_odds_free=log_odds_free,
+            occ_threshold=occ_threshold,
+            free_threshold=free_threshold,
         )
-        self._s_penalty_use_surface = s_penalty_use_surface
-        self._goal_use_surface = goal_use_surface
-
-        # target-memory lifecycle manager (native fallback).
-        self._memory_manager = TargetMemoryManager(MemoryManagerConfig(
-            enable_fallback=enable_fb,
-            fb_near_radius=self._fb_near_radius,
-            fb_hysteresis=self._fb_hysteresis,
-            fb_suspicious_hysteresis=self._fb_suspicious_hysteresis,
-            fb_suspicious_conf=self._fb_suspicious_conf,
-            enable_near_field_exempt=enable_near_field_exempt,
-            exempt_near_radius=exempt_near_radius,
-            exempt_min_merges=exempt_min_merges,
-            enable_free_space_erasure=enable_free_space_erasure,
-            free_erasure_radius=free_erasure_radius,
-            free_erasure_min_explored=free_erasure_min_explored,
-            free_erasure_free_ratio=free_erasure_free_ratio,
-            free_erasure_soft_only=free_erasure_soft_only,
+        # NOTE: must run BEFORE `_init_memory_manager` (which reads `self._enable_fb` / `self._fb_*`).
+        self._init_fallback(
+            enable_fb=enable_fb,
+            fb_hysteresis=fb_hysteresis,
+            fb_suspicious_hysteresis=fb_suspicious_hysteresis,
+            fb_suspicious_conf=fb_suspicious_conf,
+            max_depth=max_depth,
+        )
+        self._init_memory_manager(
             merge_dist_thresh=merge_dist_thresh,
             ema_weight_old=ema_weight_old,
-        ))
-        self._memory_manager.bind(
-            self._target_3d_memory, self._target_surface_memory,
-            self._target_verify_state, self._target_fallback_state,
         )
-
-        # geometric admission gate.
-        # Runs BEFORE the S-penalty gate inside `_query_and_process`.
-        self._geom_gate_engine = TargetGeometricGatingEngine(
-            occ_cfg=BoxOccupancyConfig(
-                enable=enable_occ_consistency,
-                min_occupied_voxels=occ_min_voxels,
-                min_occupancy_ratio=occ_min_ratio,
-            ),
-            density_cfg=BoxPointDensityConfig(
-                enable=enable_density_gate,
-                min_points_confirm=density_min_points,
-                min_frames_confirm=density_min_frames,
-                cluster_merge_dist=density_cluster_merge_dist,
-                use_occupancy_support=density_occ_support,
-                min_view_span_deg=density_min_view_span_deg,
-            ),
-        )
-
-        # near-field pitch-down engine: keeps low targets
-        # inside the near-field FOV so TSP3D can re-detect / merge while approaching.
-        self._pitch_engine = NearFieldDockingEngine(NearFieldDockingConfig(
-            pitch_enable=pitch,
-            pitch_trigger_dist=pitch_trigger_dist,
-            pitch_max_down_steps=pitch_max_down_steps,
-        ))
-        self._nav_aim_xyz: Optional[np.ndarray] = None     # 3D aim (incl. z) of the chosen target
-        self._pitch_cam_down: int = 0                         # current camera pitch-down steps (module 4)
-
-        # Fusion route selection: "camera" (temporal window) / "world" (incremental map) 
-        # / "panoramic" (single-position 360° spatial fusion) / "none" (no fusion mechanism).
-        self._fusion_style = fusion_style
-        self._enable_scan = bool(enable_scan)
-        self._frontier_trigger = bool(frontier_trigger)
-        self._det_seed = int(det_seed)
-        self._rng_step = 0            # monotonic numpy-RNG seed counter (never reset; P0 determinism)
-        self._diag_enable = bool(diag_enable)
-        self._diag_conf_floor = float(diag_conf_floor)
-        self._diag_logs: List[Dict[str, Any]] = []
-        self._scan_min_gap = max(int(scan_min_gap), 1)
-        self._scan_opportunistic_after = max(int(scan_opportunistic_after), 0)
-        self._last_scan_step: int = -10**9
-        self._last_lock_step: int = 0
-        # Scan state machine: True while an in-place panoramic scan is running
-        self._scan_in_progress = False
-        # S-penalty (c') candidates of the most recent TSP3D query; 
-        # the scan-end direction decision ranks them by c'.
-        self._last_pending: list = []
-        self._scan_value_views: list = []
-        self._scan_pos: Optional[np.ndarray] = None     # last scan / init pose (min-move novelty guard)
-        self._scan_remaining: int = 0                   # remaining in-place turn frames of a scan
-        self._scan_pcd_frames: list = []                # world-frame pcd slices of the in-progress scan
-        self._scan_voxel_size = float(panoramic_voxel_size)
-        self._scan_radius = float(panoramic_radius) if panoramic_radius is not None else None
-        self._scan_max_points = int(panoramic_max_points)
-        self._preprocessor = TSP3DInputPreprocessor(
+        self._init_fusion(
             fusion_style=fusion_style,
-            window_size=pcd_window_size,
-            fuse_voxel_size=fuse_voxel_size,
-            map_voxel_size=wm_voxel_size,
-            map_radius=wm_radius,
-            min_view_disp=wm_min_view_disp,
-            min_view_yaw=np.deg2rad(wm_min_view_yaw),
-            max_map_voxels=wm_max_voxels,
-            map_max_frames=wm_max_frames,
-            map_near_refresh_radius=wm_near_refresh_radius,
-            map_near_refresh_value=wm_near_refresh_value,
-            max_points=fuse_max_points,
-            cam_radius=cam_radius,
-            cam_min_view_disp=cam_min_view_disp,
-            cam_min_view_yaw=np.deg2rad(cam_min_view_yaw),
+            wm_voxel_size=wm_voxel_size,
+            wm_radius=wm_radius,
+            wm_min_view_disp=wm_min_view_disp,
+            wm_min_view_yaw=wm_min_view_yaw,
+            wm_max_voxels=wm_max_voxels,
+            wm_max_frames=wm_max_frames,
+            wm_near_refresh_radius=wm_near_refresh_radius,
+            wm_near_refresh_value=wm_near_refresh_value,
             cap_style=cap_style,
-            use_distance_sampling=distance_sample,
+            distance_sample=distance_sample,
             near_dist=near_dist,
             mid_dist=mid_dist,
             near_voxel=near_voxel,
             mid_voxel=mid_voxel,
             far_voxel=far_voxel,
-            panoramic_turn_steps=panoramic_turn_steps,
-            panoramic_voxel_size=panoramic_voxel_size,
-            panoramic_radius=panoramic_radius,
-            panoramic_max_points=panoramic_max_points,
-            panoramic_min_move=panoramic_min_move,
         )
+        self._init_s_penalty(
+            enable_s_penalty=enable_s_penalty,
+            s_penalty_thresh=s_penalty_thresh,
+            s_penalty_floor=s_penalty_floor,
+            s_penalty_radius_m=s_penalty_radius_m,
+            s_penalty_use_surface=s_penalty_use_surface,
+            goal_use_surface=goal_use_surface,
+        )
+        self._init_geom_gate(
+            enable_occ_consistency=enable_occ_consistency,
+            occ_min_voxels=occ_min_voxels,
+            occ_min_ratio=occ_min_ratio,
+            enable_density_gate=enable_density_gate,
+            density_occ_support=density_occ_support,
+            density_min_points=density_min_points,
+            density_min_frames=density_min_frames,
+            density_cluster_merge_dist=density_cluster_merge_dist,
+            density_min_view_span_deg=density_min_view_span_deg,
+        )
+        self._init_gd_proposer(
+            gdp_enable=gdp_enable,
+            gdp_every_n=gdp_every_n,
+            gdp_box_thr=gdp_box_thr,
+            gdp_caption_style=gdp_caption_style,
+            gdp_max_boxes=gdp_max_boxes,
+            gdp_weak_guard=gdp_weak_guard,
+            gdp_merge_dist=gdp_merge_dist,
+            gdp_merge_iau=gdp_merge_iau,
+            gdp_port=gdp_port,
+        )
+
+        # GD single-vote lock criterion (`weak_guard`): a `gd` entry needs this many
+        # observations before it may trigger explore -> navigate.
+        self._lock_min_obs = max(int(lock_min_obs), 1)
 
         # 3D visual grounding and vision-language evaluation clients
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
@@ -340,7 +277,70 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._pointnav_policy = WrappedPointNavResNetPolicy(pointnav_policy_path)
         self._text_prompt = text_prompt
 
-        # Core 3D spatial representations
+        self._det_seed = int(det_seed)
+        self._rng_step = 0            # monotonic numpy-RNG seed counter (never reset)
+        self._nav_pick_key: Optional[tuple] = None   # last logged navigation pick (A4 measurement #1)
+        self._deletion_log: List[Dict[str, Any]] = []  # per-episode deletions (A2 measurement #3)
+    def _reset(self) -> None:
+        """Reset memories, step counters, pointnav model, and 3D occupancy map."""
+        if self._gd_proposer is not None and self._gd_proposer.cfg.enabled:
+            s = self._gd_proposer.summary()
+            print(f"[GD2] episode summary: frames={s['frames']} boxes_above_thr={s['boxes_above_thr']} "
+                  f"proposals={s['proposals']} both={self._gd_stats['both']} gd={self._gd_stats['gd']} "
+                  f"gd_rejected={self._gd_stats['gd_rejected']} both_cleared={self._gd_stats['both_cleared']} "
+                  f"tsp3d_new={self._gd_stats['tsp3d_new']} rejects={s['rejects']}")
+            # A4 measurement #6 (§3.7.10): phrase distribution of above-threshold boxes.
+            print(f"[GD2] phrase stats: target_hit={s['target_hit']} multi_named={s['multi_named']} "
+                  f"empty={s['empty_phrase']} top={s['phrases']}")
+            self._gd_proposer.reset()
+            self._gd_stats = {
+                "both": 0, "gd": 0, "gd_rejected": 0, "both_cleared": 0, "tsp3d_new": 0,
+            }
+        self._target_object = ""
+        self._init_step_count = 0
+        self._num_steps = 0
+        self._last_goal = np.zeros(2)
+        self._done_initializing = False
+        self._called_stop = False
+        self._target_3d_memory.clear()
+        self._target_surface_memory.clear()
+        self._target_verify_state.clear()
+        self._target_fallback_state.clear()
+        # A2 measurement #3 (§3.9): the finished episode's deletions were already read by
+        # the trainer at logging time (same contract as `_memory_entries_snapshot`).
+        self._deletion_log = []
+        self._last_target_coord = None
+        self._geom_gate_engine.reset()
+        self._pointnav_policy.reset()
+        self._obstacle_map3d.reset()
+        self._preprocessor.reset()
+        self._detect_logs = []
+        self._nav_pick_key = None
+        self._did_reset = True
+    # ==========================================================================
+    # Mechanism initialisation (one `_init_*` per module) 
+    # 3D spatial representations / target-memory lifecycle /
+    # fusion / fallback / S-penalty / geometric admission /
+    # GD source
+    # ==========================================================================
+    def _init_spatial_representations(
+        self,
+        *,
+        om_style: str,
+        voxel_size: float,
+        min_obstacle_height: float,
+        max_obstacle_height: float,
+        agent_radius: float,
+        nav_slice_height: float,
+        agent_height: float,
+        hole_area_thresh: int,
+        obstacle_map_area_threshold: float,
+        log_odds_occ: float,
+        log_odds_free: float,
+        occ_threshold: float,
+        free_threshold: float,
+    ) -> None:
+        """Core 3D spatial representations: the occupancy / obstacle map backend."""
         height_range = max_obstacle_height - min_obstacle_height
         height_size = int(height_range / voxel_size) + 1
         pixels_per_meter = int(1.0 / voxel_size)
@@ -379,37 +379,339 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 occ_threshold=self._occ_threshold,
                 free_threshold=self._free_threshold,
             )
+    def _init_memory_manager(
+        self,
+        *,
+        merge_dist_thresh: float,
+        ema_weight_old: float,
+    ) -> None:
+        """Target-memory lifecycle manager (EMA merge + fallback + erasure) bound to the
+        policy's memory dicts."""
+        self._memory_manager = TargetMemoryManager(MemoryManagerConfig(
+            enable_fallback=self._enable_fb,
+            fb_near_radius=self._fb_near_radius,
+            fb_hysteresis=self._fb_hysteresis,
+            fb_suspicious_hysteresis=self._fb_suspicious_hysteresis,
+            fb_suspicious_conf=self._fb_suspicious_conf,
+            merge_dist_thresh=merge_dist_thresh,
+            ema_weight_old=ema_weight_old,
+        ))
+        self._memory_manager.bind(
+            self._target_3d_memory, self._target_surface_memory,
+            self._target_verify_state, self._target_fallback_state,
+        )
+    def _init_fusion(
+        self,
+        *,
+        fusion_style: str,
+        wm_voxel_size: float,
+        wm_radius: Optional[float],
+        wm_min_view_disp: float,
+        wm_min_view_yaw: float,
+        wm_max_voxels: int,
+        wm_max_frames: Optional[int],
+        wm_near_refresh_radius: Optional[float],
+        wm_near_refresh_value: bool,
+        cap_style: str,
+        distance_sample: bool,
+        near_dist: float,
+        mid_dist: float,
+        near_voxel: float,
+        mid_voxel: float,
+        far_voxel: float,
+        fuse_max_points: int,
+    ) -> None:
+        """World-frame incremental fusion (the final route) + send-side post-processing."""
+        self._fusion_style = fusion_style
+        self._preprocessor = TSP3DInputPreprocessor(
+            fusion_style=fusion_style,
+            map_voxel_size=wm_voxel_size,
+            map_radius=wm_radius,
+            min_view_disp=wm_min_view_disp,
+            min_view_yaw=np.deg2rad(wm_min_view_yaw),
+            max_map_voxels=wm_max_voxels,
+            map_max_frames=wm_max_frames,
+            map_near_refresh_radius=wm_near_refresh_radius,
+            map_near_refresh_value=wm_near_refresh_value,
+            max_points=fuse_max_points,
+            cap_style=cap_style,
+            use_distance_sampling=distance_sample,
+            near_dist=near_dist,
+            mid_dist=mid_dist,
+            near_voxel=near_voxel,
+            mid_voxel=mid_voxel,
+            far_voxel=far_voxel,
+        )
+    def _init_fallback(
+        self,
+        *,
+        enable_fb: bool,
+        fb_hysteresis: int,
+        fb_suspicious_hysteresis: int,
+        fb_suspicious_conf: float,
+        max_depth: float,
+    ) -> None:
+        """Anti-hallucination fallback (near-field hysteresis) parameters.
 
-    def _reset(self) -> None:
-        """Reset memories, step counters, pointnav model, and 3D occupancy map."""
-        self._target_object = ""
-        self._init_step_count = 0
-        self._num_steps = 0
-        self._last_goal = np.zeros(2)
-        self._done_initializing = False
-        self._called_stop = False
-        self._target_3d_memory.clear()
-        self._target_surface_memory.clear()
-        self._target_verify_state.clear()
-        self._target_fallback_state.clear()
-        self._last_target_coord = None
-        self._geom_gate_engine.reset()
-        self._scan_in_progress = False
-        self._last_pending = []
-        self._scan_value_views = []
-        self._scan_pos = None
-        self._scan_remaining = 0
-        self._scan_pcd_frames = []
-        self._last_scan_step = -10**9
-        self._last_lock_step = 0
-        self._pointnav_policy.reset()
-        self._obstacle_map3d.reset()
-        self._preprocessor.reset()
-        self._detect_logs = []
-        self._diag_logs = []
-        self._nav_aim_xyz = None
-        self._pitch_cam_down = 0
-        self._did_reset = True
+        The lifecycle manager consumes them; the cone radius is VLFM's `max_depth * 0.5`.
+        """
+        self._enable_fb = bool(enable_fb)
+        self._fb_near_radius = float(max_depth) * 0.5
+        self._fb_hysteresis = int(fb_hysteresis)
+        self._fb_suspicious_hysteresis = int(fb_suspicious_hysteresis)
+        self._fb_suspicious_conf = float(fb_suspicious_conf)
+    def _init_s_penalty(
+        self,
+        *,
+        enable_s_penalty: bool,
+        s_penalty_thresh: float,
+        s_penalty_floor: float,
+        s_penalty_radius_m: float,
+        s_penalty_use_surface: bool,
+        goal_use_surface: bool,
+    ) -> None:
+        """S-penalty: c' = c * w_S(semantic field), plus the surface-point goal option."""
+        self._s_penalty_cfg = SPenaltyConfig(
+            enable=enable_s_penalty,
+            thresh=s_penalty_thresh,
+            floor=s_penalty_floor,
+            radius_m=s_penalty_radius_m,
+        )
+        self._s_penalty_use_surface = s_penalty_use_surface
+        self._goal_use_surface = goal_use_surface
+    def _init_geom_gate(
+        self,
+        *,
+        enable_occ_consistency: bool,
+        occ_min_voxels: int,
+        occ_min_ratio: float,
+        enable_density_gate: bool,
+        density_occ_support: bool,
+        density_min_points: int,
+        density_min_frames: int,
+        density_cluster_merge_dist: float,
+        density_min_view_span_deg: float,
+    ) -> None:
+        """Geometric admission gate (occ-consistency + density). Runs before S-penalty."""
+        self._geom_gate_engine = TargetGeometricGatingEngine(
+            occ_cfg=BoxOccupancyConfig(
+                enable=enable_occ_consistency,
+                min_occupied_voxels=occ_min_voxels,
+                min_occupancy_ratio=occ_min_ratio,
+            ),
+            density_cfg=BoxPointDensityConfig(
+                enable=enable_density_gate,
+                min_points_confirm=density_min_points,
+                min_frames_confirm=density_min_frames,
+                cluster_merge_dist=density_cluster_merge_dist,
+                use_occupancy_support=density_occ_support,
+                min_view_span_deg=density_min_view_span_deg,
+            ),
+        )
+    def _init_gd_proposer(
+        self,
+        *,
+        gdp_enable: bool,
+        gdp_every_n: int,
+        gdp_box_thr: float,
+        gdp_caption_style: str,
+        gdp_max_boxes: int,
+        gdp_weak_guard: bool,
+        gdp_merge_dist: float,
+        gdp_merge_iau: float,
+        gdp_port: int,
+    ) -> None:
+        """New GD auxiliary mechanism: an independent per-frame proposer + vote.
+        GD only proposes and votes (`both` / `gd`).
+        """
+        self._gd_proposer = GdProposer(GdProposalConfig(
+            enabled=bool(gdp_enable),
+            every_n=max(1, int(gdp_every_n)),
+            port=int(gdp_port),
+            box_thr=float(gdp_box_thr),
+            caption_style=str(gdp_caption_style),
+            max_boxes=max(1, int(gdp_max_boxes)),
+            merge_dist=float(gdp_merge_dist),
+            merge_iau=float(gdp_merge_iau),
+            weak_guard=bool(gdp_weak_guard),
+        ))
+        self._gd_weak_guard = bool(gdp_weak_guard)
+        # Vote accounting of the GD source.
+        self._gd_stats = {
+            "both": 0, "gd": 0, "gd_rejected": 0, "both_cleared": 0, "tsp3d_new": 0,
+        }
+
+    # ---- new GD mechanism runtime ----
+    def _gd_geom_admit(
+        self,
+        proposal: Any,
+        target_class: str,
+        pcd_world: np.ndarray,
+        robot_xyz: np.ndarray,
+    ) -> bool:
+        """
+        Geometric admission of a `gd` single-vote candidate (the SAME gate as TSP3D).
+
+        No new confidence threshold: the GD box only has to survive the existing
+        occ-consistency / density gate, exactly like a TSP3D candidate.
+        """
+        eng = self._geom_gate_engine
+        if not eng.enabled:
+            return True
+        status, _cluster, _diag = eng.process_detection(
+            target_class=target_class,
+            box_corners=proposal.box8,
+            current_frame_pcd=pcd_world,
+            obstacle_map_3d=self._obstacle_map3d,
+            confidence=float(proposal.conf),
+            step=self._num_steps,
+            robot_xyz=robot_xyz,
+        )
+        if status == "REJECTED":
+            return False
+        if eng.density_acc.cfg.enable and status != "HARD_CONFIRMED":
+            return False
+        return True
+
+    @staticmethod
+    def _world_to_pixel(
+        point: np.ndarray, cam: Any
+    ) -> Union[None, Tuple[float, float, float]]:
+        """World point -> (u, v, forward depth) in the current frame; None when not visible.
+
+        R0 visibility test of the R2 negative-side accounting (§3.11 三): the inverse of
+        `_project_rgbd_to_3d_point_cloud`, with the camera-base axes `(forward, left, up)`.
+        A point behind the camera, outside the image, or beyond the depth range counts as
+        "not checked" and therefore **never** as negative evidence.
+        """
+        tf = np.asarray(cam.tf_camera_to_episodic, dtype=np.float64)
+        p = np.asarray(point, dtype=np.float64).reshape(-1)[:3]
+        if p.size < 3 or not np.all(np.isfinite(p)):
+            return None
+        base = tf[:3, :3].T @ (p - tf[:3, 3])
+        fwd, left, up = float(base[0]), float(base[1]), float(base[2])
+        if not (float(cam.min_depth) < fwd < float(cam.max_depth)):
+            return None
+        u = (-left) * float(cam.fx) / fwd + float(cam.width) / 2.0
+        v = (-up) * float(cam.fy) / fwd + float(cam.height) / 2.0
+        if not (0.0 <= u < float(cam.width) and 0.0 <= v < float(cam.height)):
+            return None
+        return (u, v, fwd)
+
+    def _gd_apply(
+        self,
+        image_rgb: np.ndarray,
+        tf_camera_to_episodic: np.ndarray,
+        max_depth: float,
+        fx: float,
+        fy: float,
+        target_classes: List[str],
+        robot_xyz: np.ndarray,
+        robot_yaw: float,
+        pcd_world: np.ndarray,
+        pending: List[Any],
+    ) -> None:
+        """
+        Run the GD proposal source on the current frame and consume its votes.
+
+        Frame alignment: GD reads the frame the fusion chain just consumed (`rgb` / `depth` / `tf`), 
+        and its point set never enters that chain or TSP3D.
+
+        * `both` -> corroborate the co-located admitted entry (no new entry, the c' scale stays TSP3D's);
+        
+        * `gd`   -> single vote: passes the SAME geometric gate, 
+          then is written as suspicious/pending with the `gd` src tag; 
+          c' is set to `sigma_tar` because GD logits are a different scale.
+        """
+        prog = self._gd_proposer
+        if prog is None or not prog.cfg.enabled or not self._done_initializing:
+            return
+        if not should_run(self._num_steps, prog.cfg.every_n):
+            return
+        frames = self._observations_cache.get("object_map_rgbd")
+        if image_rgb is None or not frames:
+            return
+        depth = frames[0][1]
+        if depth is None:
+            return
+        
+        depth_arr = np.asarray(depth, dtype=np.float64)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        height, width = int(depth_arr.shape[0]), int(depth_arr.shape[1])
+        # The observation depth is normalized in [0, 1].
+        depth_m = depth_arr * (max_depth - self._min_depth) + self._min_depth
+        cam = CameraView(
+            fx=float(fx), fy=float(fy), height=height, width=width,
+            tf_camera_to_episodic=tf_camera_to_episodic,
+            min_depth=self._min_depth, max_depth=max_depth,
+        )
+        # Deterministic chain subsampling (own RandomState, never the global stream).
+        rng = np.random.RandomState((self._det_seed * 100003 + self._num_steps) & 0x7FFFFFFF)
+        proposals = prog.propose(
+            image_rgb, depth_m, cam, target_classes,
+            np.asarray(robot_xyz, dtype=np.float64)[:2], rng,
+        )
+
+        if not proposals:
+            return
+
+        # The TSP3D vote = this frame's ADMITTED candidates only, 
+        # so a box rejected by the gates can never upgrade a GD proposal to `both`.
+        candidates = [
+            Tsp3dCandidate(
+                centroid=np.asarray(centroid_np, dtype=np.float64).reshape(-1),
+                box8=None, conf=float(conf_amp), admitted=True,
+            )
+            for conf_amp, centroid_np, _surf, _classes in pending
+        ]
+        for proposal, vote, matched_idx in attach_votes(proposals, candidates, prog.cfg):
+            if vote == BOTH and matched_idx is not None:
+                conf_amp, centroid_np, _surf, classes = pending[matched_idx]
+                res: Dict[str, Any] = {}
+                for cls in classes:
+                    res = self._memory_manager.accumulate(
+                        cls, np.asarray(centroid_np, dtype=np.float64),
+                        confidence=float(conf_amp),
+                        near_surface=np.asarray(proposal.surface, dtype=np.float64),
+                        robot_xyz=robot_xyz, robot_yaw=robot_yaw, max_depth=max_depth,
+                        suspicious_override=False, src=BOTH,
+                        gd_conf=float(proposal.conf),
+                    )
+                self._gd_stats["both"] += 1
+                if res.get("suspicion_cleared"):
+                    self._gd_stats["both_cleared"] += 1
+                print(f"[GD2] both -> corroborate {classes} at "
+                      f"{np.round(np.asarray(centroid_np, dtype=np.float64)[:3], 2)} "
+                      f"(tsp3d={float(conf_amp):.2f} gd={float(proposal.conf):.2f} "
+                      f"n_obs={res.get('num_obs')} src={res.get('src')} "
+                      f"suspicious={res.get('suspicious')} cleared={bool(res.get('suspicion_cleared'))} "
+                      f"robot={np.round(np.asarray(robot_xyz, dtype=np.float64)[:2], 2)} "
+                      f"yaw={float(robot_yaw):.2f}) -> normal path")
+                continue
+            if not admit_as_suspicious(vote):
+                continue
+            cls = proposal.canon if proposal.canon in target_classes else target_classes[0]
+            if not self._gd_geom_admit(proposal, cls, pcd_world, robot_xyz):
+                self._gd_stats["gd_rejected"] += 1
+                print(f"[GD2] gd -> REJECTED by geom gate '{cls}' at "
+                      f"{np.round(np.asarray(proposal.centroid, dtype=np.float64)[:3], 2)}")
+                continue
+            res = self._memory_manager.accumulate(
+                cls, np.asarray(proposal.centroid, dtype=np.float64),
+                confidence=self._sigma_tar,
+                near_surface=np.asarray(proposal.surface, dtype=np.float64),
+                robot_xyz=robot_xyz, robot_yaw=robot_yaw, max_depth=max_depth,
+                suspicious_override=True, src=GD,
+                gd_conf=float(proposal.conf),
+            )
+            self._gd_stats["gd"] += 1
+            print(f"[GD2] gd -> single vote '{cls}' at "
+                  f"{np.round(np.asarray(proposal.centroid, dtype=np.float64)[:3], 2)} "
+                  f"(gd={float(proposal.conf):.2f} n_obs={res.get('num_obs')} "
+                  f"src={res.get('src')} suspicious={res.get('suspicious')} "
+                  f"robot={np.round(np.asarray(robot_xyz, dtype=np.float64)[:2], 2)} "
+                  f"yaw={float(robot_yaw):.2f}) -> pending")
 
     # ==========================================================================
     # === Input & Mapping Module ===
@@ -443,7 +745,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self,
         aligned_pcd: np.ndarray,
         target_query: str,
-        conf_floor: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Query TSP3D, scaling the pruning threshold when extremely close to surfaces."""
         if len(aligned_pcd) == 0:
@@ -468,7 +769,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             sigma_sce=dynamic_sigma_sce,
             tau=self._tau,
             use_vlfm_nlp=self._nlp_mode,
-            conf_floor=conf_floor,
         )
 
         return raw_preds, diagnostics
@@ -530,13 +830,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
         detections: ObjectDetections,
         pcd_world: np.ndarray,
         robot_xyz: Optional[np.ndarray] = None,
-        diag_out: Optional[List[Dict[str, Any]]] = None,
     ) -> ObjectDetections:
         """Geometric admission on the current candidates.
+
         REJECTED (empty-air) and (when the density gate is on) unconfirmed
         SOFT_ACCUMULATING detections are dropped before the S-penalty gate.
-        ``diag_out`` (optional, P3 diagnostics) collects dropped candidates as
-        {conf, conf_amp, centroid, stage='geom_reject', reason=status}.
         """
         engine = self._geom_gate_engine
         n = detections.num_detections
@@ -557,15 +855,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 robot_xyz=robot_xyz,
             )
             drop = (status == "REJECTED") or (density_on and status == "SOFT_ACCUMULATING")
-            if drop and diag_out is not None:
-                diag_out.append({
-                    "conf": float(logits_np[i]),
-                    "conf_amp": float(logits_np[i]),
-                    "centroid": np.mean(boxes_np[i], axis=0),
-                    "stage": "geom_reject",
-                    "reason": status,
-                    "admitted": False,
-                })
             keep[i] = not drop
         if not keep.all():
             detections.filter_by_mask(keep)
@@ -574,56 +863,50 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
     def _get_target_object_location(self, position: np.ndarray) -> Union[None, np.ndarray]:
         """
-        Navigation goal among the memorized target candidates. 
-        Distance-latch keeps goal switches stable.
-
-        world/camera/none: closest centroid with a distance-latch.
-        panoramic: rank candidates by their S-penalty score c'; 
-                   nearest is the fallback when c' is missing.
+        Navigation goal among the memorized target candidates.
+        Closest centroid with a distance-latch keeps goal switches stable.
         """
-        target_classes = self._target_object.split("|")
         valid_centroids: List[np.ndarray] = []
         valid_goals: List[np.ndarray] = []
-        valid_confs: List[Optional[float]] = []
-
+        valid_obs: List[int] = []
+        valid_src: List[str] = []
+        # M-a (§五 量测): raw GD sigmoid of each candidate entry (0.0 = no GD vote).
+        valid_gconf: List[float] = []
+        target_classes = self._target_object.split("|")
         for cls in target_classes:
             if cls in self._target_3d_memory and len(self._target_3d_memory[cls]) > 0:
                 surf_list = self._target_surface_memory.get(cls, [])
                 verify_list = self._target_verify_state.get(cls, [])
                 for i, centroid in enumerate(self._target_3d_memory[cls]):
+                    obs = 1
+                    if i < len(verify_list):
+                        v = verify_list[i]
+                        obs = int(v[0]) if len(v) >= 1 else 1
+
+                    # Weak evidence does not lock (§3.6.4): a `gd` single vote needs
+                    # `lock_min_obs` observations before it may drive explore -> navigate.
+                    st = self._memory_manager.state_of(centroid)
+                    src = str(st.get("src") or "tsp3d")
+                    if not is_lockable(src, obs, self._lock_min_obs, self._gd_weak_guard):
+                        continue
+
                     valid_centroids.append(np.array(centroid))
                     if self._goal_use_surface and i < len(surf_list):
                         valid_goals.append(np.array(surf_list[i]))
                     else:
                         valid_goals.append(np.array(centroid))
-                    conf = None
-                    if i < len(verify_list):
-                        v = verify_list[i]
-                        conf = float(v[3]) if len(v) >= 4 else None
-                    valid_confs.append(conf)
-
+                    valid_obs.append(obs)
+                    valid_src.append(src)
+                    valid_gconf.append(float(st.get("gd_conf", 0.0) or 0.0))
         if len(valid_centroids) == 0:
-            self._nav_aim_xyz = None
             return None
 
         robot_xy = np.asarray(position)[:2]
-        if self._fusion_style == "panoramic" and any(c is not None for c in valid_confs):
-            # Rank by c' (highest = most target-matching); nearest as a tiebreak.
-            def _key(i: int) -> tuple:
-                conf_i = valid_confs[i] if valid_confs[i] is not None else -1.0
-                return (conf_i, -float(np.linalg.norm(valid_centroids[i][:2] - robot_xy)))
-            chosen_idx = int(max(range(len(valid_confs)), key=_key))
-        else:
-            centroids = np.array(valid_centroids)
-            dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
-            chosen_idx = int(np.argmin(dists_2d))
+        centroids = np.array(valid_centroids)
+        dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
+        chosen_idx = int(np.argmin(dists_2d))
 
         chosen_2d = valid_goals[chosen_idx][:2].copy()
-        # 3D aim (incl. z) for pitch.
-        chosen_goal3 = np.asarray(valid_goals[chosen_idx], dtype=np.float64)
-        if chosen_goal3.shape[0] < 3:
-            chosen_goal3 = np.asarray(valid_centroids[chosen_idx], dtype=np.float64)
-
         if self._last_target_coord is None:
             self._last_target_coord = chosen_2d
         else:
@@ -637,10 +920,69 @@ class TSP3DObjectNavPolicy(BasePolicy):
             else:
                 self._last_target_coord = chosen_2d
 
-        # Pitch aim (3D, incl. z) for the near-field camera look-down.
-        self._nav_aim_xyz = chosen_goal3
+        # M-b (§五 量测): what the navigation decision actually locked.
+        self._log_nav_pick(
+            valid_centroids, valid_obs, valid_src, chosen_idx, position,
+            valid_gconf=valid_gconf,
+        )
 
         return self._last_target_coord
+
+    def _log_nav_pick(
+        self,
+        valid_centroids: List[np.ndarray],
+        valid_obs: List[int],
+        valid_src: List[str],
+        chosen_idx: int,
+        position: np.ndarray,
+        valid_gconf: Optional[List[float]] = None,
+    ) -> None:
+        """Log the chosen navigation entry: src / num_obs / GD score / distance / pose,
+        plus a compact dump of the whole candidate set (M-b §五 量测).
+
+        M-b: `cands=[src:o<n_obs>:g<gd_conf>@<dist>*]` lists every candidate of the same
+        decision (nearest first, `*` = the one actually locked), so any alternative
+        ranking key (score-first, in-band vote-type priority, ...) can be evaluated
+        offline (what-if) instead of by blind online A/B. The dedup key is unchanged,
+        so the print volume of earlier arms stays comparable.
+        """
+        src = str(valid_src[chosen_idx])
+        obs = int(valid_obs[chosen_idx])
+        robot_xy = np.asarray(position, dtype=np.float64).reshape(-1)[:2]
+
+        def _gconf(j: int) -> float:
+            if valid_gconf is None or j >= len(valid_gconf):
+                return 0.0
+            return float(valid_gconf[j] or 0.0)
+
+        def _dist(j: int) -> float:
+            cen = np.asarray(valid_centroids[j], dtype=np.float64).reshape(-1)
+            return float(np.linalg.norm(cen[:2] - robot_xy))
+
+        gconf = _gconf(chosen_idx)
+        dist = _dist(chosen_idx)
+        key = (src, obs, round(dist / 0.5))
+        if key == self._nav_pick_key:
+            return
+        self._nav_pick_key = key
+        cands = sorted(
+            (
+                (_dist(j), int(j), str(valid_src[j]), int(valid_obs[j]), _gconf(j))
+                for j in range(len(valid_centroids))
+            ),
+            key=lambda t: (t[0], t[1]),
+        )
+        brief = ", ".join(
+            f"{s}:o{o}:g{g:.2f}@{d:.1f}{'*' if j == chosen_idx else ''}"
+            for d, j, s, o, g in cands[:4]
+        )
+        yaw = float(self._observations_cache.get("robot_heading", 0.0))
+        print(
+            f"[NAV] pick src={src} n_obs={obs} gd_conf={gconf:.2f} "
+            f"dist={dist:.2f} "
+            f"robot={np.round(robot_xy, 2)} yaw={yaw:.2f} "
+            f"n_cand={len(valid_centroids)} cands=[{brief}]"
+        )
 
     def _update_object_map(
         self,
@@ -658,6 +1000,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             pcd = self._project_rgbd_to_3d_point_cloud(
                 rgb, depth, fx, fy, tf_camera_to_episodic, min_depth, max_depth
             )
+        robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
+        robot_yaw = self._observations_cache.get("robot_heading", 0.0)
 
         # Update 3D geometric obstacle occupancy grid
         self._obstacle_map3d.update_map(
@@ -669,11 +1013,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             fx=fx,
             fy=fy,
         )
-        robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
-        robot_yaw = self._observations_cache.get("robot_heading", 0.0)
 
-        # Unified input pipeline: camera window / world map -> update -> prepare.
-        # (Panoramic route is driven separately by the policy scan state machine.)
+        # Unified input pipeline: world-frame incremental map -> update -> prepare.
         self._preprocessor.update(pcd, robot_xyz, robot_yaw)
         fused_pcd_local = self._preprocessor.prepare(
             robot_xyz,
@@ -702,11 +1043,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
         Query TSP3D on a local cloud, restore boxes to world frame, 
         then run the full detection pipeline (filter -> S-penalty -> memory -> fallback).
         """
-        raw_detections, _ = self._query_tsp3d_client(
-            pcd_local, self._target_object,
-            conf_floor=self._diag_conf_floor if self._diag_enable else None,
-        )
-
+        target_classes = [c.strip() for c in self._target_object.split("|") if c.strip()]
+        raw_detections, _ = self._query_tsp3d_client(pcd_local, self._target_object)
         # Restore predicted boxes to global coordinates (inverse rotation + translation)
         valid_raw = [det for det in raw_detections if det.get("box_3d") is not None]
         cos_yaw_r, sin_yaw_r = np.cos(robot_yaw), np.sin(robot_yaw)
@@ -722,7 +1060,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             boxes_3d_global.append(box_np.tolist())
         logits = [det.get("confidence", 0.0) for det in valid_raw]
         phrases = [self._target_object for _ in valid_raw]
-
         detections = ObjectDetections(
             boxes=boxes_3d_global,
             logits=logits,
@@ -733,25 +1070,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
             fy=fy,
             tf_camera_to_episodic=tf_camera_to_episodic
         )
-
-        if self._diag_enable:
-            # P3 diagnostics: log raw detections below sigma_tar (the server returns
-            # candidates down to diag_conf_floor when enabled). They never enter the
-            # decision pipeline (filter_by_conf below still drops them at sigma_tar).
-            for det, box_g in zip(valid_raw, boxes_3d_global):
-                conf_i = float(det.get("confidence", 0.0))
-                if conf_i < self._sigma_tar:
-                    self._diag_logs.append({
-                        "conf": conf_i,
-                        "conf_amp": conf_i,
-                        "centroid": np.mean(np.asarray(box_g), axis=0),
-                        "stage": "below_sigma",
-                        "reason": "below_sigma_tar",
-                        "admitted": False,
-                    })
-
-        detections.filter_by_conf(self._sigma_tar)
-        target_classes = [c.strip() for c in self._target_object.split("|") if c.strip()]
+        logits_arr = np.asarray(logits, dtype=np.float64)
+        keep = logits_arr >= self._sigma_tar
+        if len(keep):
+            if not bool(keep.all()):
+                detections.filter_by_mask(keep)
+        else:
+            detections.filter_by_conf(self._sigma_tar)
         detections.filter_by_class(target_classes, use_vlfm_nlp=self._nlp_mode)
         # Skip memory accumulation during initialization turning (repeated surfaces pollute memory).
         if not self._done_initializing:
@@ -759,11 +1084,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         # REJECTED (empty-air) -> dropped before S-penalty
         if self._geom_gate_engine.enabled:
-            detections = self._geom_gate(
-                detections, pcd_world, robot_xyz=robot_xyz,
-                diag_out=self._diag_logs if self._diag_enable else None,
-            )
-
+            detections = self._geom_gate(detections, pcd_world, robot_xyz=robot_xyz)
         # S-penalty gate cross-validation -> write passed detections to memory.
         admitted_meta: List[Any] = []
         pending = apply_s_penalty(
@@ -778,24 +1099,42 @@ class TSP3DObjectNavPolicy(BasePolicy):
             per_det_meta=None,
             meta_out=admitted_meta,
         )
-        # Keep this query's admitted candidates (c') for the scan-end direction decision.
-        self._last_pending = list(pending)
+
+        # With the GD source on, a TSP3D-only write is "single-side" evidence: a NEW
+        # entry starts suspicious and a same-frame `both` vote clears the flag again.
+        # With GD off there is no second vote at all.
+        _gd_on = self._gd_proposer is not None and self._gd_proposer.cfg.enabled
         for (conf_amp, centroid_np, near_surface, active_classes), susp in zip(pending, admitted_meta):
             for cls in active_classes:
-                self._memory_manager.accumulate(
+                res = self._memory_manager.accumulate(
                     cls, centroid_np, confidence=conf_amp, near_surface=near_surface,
                     robot_xyz=robot_xyz, robot_yaw=robot_yaw, max_depth=max_depth,
                     suspicious_override=bool(susp) if susp is not None else None,
+                    new_suspicious=_gd_on,
                 )
+                if _gd_on and not res.get("merged", False):
+                    self._gd_stats["tsp3d_new"] += 1
+                    print(f"[TSP3D] new entry '{cls}' at "
+                          f"{np.round(np.asarray(centroid_np, dtype=np.float64)[:3], 2)} "
+                          f"-> suspicious (single-side, c'={float(conf_amp):.2f})")
+        # New GD auxiliary mechanism: same-frame second proposer + two-vote
+        self._gd_apply(
+            image_rgb, tf_camera_to_episodic, max_depth, fx, fy,
+            target_classes, robot_xyz, robot_yaw, pcd_world, pending,
+        )
+
         # Target Memory Manager
         camera_pos = tf_camera_to_episodic[:3, 3]
         camera_yaw = extract_yaw(tf_camera_to_episodic)
         cone_fov = get_fov(self._fx, self._depth_image_shape[1])
-        self._memory_manager.step(
+        deleted = self._memory_manager.step(
             camera_pos, camera_yaw, cone_fov,
             obstacle_map_3d=self._obstacle_map3d,
             robot_xyz=robot_xyz,
         )
+        # A2 measurement #3 (§3.9): keep this episode's deletions for the episode logger.
+        if deleted:
+            self._deletion_log.extend(deleted)
 
         return detections
 
@@ -843,27 +1182,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         action = self._pointnav_policy.act(obs_pointnav, masks, deterministic=True)
         return action
 
-    def _nav_action(self, robot_xyz: np.ndarray) -> Optional[torch.Tensor]:
-        """Pitch: one look_down step while the near-field pitch target is not reached."""
-        eng = self._pitch_engine
-        aim = self._nav_aim_xyz
-        if not eng.config.pitch_enable or aim is None or len(aim) < 3:
-            return None
-        robot = np.asarray(robot_xyz, dtype=np.float64).reshape(-1)
-        target = int(eng.desired_pitch_at(aim, robot, camera_z=self._camera_height)[0])
-        if target <= self._pitch_cam_down:
-            return None
-        self._pitch_cam_down += 1
-        return self._look_down_action
-
-    def _restore_action(self) -> Optional[torch.Tensor]:
-        """Pitch: one look_up step to level the camera after leaving navigate."""
-        eng = self._pitch_engine
-        if not eng.config.pitch_enable or self._pitch_cam_down <= 0:
-            return None
-        self._pitch_cam_down -= 1
-        return self._look_up_action
-
     def act(
         self,
         observations: Dict,
@@ -872,12 +1190,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         masks: Tensor,
         deterministic: bool = False,
     ) -> Any:
-        # P0 determinism (V7.1): reseed numpy once per env step with a monotonic
-        # counter, so every np.random consumer of this step (send-side point cap,
-        # density-cluster subsample, ...) is reproducible run-to-run. The counter
-        # is never reset across episodes; two identical runs reproduce identical
-        # seed sequences -> bit-stable detection totals. Distribution semantics
-        # of the random cap are preserved (uniform random subset per step).
         np.random.seed((self._det_seed + self._rng_step) & 0x7FFFFFFF)
         self._rng_step += 1
 
@@ -885,63 +1197,24 @@ class TSP3DObjectNavPolicy(BasePolicy):
         object_map_rgbd = self._observations_cache["object_map_rgbd"]
         detections = []
 
-        if self._fusion_style == "panoramic":
-            rgb, depth, tf, min_depth, max_depth, fx, fy = object_map_rgbd[0]
-            pcd = self._get_shared_pcd(0)
-            robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
-            robot_yaw = self._observations_cache.get("robot_heading", 0.0)
-            goal_3d = self._get_target_object_location(robot_xyz)
-            det, mode, action = _act_panoramic(
-                self, observations, pcd, robot_xyz, robot_yaw, rgb, depth, tf,
-                min_depth, max_depth, fx, fy, goal_3d,
+        for i, (rgb, depth, tf, min_depth, max_depth, fx, fy) in enumerate(object_map_rgbd):
+            pcd = self._get_shared_pcd(i)
+            detections.append(
+                self._update_object_map(rgb, depth, tf, min_depth, max_depth, fx, fy, pcd=pcd)
             )
-            detections.append(det)
-
+        robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
+        goal_3d = self._get_target_object_location(robot_xyz)
+        # Exploration via habitat frontier_sensor.
+        if not self._done_initializing:
+            mode = "initialize"
+            action = self._initialize()
+        elif goal_3d is None:
+            mode = "explore"
+            action = self._explore(observations)
         else:
-            if self._fusion_style == "world" and self._enable_scan:
-                # World temporal fusion + frontier-arrival 360° scan.
-                rgb, depth, tf, min_depth, max_depth, fx, fy = object_map_rgbd[0]
-                pcd = self._get_shared_pcd(0)
-                robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
-                robot_yaw = self._observations_cache.get("robot_heading", 0.0)
-                goal_3d = self._get_target_object_location(robot_xyz)
-                det, mode, action = _act_world_scan(
-                    self, observations, pcd, robot_xyz, robot_yaw, rgb, depth, tf,
-                    min_depth, max_depth, fx, fy, goal_3d,
-                )
-                detections.append(det)
-            
-            else:
-                for i, (rgb, depth, tf, min_depth, max_depth, fx, fy) in enumerate(object_map_rgbd):
-                    pcd = self._get_shared_pcd(i)
-                    detections.append(
-                        self._update_object_map(rgb, depth, tf, min_depth, max_depth, fx, fy, pcd=pcd)
-                    )
-                robot_xyz = self._observations_cache.get("robot_xy_z", np.zeros(3))
-                goal_3d = self._get_target_object_location(robot_xyz)
-                # Exploration via habitat frontier_sensor.
-                if not self._done_initializing:
-                    mode = "initialize"
-                    action = self._initialize()
-                elif goal_3d is None:
-                    # Pitch: level the camera before resuming explore after a down-pitch.
-                    pitch_act = self._restore_action()
-                    if pitch_act is not None:
-                        mode = "pitch_restore"
-                        action = pitch_act
-                    else:
-                        mode = "explore"
-                        action = self._explore(observations)
-                else:
-                    mode = "navigate"
-                    print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
-                    # Pitch: near-field pitch-down (look down over 1 step while approaching a low target).
-                    pitch_act = self._nav_action(robot_xyz)
-                    if pitch_act is not None:
-                        mode = "pitch_down"
-                        action = pitch_act
-                    else:
-                        action = self._pointnav(goal_3d[:2], stop=True)
+            mode = "navigate"
+            print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
+            action = self._pointnav(goal_3d[:2], stop=True)
 
         action_np = action.detach().cpu().numpy()[0]
         if len(action_np) == 1:
@@ -954,6 +1227,62 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._did_reset = False
 
         return action, rnn_hidden_states
+
+    def _deletion_snapshot(self) -> List[Dict[str, Any]]:
+        """Scalar snapshot of this episode's deletions (A2 measurement #3, §3.9).
+
+        Read by the evaluation trainer right after the episode ends (the policy only
+        clears its log on the next `act()`), so the finished episode's deletions can be
+        labelled tp / fp against the GT target bbox and split by proposer tag / reason.
+        `gd_conf` (M-a §五 量测) is the entry's strongest raw GD sigmoid.
+        """
+        out: List[Dict[str, Any]] = []
+        for rec in self._deletion_log:
+            c = np.asarray(rec.get("centroid"), dtype=np.float64).reshape(-1)
+            out.append({
+                "class": str(rec.get("target_class", "")),
+                "x": float(c[0]) if c.size > 0 else 0.0,
+                "y": float(c[1]) if c.size > 1 else 0.0,
+                "src": str(rec.get("src") or "tsp3d"),
+                "reason": str(rec.get("reason", "")),
+                "suspicious": bool(rec.get("suspicious", False)),
+                "num_obs": int(rec.get("num_obs", 1)),
+                "conf": float(rec.get("conf", 0.0)),
+                "gd_conf": float(rec.get("gd_conf", 0.0) or 0.0),
+                "near_miss": int(rec.get("near_miss", 0)),
+            })
+        return out
+
+    def _memory_entries_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Compact snapshot of the live memory entries (A4 measurement #2, §3.7.10).
+
+        Read by the evaluation trainer right after an episode finishes (the policy only
+        resets its memory on the next `act()`), so the finished episode's entries can be
+        labelled tp / fp against the GT target bbox. Plain scalars only, keyed
+        `"<class>[i]"` (never injected into `policy_info`: habitat's
+        `extract_scalars_from_info` would try `float()` on non-scalar payloads).
+        `gd_conf` (M-a §五 量测) is the entry's strongest raw GD sigmoid, kept next to
+        `conf` (the entry's `c'`) so the two scales can be compared per entry.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        for cls, centroids in self._target_3d_memory.items():
+            ver = self._target_verify_state.get(cls, [])
+            states = self._target_fallback_state.get(cls, [])
+            for i, centroid in enumerate(centroids):
+                st = states[i] if i < len(states) else {}
+                v = ver[i] if i < len(ver) else (1, np.zeros(2), 0.0, 0.0)
+                c = np.asarray(centroid, dtype=np.float64).reshape(-1)
+                out[f"{cls}[{i}]"] = {
+                    "class": str(cls),
+                    "x": float(c[0]),
+                    "y": float(c[1]) if c.size > 1 else 0.0,
+                    "src": str(st.get("src") or "tsp3d"),
+                    "num_obs": int(v[0]) if len(v) >= 1 else 1,
+                    "conf": float(v[3]) if len(v) > 3 else 0.0,
+                    "gd_conf": float(st.get("gd_conf", 0.0) or 0.0),
+                    "suspicious": bool(st.get("suspicious", False)),
+                }
+        return out
 
     def _get_policy_info(self, detections: ObjectDetections) -> Dict[str, Any]:
         has_target = any(cls in self._target_3d_memory 
@@ -1050,11 +1379,7 @@ class VLVMConfig:
     near_voxel: float = 0.01            # distance sampling: near-band voxel (m)
     mid_voxel: float = 0.02             # distance sampling: mid-band voxel (m)
     far_voxel: float = 0.05             # distance sampling: far-band voxel (m)
-    fusion_style: str = "world"         # Fusion route: "camera" (8-frame temporal window) / "world" (incremental map) / "panoramic" (single-position 360° spatial fusion) / "none" (no fusion, raw single frame straight to TSP3D). Replaces the old use_world_map bool.
-    enable_scan: bool = False           # world+scan integration: frontier-arrival 360° scans are a BYPASS independent of the WorldLocalMap; only active when fusion_style=world. False = pure world baseline.
-    scan_min_gap: int = 90              # Sparse-scan cooldown (env steps) between two frontier scans (last-resort, 09-04); >= scan_min_gap steps after the last scan end before a new scan may fire.
-    scan_opportunistic_after: int = 60   # Opportunistic scan: if >0, also fire a scan when explore runs this many env steps without locking a nav goal (hunts the target on long empty travels). 0 = off.
-    frontier_trigger: bool = True       # Frontier-arrival scan on/off; False = opportunistic-only (no frontier scans).
+    fusion_style: str = "world"         # Fusion route: world-frame incremental map (final). Replaces the old use_world_map bool.
 
     # Phase 5b: Temporal PCD Sliding Window (Multi-frame Fusion for TSP3D)
     pcd_window_size: int = 8                # Number of frames fused for point-cloud accumulation; larger = more complete geometry but slower/staler.
@@ -1074,14 +1399,6 @@ class VLVMConfig:
     wm_near_refresh_radius: Optional[float] = 3.0  # world: near-field refresh radius (m). None=off (first-observation accounting); >0: re-observed near-field voxels are re-owned by the current frame (cam-style accounting, survives frame-window slide-out).
     wm_near_refresh_value: bool = False  # world: also overwrite the stored point of refreshed near-field voxels with the current observation (cam-style sliding refresh of the value layer). False = value layer stays first.
 
-    # Phase 5d: Panoramic Fusion
-    panoramic_turn_steps: int = 6            # Frames (env steps) per 360° scan; rotation/step = 360/turn_steps (6 -> 60°).
-    panoramic_voxel_size: float = 0.02       # Local-frame voxel for intra-scan stitching dedup.
-    panoramic_radius: Optional[float] = 6.0  # Send-side horizontal radius crop (m) around the scan position.
-    panoramic_max_points: int = 200000       # Point cap for the panoramic / single-frame input.
-    panoramic_min_move: float = 2.0          # Min distance (m) from the last scan / init pose to allow another scan (new-frontier guard).
-    panoramic_arrive_dist: float = 1.0       # Frontier-arrival trigger radius (m): fallback gate when no frontier cluster is being tracked (no-cluster starvation guard). Main trigger = pursued-cluster disappearance (fixed "and" mechanism, 09-03).
-
     # Phase 7: S-penalty (semantic-field cross-validation)
     enable_s_penalty: bool = True           # Master switch: c' = c * w_S(S) — multiply TSP3D confidence by a semantic-field weight (BLIP2 ITM, zero extra queries) to amplify TP/FP discrimination.
     s_penalty_thresh: float = 0.15          # S below this (ITM raw cosine scale ~0.10-0.15; measured min 0.084) -> apply penalty (w_S = floor).
@@ -1090,37 +1407,34 @@ class VLVMConfig:
     s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
 
-    # Phase 7b: target-memory lifecycle (all default OFF = world baseline)
-    merge_dist_thresh: float = 0.5          # cross-view EMA merge distance threshold (m)
-    ema_weight_old: float = 0.8             # cross-view EMA smoothing (old * w + new * (1 - w))
-    enable_near_field_exempt: bool = False  # keep a trusted target parked next to the robot from deletion
-    exempt_near_radius: float = 1.0         # robot-target distance below which a trusted target is exempt (m)
-    exempt_min_merges: int = 1              # min merges of a trusted target to be exempt
-    enable_free_space_erasure: bool = False # single-step ghost removal via the occupancy grid
-    free_erasure_radius: float = 0.3        # box half-side (m) around the centroid to inspect
-    free_erasure_min_explored: int = 5      # min explored voxels in the box to trust "this space was seen"
-    free_erasure_free_ratio: float = 0.85   # free-voxel ratio above which the box is judged "pure air"
-    free_erasure_soft_only: bool = True     # True = erase suspicious targets only (conservative)
-
-    # Phase 7c: geometric admission module (occ-consistency + density gates; default OFF)
-    enable_occ_consistency: bool = False    # box must have occupied-voxel support in the 3D grid
+    # Phase 7b: geometric admission module (occ-consistency + density gates)
+    enable_occ_consistency: bool = True     # box must have occupied-voxel support in the 3D grid
     occ_min_voxels: int = 8                 # occ gate: min occupied voxels supporting the box
     occ_min_ratio: float = 0.001            # occ gate: min occupied/(box volume) ratio
-    enable_density_gate: bool = False       # density x occupancy fusion gate (occ support OR density HARD-confirm)
+    enable_density_gate: bool = True        # density x occupancy fusion gate (occ support OR density HARD-confirm)
     density_occ_support: bool = True        # density gate: occupancy support as parallel spatio-temporal evidence
     density_min_points: int = 150           # density gate: min accumulated in-box points to confirm
     density_min_frames: int = 2             # density gate: min observation frames to confirm
     density_cluster_merge_dist: float = 0.5 # density gate: cross-frame cluster association radius (m)
-    density_min_view_span_deg: float = 0.0  # density path: required multi-view azimuth span (deg, 0=off)
+    density_min_view_span_deg: float = 20.0 # density path: required multi-view azimuth span (deg, 0=off)
 
-    # Phase 7e: V7 near-field camera pitch-down (module 4; default OFF = world baseline)
-    pitch: bool = False                  # Near-field camera pitch-down when approaching a low target.
-    pitch_trigger_dist: float = 1.5      # Pitch: only look down within this 2D distance (m) to the aim point.
-    pitch_max_down_steps: int = 1        # Pitch: max look_down steps (tilt 30 deg each).
+    # Phase 7c: target-memory lifecycle
+    merge_dist_thresh: float = 0.5          # cross-view EMA merge distance threshold (m)
+    ema_weight_old: float = 0.8             # cross-view EMA smoothing (old * w + new * (1 - w))
 
-    # Phase 7f: P3 recall-side diagnostics (off = default world behaviour; never changes decisions)
-    diag_enable: bool = False            # record below-sigma_tar + geom-gate-dropped detections for fn (bed) cause analysis
-    diag_conf_floor: float = 0.30        # server return floor (diagnostics only); client still filters at sigma_tar
+    # Phase 7e: GD single-vote lock criterion
+    lock_min_obs: int = 2                # a `gd` single-vote entry needs >= this many observations to be lockable
+
+    # Phase 7g: new GD auxiliary mechanism — independent proposer + frame-level vote
+    gdp_enable: bool = True              # master switch: run the GD proposal source on the current frame
+    gdp_every_n: int = 5                 # GD runs on every N-th frame (cost knob 1/3/5/10)
+    gdp_box_thr: float = 0.4             # GD logit threshold (single GD detector -> the non-COCO value)
+    gdp_caption_style: str = "vocab"     # "vocab" (full class list) / "target" (target classes only)
+    gdp_max_boxes: int = 2               # proposals built per frame (cost guard)
+    gdp_weak_guard: bool = True          # a `gd` single vote cannot lock before lock_min_obs observations
+    gdp_merge_dist: float = 0.5          # frame-level "same object" XY distance (m)
+    gdp_merge_iau: float = 0.3           # frame-level "same object" AABB IaU
+    gdp_port: int = 12181                # Grounding-DINO server port
 
     @classmethod  # type: ignore
     @property

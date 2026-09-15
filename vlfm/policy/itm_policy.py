@@ -189,11 +189,7 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
             in self._observations_cache["object_map_rgbd"]
         ]
         self._observations_cache["shared_pcds"] = shared_pcds
-        # Skip per-step value-map (BLIP2 ITM) updates while a panoramic scan is
-        # running: mid-scan frames are in-place turns at one position, their semantic
-        # field would only re-cover the same area.
-        if not getattr(self, "_scan_in_progress", False):
-            self._update_value_map()
+        self._update_value_map()
         return super().act(observations, rnn_hidden_states, prev_actions, masks, deterministic)
 
     def _get_policy_info(self, detections: ObjectDetections) -> Dict[str, Any]:

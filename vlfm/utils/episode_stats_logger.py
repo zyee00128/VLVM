@@ -189,6 +189,83 @@ def _point_in_target_bbox(
         return False
 
 
+def aggregate_memory_stats(
+    infos: Dict[str, Any], entries: Any = None
+) -> Dict[str, Any]:
+    """Per-entry tp / fp labels of the episode-end memory (A4 measurement #2, §3.7.10).
+
+    Entries are read from the policy snapshot (`policy._memory_entries_snapshot()`, read by
+    the trainer right after the episode ends) or, as a fallback, from
+    ``infos["memory_entries"]``. Every entry is labelled against the static GT target bbox
+    with the same transform as ``was_false_positive``; results are split by proposer tag
+    (`src`) and by the suspicious subset, which is what A2 / A3 need to judge
+    "deleted tp share" and "lock-right : lock-wrong".
+
+    M-a (§五 量测): `gd_conf_*` slots carry the same splits for the raw GD sigmoid.
+    Only entries with `gd_conf > 0` (entries that ever carried a GD vote) enter those
+    means — a `tsp3d`-only entry writes no GD score and would otherwise dilute the
+    average with zeros. `gd_conf_tp` vs `gd_conf_fp` is the separability read-out the
+    confidence direction needs (a flat pair = GD score cannot rank tp over fp).
+    """
+    if entries is None:
+        entries = infos.get("memory_entries")
+    if isinstance(entries, dict):
+        entries = list(entries.values())
+    entries = list(entries or [])
+    if not entries:
+        return {}
+    try:
+        dilated_mask = cv2.dilate(
+            infos["top_down_map"]["target_bboxes_mask"], np.ones((10, 10))
+        )
+    except Exception:
+        dilated_mask = None
+
+    def _gslot() -> Dict[str, float]:
+        # n = entries, gd_conf_n = entries WITH a GD score, gd_conf = sum over those.
+        return {"n": 0, "tp": 0, "num_obs": 0.0,
+                "gd_conf": 0.0, "gd_conf_n": 0.0}
+
+    out: Dict[str, Any] = {
+        "total": 0, "tp": 0, "by_src": {},
+        "suspicious": {"n": 0, "tp": 0},
+        "gd_conf_tp": _gslot(), "gd_conf_fp": _gslot(),
+    }
+    for entry in entries:
+        try:
+            cxy = np.array(
+                [float(entry.get("x", 0.0)), float(entry.get("y", 0.0))], dtype=np.float64
+            )
+        except Exception:
+            continue
+        is_tp = _point_in_target_bbox(infos, cxy, dilated_mask)
+        out["total"] += 1
+        out["tp"] += int(is_tp)
+        gconf = float(entry.get("gd_conf", 0.0) or 0.0)
+        src = str(entry.get("src") or "tsp3d")
+        slot = out["by_src"].setdefault(src, _gslot())
+        slot["n"] += 1
+        slot["tp"] += int(is_tp)
+        slot["num_obs"] += float(entry.get("num_obs", 0.0))
+        if gconf > 0.0:
+            slot["gd_conf"] += gconf
+            slot["gd_conf_n"] += 1
+        # tp / fp split of the GD score itself (the M-a judgement gate).
+        if gconf > 0.0:
+            grp = out["gd_conf_tp"] if is_tp else out["gd_conf_fp"]
+            grp["n"] += 1
+            grp["gd_conf"] += gconf
+        if entry.get("suspicious"):
+            out["suspicious"]["n"] += 1
+            out["suspicious"]["tp"] += int(is_tp)
+    for slot in out["by_src"].values():
+        slot["num_obs"] /= max(1, slot["n"])
+        slot["gd_conf"] /= max(1.0, slot["gd_conf_n"])
+    for key in ("gd_conf_tp", "gd_conf_fp"):
+        out[key]["gd_conf"] /= max(1.0, out[key]["n"])
+    return out
+
+
 def aggregate_detect_stats(
     infos: Dict[str, Any], detect_logs: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
@@ -222,39 +299,3 @@ def aggregate_detect_stats(
         "tp_flags": tp_flags,
         "admitted": [bool(d.get("admitted", False)) for d in detect_logs],
     }
-
-
-def aggregate_diag_trace(
-    infos: Dict[str, Any], diag_logs: List[Dict[str, Any]]
-) -> Dict[str, Any]:
-    """Label P3 diagnostic traces (below-sigma_tar / geom-gate-dropped detections)
-    against the GT target bbox, per stage.
-
-    ``diag_logs`` entries: {conf, conf_amp, centroid, stage, admitted} where stage
-    is ``below_sigma`` or ``geom_reject`` (populated only when diag_enable=True in
-    the policy). Returns per-stage {n, tp, conf[]} so fn (bed) episodes can be
-    attributed to a threshold miss vs a gate drop.
-    """
-    out = {
-        "below_sigma": {"n": 0, "tp": 0, "conf": []},
-        "geom_reject": {"n": 0, "tp": 0, "conf": []},
-    }
-    if not diag_logs:
-        return out
-    try:
-        dilated_mask = cv2.dilate(
-            infos["top_down_map"]["target_bboxes_mask"], np.ones((10, 10))
-        )
-    except Exception:
-        dilated_mask = None
-    for det in diag_logs:
-        stage = det.get("stage")
-        if stage not in out:
-            continue
-        out[stage]["n"] += 1
-        out[stage]["conf"].append(float(det.get("conf", 0.0)))
-        if dilated_mask is not None and _point_in_target_bbox(
-            infos, det["centroid"][:2], dilated_mask
-        ):
-            out[stage]["tp"] += 1
-    return out

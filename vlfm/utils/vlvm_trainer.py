@@ -154,61 +154,69 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
     _dist("maxscore (fp)", fp_scores)
 
 
-def _print_fn_trace(episode_records: List[Dict[str, Any]]) -> None:
-    """P3 recall-side diagnosis (bed/tv fn): per-fn-episode detection trace.
+def _print_memory_metrics(episode_records: List[Dict[str, Any]]) -> None:
+    """Per-entry tp / fp of the memorized candidates (A4 measurement #2, §3.7.10).
 
-    Distinguishes a *threshold* problem (the true target's detections only appear
-    below sigma_tar) from a *gate* problem (true detections dropped by the
-    geometric/density gate) or a *lock/admission* problem (kept but never admitted
-    to memory). Only populated when diag_enable=True (world + diag run).
+    Splits by proposer tag (`tsp3d` / `gd` / `both`) and reports the suspicious subset,
+    which is the direct input of A2 (lifecycle budget) and A3 (lock-right : lock-wrong).
+
+    M-a (§五 量测): the `gd_conf` column is the mean raw GD sigmoid over the entries of
+    that tag that actually carry a GD score (a `tsp3d`-only entry has none), and the
+    `gd-conf separability` line compares the tp group with the fp group — that gap is
+    the judgement gate of the confidence direction.
     """
-    fn = [
-        r for r in episode_records
-        if r.get("diag_trace") and _cause_short(r.get("failure_cause", "other")) == "fn"
-    ]
-    if not fn:
+    stats = [r["mem_stats"] for r in episode_records if r.get("mem_stats")]
+    if not stats:
         return
-    print("=" * 66)
-    print("=== P3 fn-episode detection trace (recall diagnosis, diag_enable=True) ===")
-    print(f"fn episodes with diag trace: {len(fn)}")
 
-    tot = {"below_sigma": {"n": 0, "tp": 0}, "geom_reject": {"n": 0, "tp": 0}}
-    kept_tot = {"n": 0, "tp": 0, "admit_tp": 0}
-    print(
-        f"{'scene':<12}{'target':<12}{'steps':>6}  "
-        f"{'below_sigma n/tp':>16}{'geom_drop n/tp':>16}{'kept_admit/tp':>16}"
-    )
-    for r in sorted(fn, key=lambda x: os.path.basename(x["scene_id"])):
-        scene = os.path.basename(r["scene_id"]).split(".")[0]
-        d = r.get("diag_trace", {})
-        ds = r.get("detect_stats") or {}
-        bs = d.get("below_sigma", {})
-        gr = d.get("geom_reject", {})
-        tp_flags = ds.get("tp_flags", [])
-        admitted = ds.get("admitted", [])
-        admit_tp = sum(1 for f, a in zip(tp_flags, admitted) if f and a)
-        print(
-            f"{scene:<12}{str(r['target_object']):<12}{r.get('steps_count', 0):>6.0f}  "
-            f"{bs.get('tp', 0):>6}/{bs.get('n', 0):<9}"
-            f"{gr.get('tp', 0):>6}/{gr.get('n', 0):<9}"
-            f"{admit_tp:>6}/{ds.get('tp', 0):<9}"
+    def _gconf_mean(key: str):
+        n = sum(s.get(key, {}).get("n", 0) for s in stats)
+        if not n:
+            return float("nan"), 0
+        v = sum(
+            s.get(key, {}).get("gd_conf", 0.0) * s.get(key, {}).get("n", 0)
+            for s in stats
         )
-        for k in tot:
-            tot[k]["n"] += d.get(k, {}).get("n", 0)
-            tot[k]["tp"] += d.get(k, {}).get("tp", 0)
-        kept_tot["n"] += ds.get("total", 0)
-        kept_tot["tp"] += ds.get("tp", 0)
-        kept_tot["admit_tp"] += admit_tp
+        return v / n, n
+    total = sum(s["total"] for s in stats)
+    tp = sum(s["tp"] for s in stats)
+    print("=" * 66)
+    print("=== Memory-entry metrics (vs GT target bbox) ===")
     print(
-        "totals: "
-        f"below_sigma tp/n = {tot['below_sigma']['tp']}/{tot['below_sigma']['n']} | "
-        f"geom_drop tp/n = {tot['geom_reject']['tp']}/{tot['geom_reject']['n']} | "
-        f"kept (post-gate) tp/n = {kept_tot['tp']}/{kept_tot['n']}, admitted tp = {kept_tot['admit_tp']}"
+        f"entries: {total}  tp={tp} ({tp / max(1, total) * 100:.1f}%)  "
+        f"fp={total - tp}  episodes={len(stats)}"
     )
     print(
-        "read: below_sigma tp>0 -> threshold problem (true det under sigma_tar); "
-        "geom_drop tp>0 -> gate problem; kept tp>0 but admit_tp==0 -> S-penalty/admission "
-        "problem; kept tp==0 -> never detected in view (query/model miss)."
+        f"{'src':<8}{'entries':>9}{'tp':>7}{'fp':>7}{'tp%':>8}"
+        f"{'n_obs':>8}{'gd_conf':>9}"
+    )
+    for src in sorted({k for s in stats for k in s["by_src"]}):
+        n = sum(s["by_src"].get(src, {}).get("n", 0) for s in stats)
+        if n == 0:
+            continue
+        t = sum(s["by_src"].get(src, {}).get("tp", 0) for s in stats)
+        with_n = [s for s in stats if s["by_src"].get(src, {}).get("n", 0) > 0]
+        nobs = np.mean([s["by_src"][src]["num_obs"] for s in with_n])
+        gcn = sum(s["by_src"][src].get("gd_conf_n", 0) for s in with_n)
+        gcs = sum(
+            s["by_src"][src].get("gd_conf", 0.0)
+            * s["by_src"][src].get("gd_conf_n", 0)
+            for s in with_n
+        )
+        gconf = (gcs / gcn) if gcn else float("nan")
+        print(
+            f"{src:<8}{n:>9}{t:>7}{n - t:>7}{t / n * 100:>7.1f}%"
+            f"{nobs:>8.2f}{gconf:>9.2f}"
+        )
+    sus_n = sum(s["suspicious"]["n"] for s in stats)
+    sus_tp = sum(s["suspicious"]["tp"] for s in stats)
+    print(f"suspicious entries: {sus_n}  tp={sus_tp}  fp={sus_n - sus_tp}")
+    tp_mean, tp_gn = _gconf_mean("gd_conf_tp")
+    fp_mean, fp_gn = _gconf_mean("gd_conf_fp")
+    gap = f"{tp_mean - fp_mean:+.3f}" if (tp_gn and fp_gn) else "n/a"
+    print(
+        "gd-conf separability (entries carrying a GD score): "
+        f"tp n={tp_gn} mean={tp_mean:.3f} | fp n={fp_gn} mean={fp_mean:.3f} | gap={gap}"
     )
 
 
@@ -277,7 +285,7 @@ def _print_eval_breakdown(episode_records: List[Dict[str, Any]]) -> None:
     _print_failure_cross_tab(episode_records)
     _print_oracle_subset(episode_records)
     _print_detection_metrics(episode_records)
-    _print_fn_trace(episode_records)
+    _print_memory_metrics(episode_records)
     print("=" * 66)
 
 
@@ -546,7 +554,6 @@ class VLVMTrainer(PPOTrainer):
 
                     from vlfm.utils.episode_stats_logger import (
                         aggregate_detect_stats,
-                        aggregate_diag_trace,
                         compute_oracle_success,
                         log_episode_stats,
                     )
@@ -579,16 +586,20 @@ class VLVMTrainer(PPOTrainer):
                     except Exception:
                         detect_stats = None
 
-                    diag_trace = None
+                    # A4 measurement #2 (§3.7.10): per-entry tp / fp of the final memory.
+                    # Read straight from the policy: it only clears its memory on the next
+                    # `act()`, so the finished episode's entries are still live here.
+                    mem_stats = None
                     try:
-                        diag_logs = (
-                            getattr(self._agent.actor_critic, "_diag_logs", None)
-                            or []
+                        from vlfm.utils.episode_stats_logger import aggregate_memory_stats
+
+                        snapshot_fn = getattr(
+                            self._agent.actor_critic, "_memory_entries_snapshot", None
                         )
-                        if diag_logs:
-                            diag_trace = aggregate_diag_trace(infos[i], diag_logs)
+                        entries = snapshot_fn() if callable(snapshot_fn) else None
+                        mem_stats = aggregate_memory_stats(infos[i], entries) or None
                     except Exception:
-                        diag_trace = None
+                        mem_stats = None
 
                     episode_records.append(
                         {
@@ -600,7 +611,7 @@ class VLVMTrainer(PPOTrainer):
                             "oracle_success": compute_oracle_success(infos[i]),
                             "failure_cause": failure_cause,
                             "detect_stats": detect_stats,
-                            "diag_trace": diag_trace,
+                            "mem_stats": mem_stats,
                             "spl": float(episode_stats.get("spl", 0.0)),
                             "soft_spl": float(episode_stats.get("soft_spl", 0.0)),
                             "steps_count": float(

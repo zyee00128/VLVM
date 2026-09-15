@@ -32,48 +32,57 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 set -o pipefail
 
 # ----------------- 输出目录与数据集 -----------------
-OUT_DIR="$PROJECT_ROOT/outputs/VLVM-V7.1"
+OUT_DIR="$PROJECT_ROOT/outputs/VLVM-V7.2"
 mkdir -p "$OUT_DIR"
-# 三场景（方向在多场景复评时用）：SCENES="[TEEsavR23oF, mv2HUxq3B53, wcojb4TFT35]"
+# 单场景（5cdE 单场景调参基线）—— A4 对照批必须用它：
 SCENES="[5cdEh9F2hJL]"
-
-export TSP3D_DATA_PATH=${TSP3D_DATA_PATH:-/root/autodl-tmp/vlvm/data/tsp3d_models/}
-TSP3D_PORT=${TSP3D_PORT:-12186}
+# 三场景：
+# SCENES="[TEEsavR23oF, mv2HUxq3B53, wcojb4TFT35]"
 
 # ----------------- 实验定义 -----------------
+#
+# 定稿（2026-09-15，代码已清理）：occ 门 + density 门 + GD 辅助机制（`gdp_enable=True` / `gdp_every_n=5`）
+#   ① geometric admission module —— enable_occ_consistency + enable_density_gate
+#   ② GD auxiliary mechanism     —— 独立提议源 + 两票制（gdp_* / 默认 on / every_n=5）
 
-# 格式: 标签 | 参数覆盖（多个 hydra 键=值，空格分隔）
-#
-# =====================================================================
-# VLVM-V7.1 前置对比实验（2026-09-08，本机；V7 最终组合档 g_m8_d1 /
-# g_m8_d1_pitch 在另一台服务器跑，勿在本机重跑）
-#
-# P0 · 采样确定性化已落地（代码，非档位）：
-#   - policy 每 env 步 np.random.seed(det_seed + 单调计数)（覆盖发送端 cap 与
-#     density cluster 子采样）；det_seed 默认 0。
-#   - TSP3D 服务端每次 predict 前 torch.manual_seed(TSP3D_SEED + 查询计数)，
-#     TSP3D_SEED 默认 0（覆盖 forward_test 内 CBA/keep 的 torch.randperm）。
-#   ⚠️ 运行前必须重启 VLM 服务加载新代码：bash scripts/launch_vlm_servers.sh
-#   （否则服务端旧代码无 torch seed / conf_floor，双跑不可能 bit-stable）。
-#
-# 档位说明：
-#   - p0_rep_A / p0_rep_B：纯 world 定稿，两次完全相同 -> 验证 det 总数/SR
-#     bit-stable（det 级随机源全固定后应复现）。
-#   - p0_diag：world + diag_enable=True（服务端 conf_floor=0.30）——P3 bed-fn
-#     前置诊断（记录低于 sigma_tar / geom gate 丢弃的真检测），末尾打印 fn 集
-#     detection trace；行为与 base 等价（客户端仍按 sigma_tar 过滤），可兼作
-#     diag 无副作用校验。
-#   - p0_gm8d1：occ 门 + density①（多视角 20°）确定性重跑 —— 保留机制在
-#     确定性 cap 下的再锚定（对照 V7 g_m8_d1，预期 ~45±1）。
-# 锚点（99 集纯 world，5cdEh9F2hJL，cap 确定性化前）：world 44 / g_m8 45 /
-# density①(v1_view) 44 / pitch 45。
-# =====================================================================
-EXPERIMENTS=(
-    "p0_rep_A|habitat_baselines.rl.policy.fusion_style=world habitat_baselines.rl.policy.det_seed=0"
-    "p0_rep_B|habitat_baselines.rl.policy.fusion_style=world habitat_baselines.rl.policy.det_seed=0"
-    "p0_diag|habitat_baselines.rl.policy.fusion_style=world habitat_baselines.rl.policy.det_seed=0 habitat_baselines.rl.policy.diag_enable=True habitat_baselines.rl.policy.diag_conf_floor=0.30"
-    "p0_gm8d1|habitat_baselines.rl.policy.fusion_style=world habitat_baselines.rl.policy.enable_occ_consistency=True habitat_baselines.rl.policy.enable_density_gate=True habitat_baselines.rl.policy.density_min_view_span_deg=20.0"
-)
+Stage2_1="habitat_baselines.rl.policy.fusion_style=world habitat_baselines.rl.policy.det_seed=0 habitat_baselines.rl.policy.enable_occ_consistency=True habitat_baselines.rl.policy.enable_density_gate=True"
+EXPERIMENTS=()
+
+# ============================================================================
+# A3 批（2026-09-14，已跑完）—— 提议侧旋钮
+# ----------------------------------------------------------------------------
+# 结果：cap 43（−7.08）/ thr3 47（−3.04）/ thr5 49（−1.02）vs 对照 n5 50；mb1 待读。
+# ⇒ 提议侧不列入收益项（详见 results/VLVM-V8.md §3.14 与 `### 启示`）。
+# 注：档位中的 `gdp_indep_enable`（A4）/ `gdp_neg_enable`（R2）开关已随代码删除，
+#     故本批整段停用，仅留作历史记录。
+# ============================================================================
+# GDP_N5="habitat_baselines.rl.policy.gdp_every_n=5"
+# EXPERIMENTS+=(
+#     "V73_a3_cap|$Stage2_1 $GDP_N5 habitat_baselines.rl.policy.gdp_caption_style=target"
+#     "V73_a3_thr3|$Stage2_1 $GDP_N5 habitat_baselines.rl.policy.gdp_box_thr=0.3"
+#     "V73_a3_thr5|$Stage2_1 $GDP_N5 habitat_baselines.rl.policy.gdp_box_thr=0.5"
+#     "V73_a3_mb1|$Stage2_1 $GDP_N5 habitat_baselines.rl.policy.gdp_max_boxes=1"
+# )
+
+# ============================================================================
+# 待排（方向 2；由用户手动开启）
+# ----------------------------------------------------------------------------
+# D2-5 R0 三态票型记账（量测，零 GPU）→ D2-8（GD 类别白名单，排除 couch）→
+#   D2-1 + D2-2 + D2-6（单票停止前双确认 / 选点排序 / 确认窗口，同批）→ D2-4（`g_self` 量测后）
+# ============================================================================
+# EXPERIMENTS+=(
+#     "V73_d2_8|$Stage2_1"          # 待实现开关后排档
+# )
+# ============================================================================
+# A4 证据独立性批（2026-09-14；机制已删除，仅留历史记录）
+# ----------------------------------------------------------------------------
+# A4-0 = 影子计数（行为零改动）；A4-1 = 门槛生效（gdp_indep_enable=True）。
+# 结论：n1 +3 SR / +5 Oracle；n5 零效应 ⇒ 已收缩，代码随本轮清理删除。
+# ============================================================================
+# EXPERIMENTS+=(
+#     "V73_a4_n1|$Stage2_1 habitat_baselines.rl.policy.gdp_every_n=1"
+#     "V73_a4_n5|$Stage2_1 habitat_baselines.rl.policy.gdp_every_n=5"
+# )
 
 # ----------------- 运行 -----------------
 for exp in "${EXPERIMENTS[@]}"; do

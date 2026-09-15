@@ -68,6 +68,7 @@ def apply_s_penalty(
     out_log: Optional[List[Dict[str, Any]]] = None,
     per_det_meta: Optional[List[Any]] = None,
     meta_out: Optional[List[Any]] = None,
+
 ) -> List[Tuple[float, np.ndarray, Optional[np.ndarray], List[str]]]:
     """S-penalty + admission gate for filtered detections.
 
@@ -77,7 +78,7 @@ def apply_s_penalty(
     detection-level diagnostics: {conf, conf_amp, centroid, s, admitted}.
 
     ``per_det_meta`` is copied item-by-item into ``meta_out`` 
-    for each ADMITTED detection (V7 geometric-gate hook).
+    for each ADMITTED detection.
     """
     import torch  # local import keeps the module torch-free at import time
 

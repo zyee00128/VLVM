@@ -2,6 +2,9 @@
 data/
 ft_datasets/
 
+# 模型代码
+GroundingDINO/
+
 # 微调代码
 ft_pipeline/
 
