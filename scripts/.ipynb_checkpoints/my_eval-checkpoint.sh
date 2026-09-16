@@ -48,6 +48,8 @@ SCENES="[5cdEh9F2hJL]"
 # 本轮全部实验（共 6 档）分两组、两机并行（每档 ~4 h；依据 §优化方向 3）：
 #   用法：服务器 1  `BATCH=A bash scripts/my_eval.sh`
 #         服务器 2  `BATCH=B bash scripts/my_eval.sh`
+#   ※ 新增的 3-4 / 3-5 / 3-9 属"无法用前置判据确定是否使用"的机制（影子只能证明
+#     作用面，判不了方向）⇒ 直接排 A/B 档；代码已实现（d2_fill_only / d2_geo_lock / d2_stop_gate）。
 #
 # 【A 组 · 服务器 1】
 #   a1) d2_scan     scan 复跑（Oracle 通路，最高优先）：V5 `ws_scan_gap90` 曾 +4.04pp @

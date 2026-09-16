@@ -74,7 +74,6 @@ habitat_baselines:
       init_turn_steps: 12
       min_depth: 0.5
       max_depth: 5.0
-
       pointnav_stop_radius: 0.90 # 0.90
       # Anti-hallucination fallback
       enable_fb: True
@@ -114,8 +113,17 @@ habitat_baselines:
       near_field_sigma_scale: 0.8
       # TSP3D Input Processing
       use_vlfm_nlp: False
-      fusion_style: world # world-frame incremental fusion (the final route)
+      fusion_style: world # Fusion route: "camera" / "world" / "panoramic" / "none" / world+scan (enable_scan)
+      enable_scan: False
+      frontier_trigger: True
+      scan_min_gap: 90 
+      scan_opportunistic_after: 60
+      pcd_window_size: 8
+      fuse_voxel_size: 0.02
       fuse_max_points: 200000
+      cam_radius: null
+      cam_min_view_disp: 0.15
+      cam_min_view_yaw: 15.0
       wm_max_frames: 8
       wm_voxel_size: 0.02
       wm_max_voxels: 400000
@@ -124,6 +132,12 @@ habitat_baselines:
       wm_min_view_yaw: 15.0
       wm_near_refresh_radius: 3.0
       wm_near_refresh_value: True
+      panoramic_turn_steps: 6
+      panoramic_voxel_size: 0.02
+      panoramic_max_points: 200000
+      panoramic_radius: 6.0
+      panoramic_min_move: 2.0
+      panoramic_arrive_dist: 1.0
       cap_style: random # point cap - "random" (baseline) / "near_first"
       det_seed: 0 # per-step numpy reseed base (same config -> bit-stable double-run)
       distance_sample: True
@@ -132,17 +146,11 @@ habitat_baselines:
       near_voxel: 0.01
       mid_voxel: 0.02
       far_voxel: 0.05
-
-      merge_dist_thresh: 0.5
-      ema_weight_old: 0.8
       # S-penalty
       enable_s_penalty: True
       s_penalty_thresh: 0.15
       s_penalty_floor: 0.3
       s_penalty_radius_m: 0.5
-      # near-surface point
-      s_penalty_use_surface: True
-      goal_use_surface: True
       # geometric admission module (occ-consistency + density gates)
       enable_occ_consistency: True
       occ_min_voxels: 8
@@ -153,20 +161,42 @@ habitat_baselines:
       density_min_frames: 2
       density_cluster_merge_dist: 0.5
       density_min_view_span_deg: 20.0
-
-
-      # new GD auxiliary mechanism: independent proposer + vote (final: ON, every_n=5)
+      # target-memory lifecycle
+      merge_dist_thresh: 0.5
+      ema_weight_old: 0.8
+      # near-surface point
+      s_penalty_use_surface: True
+      goal_use_surface: True
+      # new GD auxiliary mechanism: independent proposer + vote
       gdp_enable: True
       gdp_port: 12181
       gdp_caption_style: vocab
       gdp_box_thr: 0.4
-      gdp_max_boxes: 2
+      gdp_max_boxes: 1
       gdp_weak_guard: True
       gdp_merge_dist: 0.5
       gdp_merge_iau: 0.3
       gdp_every_n: 5
       lock_min_obs: 2
 
+
+      # direction-2 mechanisms (§优化方向 2; 默认全关，实验档显式打开；R0 记账恒开)
+      # D2-1 / D2-6（停止闸）、D2-3（`both` 软加权）、D2-4（单票自洽硬门）已判负删除（2026-09-16）
+      d2_pick_src_first: False     # D2-2 同距离带内票型优先（both > gd > tsp3d，2026-09-16 修正序）
+      d2_pick_src_band: 0.5        # D2-2 距离带宽度（m）
+      d2_gd_skip_classes: ""       # D2-8 GD 类别白名单（这些目标类不跑 GD）
+
+      # 方向 3 机制（§优化方向 3；无法用前置判据确定 ⇒ 直接排档 A/B；默认全关）
+      d2_fill_only: False          # 3-4 帧级补框：仅无 TSP3D 候选的帧可新建 GD 条目
+      d2_geo_lock: False           # 3-5 几何独立票锁门：gd 条目解锁需独立票 >= d2_geo_min
+      d2_geo_min: 2                # 3-5 独立票阈值
+      d2_stop_gate: False          # 3-9 停止闸 v2（类条件 + 二次证据 + 窗口释放）
+      d2_stop_gate_src: "tsp3d"    # 3-9 被拦票型源
+      d2_stop_gate_classes: "couch|toilet"  # 3-9 作用目标类（空 = 全类）
+      d2_stop_gate_nobs: 1         # 3-9 仅拦 num_obs <= 此值
+      d2_stop_gate_win: 30         # 3-9 拦停窗口（步）
+      d2_stop_gate_release: "explore"  # 3-9 窗口到期释放：explore（丢条目回落）/ stop（强制放行）
+      d2_lock_exempt: False        # 3-9 配套：navigate 下 nav goal 条目豁免 near_miss 预算
 
     ppo:
       clip_param: 0.2

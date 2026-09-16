@@ -1,5 +1,5 @@
 """Sampling helpers: world voxelization, distance-adaptive sampling, unified point cap."""
-from typing import Optional, Tuple
+from typing import Tuple
 import numpy as np
 
 

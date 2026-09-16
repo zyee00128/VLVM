@@ -1,16 +1,13 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
-from typing import Any, Tuple, Union, Optional
+from typing import Optional
 
 import cv2
 import numpy as np
 from scipy import ndimage
 
-from frontier_exploration.frontier_detection import detect_frontier_waypoints
-from frontier_exploration.utils.fog_of_war import reveal_fog_of_war
-
 from vlfm.mapping.base_map import BaseMap
-from vlfm.utils.geometry_utils import extract_yaw, get_point_cloud, transform_points
+from vlfm.utils.geometry_utils import get_point_cloud, transform_points
 from vlfm.utils.img_utils import fill_small_holes
 
 class _BaseObstacleMap3D(BaseMap):

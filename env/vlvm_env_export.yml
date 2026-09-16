@@ -1,3 +1,15 @@
+# =============================================================================
+# VLVM 全量环境快照（conda env export -n vlfm --no-builds，2026-09-16 实机导出）
+# -----------------------------------------------------------------------------
+# 用法  : conda env create -f vlvm_env_export.yml -n vlfm
+#         （文件内 name: vlvm 仅作标记；-n 会覆盖为目标环境名，代码按 env `vlfm` 调用）
+# Python: 3.9.25   |   torch 1.12.1+cu113   |   transformers 4.26.0
+# 注意  : 本文件只含**已安装包及其版本**（--no-builds），不含本地 editable 源码；
+#         habitat-lab / habitat-baselines / frontier_exploration / depth_camera_filtering /
+#         vlfm / GroundingDINO 六个 editable 包需另行按 vlvm环境配置指南.md §2 建立，
+#         或直接运行 vlvm_setup_env.sh 完成重定向。
+# 差异  : 与旧版快照的关键修正见 vlvm_env_audit.md
+# =============================================================================
 name: vlvm
 channels:
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
@@ -6,36 +18,36 @@ channels:
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch/
   - defaults
 dependencies:
-  - _libgcc_mutex=0.1=main
-  - _openmp_mutex=5.1=52_gnu
-  - bzip2=1.0.8=h5eee18b_6
-  - ca-certificates=2026.7.16=h06a4308_0
-  - expat=2.8.2=h7354ed3_1
-  - ld_impl_linux-64=2.44=h9e0c5a2_3
-  - libexpat=2.8.2=h7354ed3_1
-  - libffi=3.4.8=h06d3fd0_3
-  - libgcc=15.2.0=h69a1729_8
-  - libgcc-ng=15.2.0=h166f726_8
-  - libnsl=2.0.0=h5eee18b_0
-  - libstdcxx=15.2.0=h39759b7_8
-  - libuuid=1.41.5=h5eee18b_0
-  - libxcb=1.17.0=h9b100fa_0
-  - libzlib=1.3.2=h47b2149_0
-  - ncurses=6.5=h7934f7d_0
-  - openssl=3.5.7=h1b28b03_0
-  - pip=26.0.1=pyhc872135_1
-  - pthread-stubs=0.3=h47b2149_2
-  - python=3.9.25=h0dcde21_1
-  - readline=8.3=hc2a1206_0
-  - sqlite=3.53.2=h795bf6d_0
-  - tk=8.6.15=h54e0aa7_0
-  - wheel=0.45.1=py39h06a4308_0
-  - xorg-libx11=1.8.12=h9b100fa_1
-  - xorg-libxau=1.0.12=h9b100fa_0
-  - xorg-libxdmcp=1.1.5=h9b100fa_0
-  - xorg-xorgproto=2024.1=h47b2149_2
-  - xz=5.8.2=h448239c_0
-  - zlib=1.3.2=h47b2149_0
+  - _libgcc_mutex=0.1
+  - _openmp_mutex=5.1
+  - bzip2=1.0.8
+  - ca-certificates=2026.7.16
+  - expat=2.8.2
+  - ld_impl_linux-64=2.44
+  - libexpat=2.8.2
+  - libffi=3.4.8
+  - libgcc=15.2.0
+  - libgcc-ng=15.2.0
+  - libnsl=2.0.0
+  - libstdcxx=15.2.0
+  - libuuid=1.41.5
+  - libxcb=1.17.0
+  - libzlib=1.3.2
+  - ncurses=6.5
+  - openssl=3.5.7
+  - pip=26.0.1
+  - pthread-stubs=0.3
+  - python=3.9.25
+  - readline=8.3
+  - sqlite=3.53.2
+  - tk=8.6.15
+  - wheel=0.45.1
+  - xorg-libx11=1.8.12
+  - xorg-libxau=1.0.12
+  - xorg-libxdmcp=1.1.5
+  - xorg-xorgproto=2024.1
+  - xz=5.8.2
+  - zlib=1.3.2
   - pip:
       - absl-py==2.3.1
       - addict==2.4.0
@@ -198,6 +210,7 @@ dependencies:
       - protobuf==3.20.1
       - ptyprocess==0.7.0
       - pure-eval==0.2.3
+      - py-spy==0.4.2
       - pyarrow==21.0.0
       - pyasn1==0.6.4
       - pyasn1-modules==0.4.2
@@ -237,7 +250,7 @@ dependencies:
       - scipy==1.13.1
       - seaborn==0.13.2
       - sentencepiece==0.2.2
-      - setuptools==67.6.1
+      - setuptools==82.0.1
       - shapely==2.0.7
       - shellingham==1.5.4
       - simplejson==4.1.1
@@ -272,7 +285,7 @@ dependencies:
       - tornado==6.5.7
       - tqdm==4.70.0
       - traitlets==5.15.1
-      - transformers==4.57.6
+      - transformers==4.26.0
       - trimesh==4.12.2
       - typer==0.4.2
       - typer-slim==0.23.2

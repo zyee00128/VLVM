@@ -3,15 +3,11 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
-from vlfm.vlm.detections import ObjectDetections
 from .server_wrapper import (
     ServerMixin,
-    bool_arr_to_str,
     host_model,
     ndarray_to_str,
     send_request,
-    str_to_bool_arr,
-    str_to_image,
     str_to_ndarray,
 )
 
@@ -162,7 +158,7 @@ class TSP3D:
                             "confidence": conf
                         })
             else:
-                print(f"[TSP3D Server] NMS returned empty (no box passed score_thr)")
+                print("[TSP3D Server] NMS returned empty (no box passed score_thr)")
         else:
             print(f"[TSP3D Server] bbox_results empty (all voxels likely pruned)! sigma_sce={sigma_sce}, text='{processed_text}'")
                         

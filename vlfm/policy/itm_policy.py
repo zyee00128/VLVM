@@ -189,7 +189,8 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
             in self._observations_cache["object_map_rgbd"]
         ]
         self._observations_cache["shared_pcds"] = shared_pcds
-        self._update_value_map()
+        if not getattr(self, "_scan_in_progress", False):
+            self._update_value_map()
         return super().act(observations, rnn_hidden_states, prev_actions, masks, deterministic)
 
     def _get_policy_info(self, detections: ObjectDetections) -> Dict[str, Any]:
@@ -259,8 +260,7 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
 
         os.environ["DEBUG_INFO"] = ""
         # If there is a last point pursued, then we consider sticking to pursuing it
-        # if it is still in the list of frontiers and its current value is not much
-        # worse than self._last_value.
+        # if it is still in the list of frontiers and its current value is not much worse than self._last_value.
         if not np.array_equal(self._last_frontier, np.zeros(2)):
             curr_index = None
 
@@ -280,14 +280,14 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
             if curr_index is not None:
                 curr_value = sorted_values[curr_index]
                 if curr_value + 0.01 > self._last_value:
-                    # The last point pursued is still in the list of frontiers and its
-                    # value is not much worse than self._last_value
+                    # The last point pursued is still in the list of frontiers 
+                    # and its value is not much worse than self._last_value
                     print("Sticking to last point.")
                     os.environ["DEBUG_INFO"] += "Sticking to last point. "
                     best_frontier_idx = curr_index
 
-        # If there is no last point pursued, then just take the best point, given that
-        # it is not cyclic.
+        # If there is no last point pursued, then just take the best point, 
+        # given that it is not cyclic.
         if best_frontier_idx is None:
             for idx, frontier in enumerate(sorted_pts):
                 cyclic = self._acyclic_enforcer.check_cyclic(robot_xy, frontier, top_two_values)
@@ -387,9 +387,10 @@ class ITMPolicyV1(BaseITMPolicy):
 
 
 class ITMPolicyV2(BaseITMPolicy):
-    """Route 2 (surface style): lands scores from 3D surface points into 2D (x, y)
-    buckets (S: confidence-gated max, consistent with VLFM) + height-axis
-    semantic value (H1)."""
+    """
+    Route 2 (surface style): lands scores from 3D surface points 
+    into 2D (x, y) buckets (S: confidence-gated max, consistent with VLFM) + height-axis semantic value (H1).
+    """
 
     _min_valid_conf: float = 1e-4   # Per-point confidence floor (same as itm3d min_valid_conf)
 

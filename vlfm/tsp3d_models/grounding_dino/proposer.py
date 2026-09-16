@@ -72,10 +72,6 @@ class GdProposer:
                 self.stats.bump("below_thr")
                 continue
             match = match_phrase(phrases[i] if i < len(phrases) else "", target_classes, self.alias_map)
-            # A4 measurement #6: count EVERY above-threshold box's phrase, including the ones
-            # the strict single-class rule rejects (that is exactly the multi-class share).
-            _phr = str(phrases[i]) if i < len(phrases) else ""
-            self.stats.bump_phrase(_phr, int(match.n_named), bool(match.is_target), not _phr.strip())
             if not match.is_target:          # strict single-class rule (T1/T2)
                 self.stats.bump("other_class")
                 continue
@@ -147,9 +143,4 @@ class GdProposer:
             "boxes_above_thr": s.boxes_above_thr,
             "proposals": s.proposals,
             "rejects": dict(s.rejects),
-            # A4 measurement #6 (§3.7.10): phrase shape of the above-threshold boxes.
-            "phrases": s.top_phrases(20),
-            "multi_named": s.multi_named,
-            "empty_phrase": s.empty_phrase,
-            "target_hit": s.target_hit,
         }
