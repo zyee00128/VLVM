@@ -4,7 +4,7 @@ ft_datasets/
 
 # 模型代码
 GroundingDINO/
-env/vlvm_env_audit.md
+vlvm_env_audit.md
 
 # 微调代码
 ft_pipeline/
