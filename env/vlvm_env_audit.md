@@ -1,7 +1,7 @@
 # VLVM 环境文件差异审计（2026-09-16）
 
 > **背景**：`env/` 下原有三份文件（`vlvm环境配置指南.md` / `vlvm_env_export.yml` / `vlvm_requirements.txt`）源自
-> 早期（约 2026-08 中）状态。本次以实机（conda env `vlfm`）逐项核对，记录**过期项与修正依据**，
+> 早期（约 2026-08 中）状态。本次以实机（conda env `vlfm`，**2026-09-16 用户定名统一为 `vlvm`**）逐项核对，记录**过期项与修正依据**，
 > 并说明新增文件的作用。旧版原件保留于 `env/.bak_20260916/`。
 
 ---
@@ -10,7 +10,7 @@
 
 | 项 | 实测值 |
 |---|---|
-| 环境 | conda `vlfm`，`/root/miniconda3/envs/vlfm`，Python 3.9.25 |
+| 环境 | conda `vlfm`（待迁移为 `vlvm`），`/root/miniconda3/envs/vlfm`，Python 3.9.25 |
 | 硬件 | RTX 3090 24 GB，驱动 570.124.04（CUDA 12.8），工具链 nvcc 11.8.89 / gcc 11.3.0 |
 | 核心 | torch 1.12.1+cu113、torchvision 0.13.1+cu113、numpy 1.26.4、transformers 4.26.0、timm 0.4.12 |
 | 三维算子 | MinkowskiEngine 0.5.4、mmcv 2.1.0、mmdet 3.2.0、mmdet3d 1.4.0、mmengine 0.10.4 |
@@ -25,11 +25,11 @@
 
 | 文件/位置 | 旧内容 | 实际 | 修正 |
 |---|---|---|---|
-| 指南 §1.1 | `conda create -n vlvm` | 运行时环境名 **`vlfm`** | 全部改为 `vlfm` |
-| `vlvm_env_export.yml` | `name: vlvm` | 同上 | 文件头加注：`name: vlvm` 仅标记，实际用 `-n vlfm` |
-| 依据 | — | `scripts/my_eval.sh`：`CONDA_ENV_NAME="vlfm"`；`conda env list` 只有 `base` / `vlfm` | — |
+| 指南 §1.1 | `conda create -n vlvm` | 运行时环境名 **`vlfm`** | **2026-09-16 用户定：环境名统一为 `vlvm`**；脚本改为优先 `vlvm`、自动回退 `vlfm`；迁移步骤见指南附录 C |
+| `vlvm_env_export.yml` | `name: vlvm` | 同上 | `name:` 与 `-n vlvm` 一致（定名后无需再注） |
+| 依据 | — | `conda env list` 只有 `base` / `vlfm`（实机环境尚未改名） | — |
 
-> 影响：按旧指南建出的 `vlvm` 环境不会被执行脚本识别，评测脚本会 `conda activate vlfm` 失败或落到错误环境。
+> 影响：旧指南建 `vlvm`、实机跑 `vlfm` ⇒ 两套命名并存。现脚本两种名字都能识别（`CONDA_ENV_NAME` 可覆盖）。
 
 ### 2. 子模块路径过期（高危）
 
@@ -99,6 +99,7 @@
 | `python -m vlfm.utils.generate_dummy_policy` | 指南沿用 | 该脚本已于 2026-09-15 删除 → 改为"从备份拷贝 `data/dummy_policy.pth`" |
 | `psutil` | 清单内 | **实机未安装**；代码 try/except 导入，标注为可选 |
 | `seaborn` 依赖 | 旧 pyproject 声明 | 代码零引用（属旧 yolov7 链路），不列入 |
+| 环境名口径（09-16 补） | 指南写 `vlvm`、实机 `vlfm` | **统一为 `vlvm`**；脚本优先 `vlvm` + 回退 `vlfm`；迁移见指南附录 C |
 | 微调链路 | 未提 | 2026-09-15 已从仓库删除（`ft_pipeline` / `ft_tsp3d.sh`），环境侧无额外依赖 |
 | 模型配置口径 | 未提 | 新增说明：TSP3D 主权重由 `TSP3D_CHECKPOINT` 指定（现档 `tsp3d_scanrefer.pth`）；GD 为辅助提议源（`gdp_enable` / `every_n=5` / `max_boxes=1`），不改主模型地位 |
 

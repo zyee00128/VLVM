@@ -1,16 +1,15 @@
 # Copyright [2023] Boston Dynamics AI Institute, Inc.
 # [Update 2026] VLVM —— 3D Native 重构版的最小打包配置。
-#
-# 为什么需要这个文件：
-#   仓库在 2026-09 的清理中丢失了打包配置，导致 `pip install -e .` 直接报
-#   "does not appear to be a Python project"。本机当前靠历史遗留的 easy-install
-#   路径条目运行（未列入 requirements），新机必须能重新安装，故补回。
+#   运行环境：conda env `vlvm`（旧名 `vlfm` 过渡期兼容）。
 #
 # 设计取舍：
 #   1) 不声明 dependencies —— 依赖版本由 env/vlvm_requirements.txt 与
 #      env/vlvm_env_export.yml 统一管理，避免 pip 解析时升级已锁死的包
 #      （例如把 transformers 从 4.26.0 拉高而破坏 BLIP-2）。
-#   2) packages.find.where = ["vlfm"] —— 与原 VLFM 一致：包根即 vlfm/，
+#   2) 发行名与包名保持 `vlfm`，不随环境名改动：import 名 `vlfm` 被全部代码
+#      （`import vlfm...` 共百余处）与全部启动命令（`python -m vlfm.run` /
+#      `python -m vlfm.vlm.tsp3d` 等）固定引用，改名无收益且必致不一致。
+#   3) packages.find.where = ["vlfm"] —— 与原 VLFM 一致：包根即 vlfm/，
 #      故 `import vlfm` → <repo>/vlfm/__init__.py。
 
 [build-system]

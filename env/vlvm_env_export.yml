@@ -1,8 +1,8 @@
 # =============================================================================
 # VLVM 全量环境快照（conda env export -n vlfm --no-builds，2026-09-16 实机导出）
 # -----------------------------------------------------------------------------
-# 用法  : conda env create -f vlvm_env_export.yml -n vlfm
-#         （文件内 name: vlvm 仅作标记；-n 会覆盖为目标环境名，代码按 env `vlfm` 调用）
+# 用法  : conda env create -f vlvm_env_export.yml -n vlvm
+#         （文件内已写 name: vlvm；脚本按 env `vlvm` 调用，旧名 `vlfm` 亦可）
 # Python: 3.9.25   |   torch 1.12.1+cu113   |   transformers 4.26.0
 # 注意  : 本文件只含**已安装包及其版本**（--no-builds），不含本地 editable 源码；
 #         habitat-lab / habitat-baselines / frontier_exploration / depth_camera_filtering /
@@ -307,4 +307,3 @@ dependencies:
       - yacs==0.1.8
       - yapf==0.43.0
       - zipp==3.23.1
-prefix: /root/miniconda3/envs/vlfm

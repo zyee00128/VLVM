@@ -17,7 +17,7 @@
 | 机器 | AutoDL 实例，**RTX 3090 (24 GB)** ×1 | 驱动 570.124.04 / CUDA 12.8 |
 | 系统工具链 | gcc 11.3.0、Ubuntu 22.04 | MinkowskiEngine 编译用 |
 | 工具链 CUDA | `/usr/local/cuda-11.8`（nvcc 11.8.89） | 编译用 `TORCH_CUDA_ARCH_LIST=8.6` |
-| conda 环境 | **`vlfm`**（`/root/miniconda3/envs/vlfm`） | ⚠️ 环境名是 `vlfm` 不是 `vlvm`，脚本与文档均按 `vlfm` 调用 |
+| conda 环境 | **`vlvm`**（`/root/miniconda3/envs/vlvm`） | 过渡期兼容旧名 `vlfm`：同名环境不存在时脚本自动回退 |
 | Python | 3.9.25 | |
 | torch / torchvision | 1.12.1+cu113 / 0.13.1+cu113 | 锁死 |
 | transformers | **4.26.0** | 锁死，>4.26.0 破坏 BLIP-2 |
@@ -41,11 +41,12 @@
 ## 1.1 创建 conda 环境
 
 ```bash
-conda create -n vlfm python=3.9 -y
-conda activate vlfm
+conda create -n vlvm python=3.9 -y
+conda activate vlvm
 ```
 
-> 环境名必须是 `vlfm`：`scripts/my_eval.sh` 中 `CONDA_ENV_NAME="vlfm"` 写死。
+> 环境名 `vlvm`。`scripts/my_eval.sh` / `env/vlvm_setup_env.sh` 优先激活 `vlvm`，
+> 同名环境不存在时自动回退旧名 `vlfm`（过渡期兼容）；显式指定用 `CONDA_ENV_NAME=xxx`。
 
 ## 1.2 安装 PyTorch（CUDA 11.3 构建）
 
@@ -283,9 +284,9 @@ bash scripts/my_eval.sh                # BATCH=A / BATCH=B 分机组评测
 | `Could not import lavis` / BLIP-2 服务起不来 | transformers 被升级 | 退回 4.26.0 |
 | 客户端 `Connection refused` | VLM 服务未起或端口不符 | §3.3 |
 | 渲染报 EGL / DISPLAY 错误 | 未设 headless 变量 | §3.3 |
-| Pylance 报 `cv2` / `numpy` / `torch` 无法解析 | 编辑器解释器未选 `vlfm` env | 选 `/root/miniconda3/envs/vlfm/bin/python`，非代码问题 |
+| Pylance 报 `cv2` / `numpy` / `torch` 无法解析 | 编辑器解释器未选 `vlvm` env | 选 `/root/miniconda3/envs/vlvm/bin/python`，非代码问题 |
 | 显存不足 / 抢卡 | 单卡需约 17 GB（3 服务 + 评测） | `nvidia-smi` 确认并停掉多余进程 |
-| conda 环境名不一致报错 | 误用 `vlvm` | 统一用 `vlfm`（§1.1） |
+| conda 环境名报错 | 环境名写错 | 统一用 `vlvm`（§1.1） |
 
 ---
 
@@ -294,10 +295,10 @@ bash scripts/my_eval.sh                # BATCH=A / BATCH=B 分机组评测
 若持有整环境快照包（tar.gz）：
 
 ```bash
-mkdir -p /root/miniconda3/envs/vlfm
-tar -xzf <snapshot>.tar.gz -C /root/miniconda3/envs/vlfm
-/root/miniconda3/envs/vlfm/bin/conda-unpack        # 重写前缀
-source /root/miniconda3/etc/profile.d/conda.sh && conda activate vlfm
+mkdir -p /root/miniconda3/envs/vlvm
+tar -xzf <snapshot>.tar.gz -C /root/miniconda3/envs/vlvm
+/root/miniconda3/envs/vlvm/bin/conda-unpack        # 重写前缀
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate vlvm
 bash $VLVM/env/vlvm_setup_env.sh                   # 重定向 6 个 editable 包 + 校验
 ```
 
@@ -308,8 +309,28 @@ bash $VLVM/env/vlvm_setup_env.sh                   # 重定向 6 个 editable �
 
 | 项 | 旧版 | 现版 | 依据 |
 |---|---|---|---|
-| conda 环境名 | `vlvm` | **`vlfm`** | `scripts/my_eval.sh` 实机生效值 |
+| conda 环境名 | `vlvm`（文档） | **`vlfm`**（实机） | **2026-09-16 用户定：统一为 `vlvm`**；过渡期脚本自动回退 `vlfm`，迁移步骤见本附录 C |
 | 子模块路径 | `$VLVM/habitat-lab` 等 | **`$DEPS = /root/autodl-tmp/vlfm`** | `python -c "import habitat"` 实机解析 |
 | transformers | 正文 4.26.0，快照 4.57.6 | **4.26.0**（锁定） | 实机 `pip freeze` |
 | 快照文件 | 含 `/root/autodl-tmp/vlfm` 路径条目与 `mobile-sam` | 重新导出（无路径条目） | `conda env export --no-builds` |
 | 新增 | — | `vlvm_setup_env.sh` / `vlvm_env_audit.md` | 本次整理 |
+
+# 附录 C：环境名迁移（`vlfm` → `vlvm`）
+
+用户定名：**以后统一用 `vlvm`**。脚本已改成「优先 `vlvm`、不存在则回退 `vlfm`」，
+故迁移前后都能直接跑；正式迁移在**实验与服务停止后**执行：
+
+```bash
+# 0) 停掉评测与三个 VLM 服务（环境目录被占用时无法安全删除）
+pip install conda-pack
+conda pack -n vlfm -o /root/autodl-tmp/vlfm_env_$(date +%Y%m%d).tar.gz   # ① 整环境打包
+conda env remove -n vlfm -y                                             # ② 释放空间
+mkdir -p /root/miniconda3/envs/vlvm
+ tar -xzf /root/autodl-tmp/vlfm_env_*.tar.gz -C /root/miniconda3/envs/vlvm   # ③ 解包
+/root/miniconda3/envs/vlvm/bin/conda-unpack                              # ④ 重写前缀
+bash /root/autodl-tmp/vlvm/env/vlvm_setup_env.sh                         # ⑤ 重定向 editable + 校验
+```
+
+> ⚠️ 必须在第 ① 步留存 tar.gz 再删旧环境：磁盘当前仅剩约 8.6 GB，而环境本体 7.4 GB，
+> 直接 `conda create --clone` 会撑爆磁盘。
+> ⚠️ 不要在评测/服务运行时执行 ②——运行中进程依赖 `/root/miniconda3/envs/vlfm` 的源码与库。
