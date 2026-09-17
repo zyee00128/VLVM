@@ -130,8 +130,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_thresh: float = 0.15,
             s_penalty_floor: float = 0.3,
             s_penalty_radius_m: float = 0.5,
-            s_penalty_use_surface: bool = True,
-            goal_use_surface: bool = True,
+            s_penalty_uncovered_w: float = 1.0,
             # geometric admission module
             enable_occ_consistency: bool = True,
             occ_min_voxels: int = 8,
@@ -145,7 +144,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
             # target-memory manager
             merge_dist_thresh: float = 0.5,
             ema_weight_old: float = 0.8,
-            # new GD auxiliary mechanism (§3.6): independent proposer + frame-level vote
+            s_penalty_use_surface: bool = True,
+            goal_use_surface: bool = True,
+            # new GD auxiliary mechanism: independent proposer + frame-level vote
             gdp_enable: bool = True,
             gdp_every_n: int = 5,
             gdp_box_thr: float = 0.4,
@@ -156,25 +157,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
             gdp_merge_iau: float = 0.3,
             gdp_port: int = 12181,
             lock_min_obs: int = 2,
+            lock_exempt: bool = False,
 
             # D2-2 pick ranking: vote-type priority inside a distance band (ranking only).
             d2_pick_src_first: bool = False,
             d2_pick_src_band: float = 0.5,
-            # 注：D2-4（单票自洽硬门，= 原 D2-7 的"按类几何门"支）已判负删除（2026-09-16）。
             # D2-8: GD class whitelist — these object goals skip the GD source entirely.
             d2_gd_skip_classes: str = "",
-
-            # 方向 3 机制（§优化方向 3；无法用前置判据确定 ⇒ 直接排档 A/B；默认全关）
-            d2_fill_only: bool = False,
-            d2_geo_lock: bool = False,
-            d2_geo_min: int = 2,
-            d2_stop_gate: bool = False,
-            d2_stop_gate_src: str = "tsp3d",
-            d2_stop_gate_classes: str = "couch|toilet",
-            d2_stop_gate_nobs: int = 1,
-            d2_stop_gate_win: int = 30,
-            d2_stop_gate_release: str = "explore",
-            d2_lock_exempt: bool = False,
 
             *args: Any,
             **kwargs: Any,
@@ -291,6 +280,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_thresh=s_penalty_thresh,
             s_penalty_floor=s_penalty_floor,
             s_penalty_radius_m=s_penalty_radius_m,
+            s_penalty_uncovered_w=s_penalty_uncovered_w,
             s_penalty_use_surface=s_penalty_use_surface,
             goal_use_surface=goal_use_surface,
         )
@@ -320,16 +310,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             d2_pick_src_first=d2_pick_src_first,
             d2_pick_src_band=d2_pick_src_band,
             d2_gd_skip_classes=d2_gd_skip_classes,
-            d2_fill_only=d2_fill_only,
-            d2_geo_lock=d2_geo_lock,
-            d2_geo_min=d2_geo_min,
-            d2_stop_gate=d2_stop_gate,
-            d2_stop_gate_src=d2_stop_gate_src,
-            d2_stop_gate_classes=d2_stop_gate_classes,
-            d2_stop_gate_nobs=d2_stop_gate_nobs,
-            d2_stop_gate_win=d2_stop_gate_win,
-            d2_stop_gate_release=d2_stop_gate_release,
-            d2_lock_exempt=d2_lock_exempt,
+            lock_exempt=lock_exempt,
         )
         self._lock_min_obs = max(int(lock_min_obs), 1)
 
@@ -348,6 +329,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._approach_key: Optional[tuple] = None   # dedup of the `[NAV] approach` print (0.5 m band)
         self._last_pick_meta: Dict[str, Any] = {}    # src / n_obs / gd_conf / XY of the current nav pick
         self._lock_step: int = -1                    # step at which the current lock started (-1 = no lock)
+
     def _reset(self) -> None:
         """Reset memories, step counters, pointnav model, and 3D occupancy map."""
         if self._gd_proposer is not None and self._gd_proposer.cfg.enabled:
@@ -356,15 +338,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
                   f"proposals={s['proposals']} both={self._gd_stats['both']} gd={self._gd_stats['gd']} "
                   f"gd_rejected={self._gd_stats['gd_rejected']} both_cleared={self._gd_stats['both_cleared']} "
                   f"tsp3d_new={self._gd_stats['tsp3d_new']} "
-                  f"w_new={self._gd_stats['w_new']} w_merge={self._gd_stats['w_merge']} "
-                  f"w_new_tsp={self._gd_stats['w_new_tsp']} w_merge_tsp={self._gd_stats['w_merge_tsp']} "
-                  f"gd_gated={self._gd_stats.get('gd_gated', 0)} "
                   f"rejects={s['rejects']}")
             self._gd_proposer.reset()
             self._gd_stats = {
                 "both": 0, "gd": 0, "gd_rejected": 0, "both_cleared": 0, "tsp3d_new": 0,
-                "w_new": 0, "w_merge": 0, "w_new_tsp": 0, "w_merge_tsp": 0,
-                "gd_gated": 0,
             }
         self._target_object = ""
         self._init_step_count = 0
@@ -399,9 +376,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._r0 = {"hit": 0, "miss": 0, "invis": 0}
         self._gself_recs = []
         self._lock_step = -1
-        # 3-9 停止闸状态（拦停坐标键 / 累计步数）
-        self._stop_gate_key = None
-        self._stop_gate_blocked = 0
         self._did_reset = True
     # ==========================================================================
     # Mechanism initialisation (one `_init_*` per module) 
@@ -596,6 +570,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._fb_hysteresis = int(fb_hysteresis)
         self._fb_suspicious_hysteresis = int(fb_suspicious_hysteresis)
         self._fb_suspicious_conf = float(fb_suspicious_conf)
+
     def _init_s_penalty(
         self,
         *,
@@ -603,6 +578,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         s_penalty_thresh: float,
         s_penalty_floor: float,
         s_penalty_radius_m: float,
+        s_penalty_uncovered_w: float,
         s_penalty_use_surface: bool,
         goal_use_surface: bool,
     ) -> None:
@@ -612,6 +588,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             thresh=s_penalty_thresh,
             floor=s_penalty_floor,
             radius_m=s_penalty_radius_m,
+            uncovered_w=s_penalty_uncovered_w,
         )
         self._s_penalty_use_surface = s_penalty_use_surface
         self._goal_use_surface = goal_use_surface
@@ -651,51 +628,28 @@ class TSP3DObjectNavPolicy(BasePolicy):
         d2_pick_src_first: bool,
         d2_pick_src_band: float,
         d2_gd_skip_classes: str,
-        d2_fill_only: bool,
-        d2_geo_lock: bool,
-        d2_geo_min: int,
-        d2_stop_gate: bool,
-        d2_stop_gate_src: str,
-        d2_stop_gate_classes: str,
-        d2_stop_gate_nobs: int,
-        d2_stop_gate_win: int,
-        d2_stop_gate_release: str,
-        d2_lock_exempt: bool,
+        lock_exempt: bool,
     ) -> None:
-        """Direction-2 / 3 mechanisms, one switch per item:
+        """Retained direction-2 / baseline switches, one per item:
 
           D2-2 pick ranking          — vote-type priority inside a distance band (`both > gd > tsp3d`);
           D2-5 R0 bookkeeping        — checked & hit / checked & miss counters (always on);
           D2-8 GD class whitelist    — listed object goals skip the GD source;
-          3-4 帧级补框（`d2_fill_only`）  — GD 仅在没有 TSP3D 目标类候选的帧新建条目；
-          3-5 几何独立票锁门（`d2_geo_lock`）— `gd` 条目以几何独立票数（≥`d2_geo_min`）解锁；
-          3-9 停止闸 v2（`d2_stop_gate*`）— 类条件 + 二次证据 + 窗口释放，配套 `d2_lock_exempt`。
+          V9 lock_exempt             — navigate 模式下 nav goal 条目豁免 near_miss 预算（基线机制）。
 
-        D2-1 / D2-6（旧停止闸）、D2-3（`both` 共位软加权 c''）与 D2-4（单票自洽硬门）
-        已判负并删除（2026-09-16，依据 results/VLVM-V8.md §3.15.4 / §3.15.7–§3.15.13）。
-        `g_self` 特征记录保留为量测（零行为，判定行 `g_self separability`）。
+        已判负删除（2026-09-16，results/VLVM-V8.md §3.15.4 / §3.15.7–§3.15.13）：
+        D2-1 / D2-6（旧停止闸）、D2-3（`both` 软加权）、D2-4（单票自洽硬门）；
+        已判负/零效应删除（2026-09-17 清理，results/VLVM-V8_1.md §四/§五）：
+        3-4 帧级补框、3-5 几何独立票锁门、3-9 停止闸 v2、M1 ITM 停机复核、
+        M2 停机帧 GD 复核、M3 关联影子、P2a（`lock_max_dist`）、free-space erasure v2。
+        `g_self` / R0 记录保留为量测（零行为）。
         """
         self._d2_pick_src_first = bool(d2_pick_src_first)
         self._d2_pick_band = max(float(d2_pick_src_band), 0.0)
         self._d2_gd_skip = {
             c.strip() for c in str(d2_gd_skip_classes).split("|") if c.strip()
         }
-        # 3-4 / 3-5 / 3-9（§优化方向 3）
-        self._d2_fill_only = bool(d2_fill_only)
-        self._d2_geo_lock = bool(d2_geo_lock)
-        self._d2_geo_min = max(int(d2_geo_min), 1)
-        self._d2_stop_gate = bool(d2_stop_gate)
-        self._d2_stop_gate_src = str(d2_stop_gate_src or "tsp3d")
-        self._d2_stop_gate_cls = {
-            c.strip() for c in str(d2_stop_gate_classes).split("|") if c.strip()
-        }
-        self._d2_stop_gate_nobs = max(int(d2_stop_gate_nobs), 0)
-        self._d2_stop_gate_win = max(int(d2_stop_gate_win), 1)
-        self._d2_stop_gate_release = str(d2_stop_gate_release or "explore")
-        self._d2_lock_exempt = bool(d2_lock_exempt)
-        # 3-9 拦停记账（当前被拦条目的坐标键 / 累计拦停步数）
-        self._stop_gate_key: Optional[tuple] = None
-        self._stop_gate_blocked: int = 0
+        self._lock_exempt = bool(lock_exempt)
         # R0 counters (per episode) + `g_self` 特征量测（零行为）：每个 GD 提案记录
         # `(xy2, density, box_frac, vote)`，供条目级 tp/fp 可分性判定（D2-4 已删，仅留量测）。
         self._r0: Dict[str, int] = {"hit": 0, "miss": 0, "invis": 0}
@@ -744,11 +698,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
             weak_guard=bool(gdp_weak_guard),
         ))
         self._gd_weak_guard = bool(gdp_weak_guard)
-        # Vote accounting of the GD source（`w_*` = 3-4 帧级补框影子，零行为）。
+        # Vote accounting of the GD source.
         self._gd_stats = {
             "both": 0, "gd": 0, "gd_rejected": 0, "both_cleared": 0, "tsp3d_new": 0,
-            "w_new": 0, "w_merge": 0, "w_new_tsp": 0, "w_merge_tsp": 0,
-            "gd_gated": 0,
         }
 
     # ---- new GD mechanism runtime ----
@@ -888,10 +840,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         if not proposals:
             return
 
-        # 3-4 帧级补框影子（§优化方向 3，零行为）：本帧 TSP3D 是否已有目标类 admitted
-        # 候选 —— 判定 "GD 只在该帧无 TSP3D 候选时新建条目" 会砍掉 / 保留多少写入。
-        frame_tsp = len(pending) > 0
-
         # The TSP3D vote = this frame's ADMITTED candidates only, 
         # so a box rejected by the gates can never upgrade a GD proposal to `both`.
         candidates = [
@@ -951,26 +899,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 robot_xyz=robot_xyz, robot_yaw=robot_yaw, max_depth=max_depth,
                 suspicious_override=True, src=GD,
                 gd_conf=float(proposal.conf),
-                # 3-4 帧级补框门（§优化方向 3）：带 TSP3D 目标类候选的帧不得新建 GD 条目。
-                new_gate=bool(self._d2_fill_only and frame_tsp),
             )
-            if res.get("suppressed"):
-                self._gd_stats["gd_gated"] = int(self._gd_stats.get("gd_gated", 0)) + 1
-                print(f"[GD2] gd -> gated (frame has TSP3D candidates) '{cls}' at "
-                      f"{np.round(np.asarray(proposal.centroid, dtype=np.float64)[:3], 2)} "
-                      f"(gd={float(proposal.conf):.2f}) -> suppressed")
-                continue
             self._gd_stats["gd"] += 1
-            # 3-4 帧级补框影子（§优化方向 3，零行为）：本次写入是"新建"还是"重复"，
-            # 以及该帧是否已有 TSP3D 目标类候选（→ 只允许干净帧新建时会砍掉哪些）。
-            _new = not bool(res.get("merged", False))
-            self._gd_stats["w_new" if _new else "w_merge"] += 1
-            if frame_tsp:
-                self._gd_stats["w_new_tsp" if _new else "w_merge_tsp"] += 1
             print(f"[GD2] gd -> single vote '{cls}' at "
                   f"{np.round(np.asarray(proposal.centroid, dtype=np.float64)[:3], 2)} "
                   f"(gd={float(proposal.conf):.2f} n_obs={res.get('num_obs')} "
-                  f"new={_new} frame_tsp={int(frame_tsp)} "
                   f"geo_ind={res.get('gd_geo_ind')} "
                   f"density={_den:.3f} box_frac={_frac:.3f} "
                   f"src={res.get('src')} suspicious={res.get('suspicious')} "
@@ -1149,16 +1082,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
                     # Weak evidence does not lock (§3.6.4): a `gd` single vote needs
                     # `lock_min_obs` observations before it may drive explore -> navigate.
-                    # 3-5（§优化方向 3，`d2_geo_lock`）：`gd` 条目的解锁判据改用
-                    # "几何独立票 >= `d2_geo_min`"（位移 >= 0.5 m 或视角差 >= 30°），
-                    # 替代纯计数 `num_obs`；`tsp3d` / `both` 条目不受影响。
                     st = self._memory_manager.state_of(centroid)
                     src = str(st.get("src") or "tsp3d")
-                    if self._d2_geo_lock and src == GD:
-                        lockable = int(st.get("gd_geo_ind", 0) or 0) >= int(self._d2_geo_min)
-                    else:
-                        lockable = is_lockable(src, obs, self._lock_min_obs, self._gd_weak_guard)
-                    if not lockable:
+                    if not is_lockable(src, obs, self._lock_min_obs, self._gd_weak_guard):
                         continue
 
                     valid_centroids.append(np.array(centroid))
@@ -1435,14 +1361,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
         camera_pos = tf_camera_to_episodic[:3, 3]
         camera_yaw = extract_yaw(tf_camera_to_episodic)
         cone_fov = get_fov(self._fx, self._depth_image_shape[1])
-        # 3-9 配套（`d2_lock_exempt`）：navigate 模式下 nav goal 条目豁免 near_miss 预算。
+        # 3-9 配套（`lock_exempt`）：navigate 模式下 nav goal 条目豁免 near_miss 预算。
         _nav_goal = self._last_target_coord if int(self._lock_step) >= 0 else None
         self._memory_manager.step(
             camera_pos, camera_yaw, cone_fov,
-            obstacle_map_3d=self._obstacle_map3d,
             robot_xyz=robot_xyz,
             nav_goal_xy=_nav_goal,
-            exempt_nav_goal=bool(self._d2_lock_exempt),
+            exempt_nav_goal=bool(self._lock_exempt),
         )
 
         return detections
@@ -1485,31 +1410,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         self._policy_info["rho_theta"] = np.array([rho, theta])
         if rho < self._pointnav_stop_radius and stop:
-            # 3-9 停止闸 v2（§优化方向 3，`d2_stop_gate`）：类条件 + 二次证据 + 窗口释放；
-            # 关闭时恒 "allow"（= 优化前行为）。
-            verdict = self._stop_gate_verdict()
-            if verdict == "allow":
-                self._log_stop_confirm(goal, allowed=True)
-                self._called_stop = True
-                return self._stop_action
-            nav = self._nav_stats.setdefault("nav", {})
-            nav["stop_blocked"] = int(nav.get("stop_blocked", 0)) + 1
-            if verdict == "release" and str(self._d2_stop_gate_release) != "explore":
-                # 窗口到期：强制放行（veto → delay）
-                nav["stop_released"] = int(nav.get("stop_released", 0)) + 1
-                self._log_stop_confirm(goal, allowed=True)
-                self._called_stop = True
-                return self._stop_action
-            if verdict == "release":
-                # 窗口到期：释放路径 = 放弃该条目并回落 explore（本步先交回 pointnav 动作，
-                # 下一步 `_get_target_object_location` 无该候选 ⇒ mode=explore）。
-                nav["stop_abandoned"] = int(nav.get("stop_abandoned", 0)) + 1
-                self._log_stop_confirm(goal, allowed=False)
-                self._stop_gate_abandon()
-                return self._pointnav_policy.act(obs_pointnav, masks, deterministic=True)
-            # 拦停中：本步不停止（交回 pointnav 动作，通常为原地转向/微调）
-            self._log_stop_confirm(goal, allowed=False)
-            return self._pointnav_policy.act(obs_pointnav, masks, deterministic=True)
+            self._log_stop_confirm(goal, allowed=True)
+            self._called_stop = True
+            return self._stop_action
 
         action = self._pointnav_policy.act(obs_pointnav, masks, deterministic=True)
         return action
@@ -1605,89 +1508,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 return True
         return False
 
-    def _stop_gate_verdict(self) -> str:
-        """3-9 / D2-1″ 停止闸的判定（§优化方向 3）。
-
-        拦停条件（全部满足）：`d2_stop_gate` 开 · 锁定票型 = `d2_stop_gate_src` ·
-        目标类 ∈ `d2_stop_gate_classes` · 条目**实时**票型仍为 `d2_stop_gate_src` 且
-        `num_obs <= d2_stop_gate_nobs`。二次证据 = 条目被再次写入（`num_obs` 增长）
-        或票型升级（both / gd）⇒ 立即放行。
-
-        返回 "allow"（正常停）/ "block"（窗口内拦停，继续接近）/ "release"
-        （窗口到期，按 `d2_stop_gate_release` 放行或回落 explore）。
-        """
-        if not self._d2_stop_gate:
-            return "allow"
-        meta = self._last_pick_meta or {}
-        xy = meta.get("xy")
-        if xy is None:
-            return "allow"
-        if str(meta.get("src", "tsp3d")) != self._d2_stop_gate_src:
-            return "allow"
-        if self._d2_stop_gate_cls:
-            classes = {c.strip() for c in self._target_object.split("|") if c.strip()}
-            if not (classes & self._d2_stop_gate_cls):
-                return "allow"
-        st = self._memory_manager.state_of(xy, tol=0.5)
-        if not st:
-            return "allow"   # 条目已被回收 ⇒ 不再拦停
-        src_live = str(st.get("src") or "tsp3d")
-        obs_live = int(st.get("num_obs", int(meta.get("n_obs", 1) or 1)) or 1)
-        if src_live != self._d2_stop_gate_src:
-            return "allow"   # 二次证据：票型升级（both / gd）
-        if obs_live > int(self._d2_stop_gate_nobs):
-            return "allow"   # 二次证据：条目被再次写入
-        key = (round(float(np.asarray(xy).reshape(-1)[0]), 2),
-               round(float(np.asarray(xy).reshape(-1)[1]), 2))
-        if self._stop_gate_key != key:
-            self._stop_gate_key = key
-            self._stop_gate_blocked = 0
-        self._stop_gate_blocked = int(self._stop_gate_blocked) + 1
-        # 窗口语义：拦停 `d2_stop_gate_win` 步后（第 win+1 次判定）放行。
-        if self._stop_gate_blocked > int(self._d2_stop_gate_win):
-            return "release"
-        return "block"
-
-    def _stop_gate_abandon(self) -> None:
-        """3-9 释放路径（release=explore）：丢弃被拦条目并清掉锁存 / 接近记账。"""
-        meta = self._last_pick_meta or {}
-        self._drop_entry_at(meta.get("xy"))
-        self._last_target_coord = None
-        self._lock_step = -1
-        self._approach_key = None
-        self._stop_gate_key = None
-        self._stop_gate_blocked = 0
-
-    def _drop_entry_at(self, xy: Any, tol: float = 0.5) -> None:
-        """丢弃距离 `xy` 最近的记忆条目（四表同步删除；3-9 释放路径用）。"""
-        if xy is None:
-            return
-        p = np.asarray(xy, dtype=np.float64).reshape(-1)[:2]
-        for cls in list(self._target_3d_memory.keys()):
-            recs = self._target_3d_memory.get(cls, [])
-            best_i, best_d = -1, float(tol)
-            for i, c in enumerate(recs):
-                d = float(np.linalg.norm(
-                    np.asarray(c, dtype=np.float64).reshape(-1)[:2] - p))
-                if d <= best_d:
-                    best_d, best_i = d, i
-            if best_i < 0:
-                continue
-            drop_c = np.asarray(recs[best_i], dtype=np.float64).reshape(-1)[:2].copy()
-            for tbl in (self._target_3d_memory, self._target_surface_memory,
-                        self._target_verify_state, self._target_fallback_state):
-                lst = tbl.get(cls)
-                if isinstance(lst, list) and best_i < len(lst):
-                    lst.pop(best_i)
-            print(f"[STOPG] release: dropped '{cls}' entry at {np.round(drop_c, 2)}")
-            return
-
     def _log_stop_confirm(self, goal: np.ndarray, allowed: bool = True) -> None:
-        """Stop-time measurement：本次停止（或被拦）的票型 / 单帧共位 / 距锁步数。
+        """Stop-time measurement：本次停止的票型 / 单帧共位 / 距锁步数。
 
-        `stop_allowed=False` 表示被 3-9 停止闸拦下（`d2_stop_gate`）。放行的停止计入
-        `stops` / 共位分档；拦停尝试计入 `stop_blocked`（在 `_pointnav` 里累加），
-        两者分开统计，避免拦停把停止侧口径打散。
+        放行的停止计入 `stops` / 共位分档（`allowed=False` 的入口保留给诊断用途）。
         """
         meta = self._last_pick_meta or {}
         confirm = self._tsp3d_confirms(meta.get("xy"))
@@ -1740,9 +1564,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
                   f"approach_unconfirmed={nav.get('approach_unconfirm', 0)} "
                   f"picks={pick.get('n', 0)} pick_gd={pick.get('gd', 0)} "
                   f"pick_both={pick.get('both', 0)} pick_tsp3d={pick.get('tsp3d', 0)} "
-                  f"stop_blocked={nav.get('stop_blocked', 0)} "
-                  f"stop_released={nav.get('stop_released', 0)} "
-                  f"stop_abandoned={nav.get('stop_abandoned', 0)} "
                   f"r0_hit={self._r0.get('hit', 0)} r0_miss={self._r0.get('miss', 0)} "
                   f"r0_invis={self._r0.get('invis', 0)}")
         self._nav_stats = {}
@@ -1929,6 +1750,7 @@ class VLVMConfig:
     s_penalty_thresh: float = 0.15          # S below this (ITM raw cosine scale ~0.10-0.15; measured min 0.084) -> apply penalty (w_S = floor).
     s_penalty_floor: float = 0.3            # Lower bound of the dynamic penalty weight w_S = max(floor, S/thresh) when S < thresh (non-zero -> keep recall; S->0 -> floor).
     s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection point.
+    s_penalty_uncovered_w: float = 1.0      # weight when S=None/<=0 (no coverage): 1.0 = free pass (A1), <1.0 = mild penalty on unverifiable detections.
     s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
     # Phase 7b: geometric admission module (occ-consistency + density gates)
@@ -1964,17 +1786,8 @@ class VLVMConfig:
     d2_pick_src_band: float = 0.5        # D2-2: band width (m)
     d2_gd_skip_classes: str = ""         # D2-8: object goals that skip the GD source (e.g. "couch")
 
-    # Phase 7i: 方向 3 机制（§优化方向 3；无法用前置判据确定 ⇒ 直接排档 A/B；默认全关）
-    d2_fill_only: bool = False           # 3-4: GD only creates entries in frames without TSP3D candidates
-    d2_geo_lock: bool = False            # 3-5: `gd` unlock needs geometric-independent votes instead of num_obs
-    d2_geo_min: int = 2                  # 3-5: required independent votes (>=2)
-    d2_stop_gate: bool = False           # 3-9: stop gate v2 (class-conditional + second evidence + window release)
-    d2_stop_gate_src: str = "tsp3d"      # 3-9: the vote source being gated
-    d2_stop_gate_classes: str = "couch|toilet"  # 3-9: object goals the gate applies to ("" = all)
-    d2_stop_gate_nobs: int = 1           # 3-9: gate entries with num_obs <= this
-    d2_stop_gate_win: int = 30           # 3-9: blocked steps before release
-    d2_stop_gate_release: str = "explore"  # 3-9: "explore" (drop entry & fall back) / "stop" (force allow)
-    d2_lock_exempt: bool = False         # 3-9: nav-goal entry exempt from the near-field near_miss budget
+    # V9 baseline mechanism（2026-09-17 采纳）：nav-goal entry exempt from the near-field near_miss budget
+    lock_exempt: bool = False            # V9: nav-goal entry exempt from the near-field near_miss budget
 
 
 cs = ConfigStore.instance()

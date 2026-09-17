@@ -11,16 +11,21 @@ class SPenaltyConfig:
     thresh: float = 0.15   # S below this -> penalty (ITM raw cosine scale ~0.10-0.15)
     floor: float = 0.3     # w_S lower bound (keeps recall for borderline true targets)
     radius_m: float = 0.5  # S query radius (m) around the detection point
+    uncovered_w: float = 1.0  # weight when there is NO semantic coverage (S=None/<=0);
+                              # 1.0 = free pass (A1 default), <1.0 = mild penalty for
+                              # detections the value map cannot corroborate at all.
 
 
 def compute_w_s(s: Optional[float], cfg: SPenaltyConfig) -> Tuple[float, Optional[float]]:
     """Map a semantic-field value S to a penalty weight w_S; returns (w_S, S).
 
-    S=None/<=0 (no coverage) -> (1.0, None): free pass (A1)."""
+    S=None/<=0 (no coverage) -> (cfg.uncovered_w, None): the historical A1 default is
+    1.0 = free pass; a value <1.0 additionally discounts detections in never-scored
+    areas (the value map cannot corroborate them, which is not positive evidence)."""
     if not cfg.enable:
         return 1.0, None
     if s is None or s <= 0.0:
-        return 1.0, None
+        return float(cfg.uncovered_w), None
     if s >= cfg.thresh:
         return 1.0, s
     return max(cfg.floor, s / max(cfg.thresh, 1e-6)), s

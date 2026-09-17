@@ -153,6 +153,62 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
     _dist("maxscore (tp)", tp_scores)
     _dist("maxscore (fp)", fp_scores)
 
+    # --- 09-17 量测补强（零行为）：S × maxscore 联合分布 -----------------------
+    # S = 语义场值（检测框近表面点，半径 s_penalty_radius_m）；None/≤0 = 无覆盖（w_S=1 免罚）。
+    # 用途：为 σ_tar / s_penalty_thresh / floor 定档提供数据（此前 S 已采集但未被聚合打印）。
+    s_vals_all = [v for s in stats for v in s.get("s_vals", [])]
+    s_covered = [float(v) for v in s_vals_all if v is not None and float(v) > 0.0]
+    s_tp = [
+        float(v) for s in stats
+        for v, f in zip(s.get("s_vals", []), s.get("tp_flags", []))
+        if v is not None and float(v) > 0.0 and f
+    ]
+    s_fp = [
+        float(v) for s in stats
+        for v, f in zip(s.get("s_vals", []), s.get("tp_flags", []))
+        if v is not None and float(v) > 0.0 and not f
+    ]
+    if s_vals_all:
+        print(f"  S uncovered/free-pass: {len(s_vals_all) - len(s_covered)}/{len(s_vals_all)}")
+    _dist("S (all, covered)", s_covered)
+    _dist("S (tp, covered)", s_tp)
+    _dist("S (fp, covered)", s_fp)
+    _dist("maxscore (admitted)", [
+        v for s in stats for v, a in zip(s.get("scores", []), s.get("admitted", [])) if a
+    ])
+    rows = [
+        ("S<=0/未覆盖", None),
+        ("S 0-0.108 硬拒", (None, 0.108)),
+        ("S .108-.15 软区", (0.108, 0.15)),
+        ("S >0.15 达标", (0.15, None)),
+    ]
+    cols = [(0.70, 0.75, "0.70-0.75"), (0.75, 0.80, "0.75-0.80"), (0.80, 999.0, ">=0.80")]
+
+    def _in_row(v, rng) -> bool:
+        if v is None or float(v) <= 0.0:
+            return rng is None
+        if rng is None:
+            return False
+        lo, hi = rng
+        return (lo is None or float(v) > lo) and (hi is None or float(v) <= hi)
+
+    if s_vals_all:
+        print("  joint S x maxscore (cell = n / tp%)")
+        print("    " + f"{'S x conf':<18}" + "".join(f"{lab:>14}" for _, _, lab in cols))
+        for name, rng in rows:
+            cells = []
+            for lo, hi, _ in cols:
+                n = tpc = 0
+                for s in stats:
+                    for v, sc, f in zip(
+                        s.get("s_vals", []), s.get("scores", []), s.get("tp_flags", [])
+                    ):
+                        if _in_row(v, rng) and lo <= float(sc) < hi:
+                            n += 1
+                            tpc += int(f)
+                cells.append(f"{n}/{tpc / n * 100:.0f}%" if n else "-")
+            print("    " + f"{name:<18}" + "".join(f"{c:>14}" for c in cells))
+
 
 def _print_memory_metrics(episode_records: List[Dict[str, Any]]) -> None:
     """Per-entry tp / fp of the memorized candidates (A4 measurement #2, §3.7.10).

@@ -1,16 +1,14 @@
 # VLVM 项目环境配置指南
 
 > **适用对象**：在全新服务器 / 实例上为 **VLVM 项目**（`/root/autodl-tmp/vlvm`）搭建可运行环境。
->
-> **项目定位**：3D Native 主动视觉语言导航 —— VLFM 导航框架重构 + **TSP3D** 三维目标定位（主模型）。
->
+
 > **配置顺序**：先装 **vlfm 导航框架环境**（第一部分）→ 再装 **TSP3D 模型依赖**（第二部分）→ 最后做**外部依赖与路径重定向**（第三部分）。
->
+
 > **目录约定**：本文用 `$VLVM` 代表项目根（`/root/autodl-tmp/vlvm`），`$DEPS` 代表外部依赖根（`/root/autodl-tmp/vlfm`，见 §3.1）。
 
 ---
 
-## 0. 环境速览（实机核对信息，2026-09-16）
+## 0. 环境速览
 
 | 项 | 值 | 备注 |
 |---|---|---|
@@ -32,7 +30,6 @@
 | `vlvm_requirements.txt` | **直接依赖清单**（显式安装项 + 锁定版本 + 注意事项） |
 | `vlvm_env_export.yml` | **全量快照**（258 个 pip 包 + conda 层），整环境复刻用 |
 | `vlvm_setup_env.sh` | **一键环境重定向 / 校验脚本**（新机解压快照或 pip 装完后运行） |
-| `vlvm_env_audit.md` | 旧版环境文件的**差异审计**（过期路径 / 版本、修正方式、最新实测） |
 
 ---
 
@@ -44,9 +41,6 @@
 conda create -n vlvm python=3.9 -y
 conda activate vlvm
 ```
-
-> 环境名 `vlvm`。`scripts/my_eval.sh` / `env/vlvm_setup_env.sh` 优先激活 `vlvm`，
-> 同名环境不存在时自动回退旧名 `vlfm`（过渡期兼容）；显式指定用 `CONDA_ENV_NAME=xxx`。
 
 ## 1.2 安装 PyTorch（CUDA 11.3 构建）
 

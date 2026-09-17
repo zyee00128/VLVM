@@ -308,7 +308,7 @@ def aggregate_detect_stats(
     """
     total = len(detect_logs)
     if total == 0:
-        return {"total": 0, "tp": 0, "fp": 0, "scores": [], "conf_amps": [], "tp_flags": [], "admitted": []}
+        return {"total": 0, "tp": 0, "fp": 0, "scores": [], "conf_amps": [], "tp_flags": [], "admitted": [], "s_vals": []}
 
     try:
         dilated_mask = cv2.dilate(
@@ -329,4 +329,6 @@ def aggregate_detect_stats(
         "conf_amps": [float(d.get("conf_amp", d["conf"])) for d in detect_logs],
         "tp_flags": tp_flags,
         "admitted": [bool(d.get("admitted", False)) for d in detect_logs],
+        # 09-17 量测补强：S（语义场值，检测框近表面点；None/≤0 = 无覆盖 = 免罚）。
+        "s_vals": [d.get("s", None) for d in detect_logs],
     }

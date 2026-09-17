@@ -57,14 +57,13 @@ SCENES="[5cdEh9F2hJL]"
 # ============================================================================
 # 【09-17 09:5x 更新 · 机制批收口 ⇒ A/B 两机 = **参数优化批 3/3 平均分摊**】
 #   参数批（单变量、**对拍 V9 新基线 52/99**；每档 ~4 h）：
-#     A（服务器 1）= `d2_base`（纯 V9 复现 + S×conf 观测，先跑定 S 参数）→ `d2_pick1b`（D2-2′ band=1.0）→ `d2_merg8`（merge 0.5→0.8）
+#     A（服务器 1）= `d2_pick1b`（D2-2′ band=1.0）→ `d2_sig72`（σ_tar 0.70→0.72）→ `d2_merg8`（merge 0.5→0.8）
 #     B（服务器 2）= `d2_pick1`（band=0.5）→ `d2_budg3`（susp_hysteresis 2→3）→ `d2_hys3`（hysteresis 5→3）
 #   依据：V8_1 §五-6 参数批；`p4` caption 已判负（V73_a3_cap −7.08）不排；`d2_8tv` 保持暂缓。
 #   09-17 复核：`d2_conf70` 已撕（空转键——GD 开启时新条目恒标 suspicious，该键不参与决策）；
 #     V9 失败结构 = 47 失败中 46 为 false_positive（早停锁假）· 逐类 ora=0：couch 15 / tv 19 / toilet 8 / chair 1 / bed 0
-#     ⇒ 瓶颈 = 锁正确率（停止时源分布 tsp3d 50 / both 22 / gd 20）。
-#   09-17 修订2：`d2_sig72` 暂缓——先跑 `d2_base` 拿 S×conf 联合观测，再定 σ_tar / `s_penalty_thresh` /
-#     `s_penalty_floor` / 新增 `s_penalty_uncovered_w` 的取值（无覆盖区从免罚改为可调权重）。
+#     ⇒ 瓶颈 = 锁正确率（停止时源分布 tsp3d 50 / both 22 / gd 20）⇒ 录取线档 `d2_sig72`
+#       （09-17 修订：原 0.75 与 `fb_suspicious_conf` 重合且历史网格 0.75 起单调降 → 改 0.72）。
 #   机制批结果（读参数档时对照）：`lockx` 52/99（+1 · steps −26.5）✓ 采纳为新基线（= 上方 `Stage2_1`）；
 #     `lockgeo` ≡ lockx（逐集同、零增量）· `lmd4` 48/99（−3）· `lockfse` ≈ 0（全批仅 7 次事件）⇒ 均判负。
 #   多场景批（待开）：SCENES 切三场景后启用阵列末尾的 `ms_v9` / `ms_ref`。
@@ -158,11 +157,13 @@ if [ "$BATCH" = "B" ]; then
 else
     # 服务器 1
     EXPERIMENTS=(
-        # A-p0s 【09-17 · 先跑基线定 S 参数】纯 V9 复现 + S×conf 联合观测（零行为打点）
-        #   `d2_sig72` 暂缓：等 S 数据定 uncovered_w / floor / thresh 后再排。
-        "VLVM3_base|$Stage2_1"
         # A-p3 D2-2′ 选点序 band=1.0（修正序 both > gd > tsp3d；离线 35 改选/8 集，含 2 成功集=风险面）
         "d2_pick1b|$Stage2_1 habitat_baselines.rl.policy.d2_pick_src_first=True habitat_baselines.rl.policy.d2_pick_src_band=1.0"
+        # A-p6 【09-17 修订 · σ_tar 0.70→0.72】（原 0.75 弃用：① 与 `fb_suspicious_conf=0.75` 重合
+        #   ⇒ 可疑判据作用带 [σ_tar, 0.75) 变空集（回退机制置信分档失效）；② 历史网格搜索：
+        #   0.70/0.72 并列最高、**0.75/0.78/0.80 单调降**（results/Analysis_VLVM_vs_VLFM.md L155）。
+        #   作用面（V9 日志）：98 个新条目中 23 个 c'<0.72（≈23%）将被拦。
+        "d2_sig72|$Stage2_1 habitat_baselines.rl.policy.sigma_tar=0.72"
         # A-p5 写入侧共位放宽：`gdp_merge_dist` 0.5→0.8（`both` 生成率 ↑）
         "d2_merg8|$Stage2_1 habitat_baselines.rl.policy.gdp_merge_dist=0.8"
 )

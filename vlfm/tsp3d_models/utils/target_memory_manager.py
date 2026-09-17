@@ -26,18 +26,15 @@ class MemoryManagerConfig:
     """
     Target-memory / fallback lifecycle hyper-parameters.
 
-    ``enable_fallback`` gates only the native hysteresis fallback;
-    the free-space erasure runs on its own switch even when the fallback is off.
+    ``enable_fallback`` gates only the native hysteresis fallback.
     """
     # cross-view EMA merge (memory write)
     merge_dist_thresh: float = 0.5        # merge two observations of the same class within this distance (m)
     ema_weight_old: float = 0.8           # EMA smoothing: old * 0.8 + new * 0.2
 
-    # 3-5 shadow (§优化方向 3, 零行为量测): geometric independence of successive writes
-    # to one entry — displacement >= `gd_geo_move_m` (m) OR heading change >=
-    # `gd_geo_yaw_deg` (deg). Counted per entry (`gd_geo_obs` / `gd_geo_ind`); the
-    # 3-5 gate itself is `d2_geo_lock` in the policy. 3-4 帧级补框门由调用方按帧
-    # 判定（`accumulate(..., new_gate=True)`，带 TSP3D 候选的帧不得新建条目）。
+    # 几何独立票量测（零行为）：连续写入同一条目时，位移 >= `gd_geo_move_m` (m)
+    # 或朝向变化 >= `gd_geo_yaw_deg` (deg) 记为一次"独立票"，按条目计数
+    # （`gd_geo_obs` / `gd_geo_ind`），供停止侧诊断（[STOP] 的 geo_ind 字段）。
     gd_geo_move_m: float = 0.5
     gd_geo_yaw_deg: float = 30.0
 
@@ -92,7 +89,6 @@ class TargetMemoryManager:
         src: Optional[str] = None,
         new_suspicious: bool = False,
         gd_conf: float = 0.0,
-        new_gate: bool = False,
     ) -> Dict[str, Any]:
         """
         In-place write / EMA-merge of one admitted detection.
@@ -109,10 +105,6 @@ class TargetMemoryManager:
           * single-side evidence may be marked suspicious: `new_suspicious` marks a
             newly created entry, `suspicious_override=True` forces the flag on.
 
-        3-4 帧级补框门（§优化方向 3）: `new_gate=True` 时本写入**不得新建条目**
-        （该帧 TSP3D 已有目标类 admitted 候选，由调用方判定）—— 能并入已有条目则
-        照常合并，否则直接丢弃并返回 `{"suppressed": True}`（不写记忆、不计数）。
-
         M-a (§五 量测, default-neutral): `gd_conf` is the RAW GD sigmoid score of
         this write (0.0 = the write carries no GD score, i.e. a pure `tsp3d`
         write). Unlike `confidence` — which for a `gd` entry is the constant
@@ -123,7 +115,7 @@ class TargetMemoryManager:
 
         Returns a small record of the write: `{merged, src, num_obs, suspicious,
         suspicion_cleared, gd_conf, gd_geo_obs, gd_geo_ind}` (for caller-side
-        logging / accounting; the `gd_geo_*` pair is the 3-5 shadow count).
+        logging / accounting; the `gd_geo_*` pair is the geometric-vote count).
         """
         r_xyz = np.zeros(3) if robot_xyz is None else np.asarray(robot_xyz, dtype=np.float64)
         r_xy = r_xyz[:2]
@@ -185,12 +177,6 @@ class TargetMemoryManager:
 
         recs = self._mem.get(target_class)
         if not recs:
-            if new_gate:
-                # 3-4：带 TSP3D 候选的帧不允许新建条目（无同类记录可合并）。
-                return {"merged": False, "suppressed": True, "src": _src_tag(src),
-                        "num_obs": 0, "suspicious": False, "suspicion_cleared": False,
-                        "gd_conf": float(gd_conf) if float(gd_conf) > 0.0 else 0.0,
-                        "gd_geo_obs": 0, "gd_geo_ind": 0}
             self._mem[target_class] = [c_np]
             self._surf[target_class] = [s_np]
             self._ver[target_class] = [(1, r_xy.copy(), float(robot_yaw), float(confidence))]
@@ -235,14 +221,9 @@ class TargetMemoryManager:
                 prev_state["suspicious"] = False
             return {"merged": True, "src": merged_src, "num_obs": int(v_old[0]) + 1,
                     "suspicious": bool(prev_state.get("suspicious")),
-                    "suspicion_cleared": cleared, **_m_a(prev_state), **_geo(prev_state)}
+                    "suspicion_cleared": cleared,
+                    **_m_a(prev_state), **_geo(prev_state)}
         else:
-            if new_gate:
-                # 3-4：未命中已有条目（会新建）且当前帧带 TSP3D 候选 ⇒ 丢弃本条写入。
-                return {"merged": False, "suppressed": True, "src": _src_tag(src),
-                        "num_obs": 0, "suspicious": False, "suspicion_cleared": False,
-                        "gd_conf": float(gd_conf) if float(gd_conf) > 0.0 else 0.0,
-                        "gd_geo_obs": 0, "gd_geo_ind": 0}
             recs.append(c_np)
             self._surf[target_class].append(s_np)
             self._ver[target_class].append((1, r_xy.copy(), float(robot_yaw), float(confidence)))
@@ -338,15 +319,13 @@ class TargetMemoryManager:
         camera_pos: np.ndarray,
         camera_yaw: float,
         cone_fov_rad: float,
-        obstacle_map_3d: Optional[Any] = None,
         robot_xyz: Optional[np.ndarray] = None,
         nav_goal_xy: Optional[np.ndarray] = None,
         exempt_nav_goal: bool = False,
     ) -> List[Dict[str, Any]]:
         """One-step lifecycle over all memory records.
 
-        Order: (1) free-space erasure; (2) native near-field hysteresis fallback
-        with the near-field exemption.
+        Native near-field hysteresis fallback with the near-field exemption.
 
         3-9 配套（§优化方向 3）: with `exempt_nav_goal=True` and a `nav_goal_xy`,
         the entry within 0.5 m of the current navigation goal is exempt from the
@@ -354,7 +333,7 @@ class TargetMemoryManager:
         the goal, no new writes) would delete the entry and turn "delayed stop"
         into "lost entry" (results/VLVM-V8.md §3.15.8 chain 3).
 
-        Returns per-deletion logs with `reason="hysteresis_exceeded"`.
+        Returns per-deletion logs with `reason` in {"hysteresis_exceeded"}.
         """
         deleted: List[Dict[str, Any]] = []
         if robot_xyz is None:
