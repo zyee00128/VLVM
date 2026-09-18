@@ -7,7 +7,7 @@ Modules:
   sampling       : send-side post-processing (voxelization / distance sampling / cap)
   pipeline       : unified TSP3DInputPreprocessor (camera / world / panoramic / none)
   s_penalty      : semantic-field cross-validation (c' = c * w_S)
-  target_geometric_gating : occ-consistency / density admission gates
+  target_geometric_gating : occupancy-consistency admission gate
   target_memory_manager   : target lifecycle (merge / fallback)
 """
 

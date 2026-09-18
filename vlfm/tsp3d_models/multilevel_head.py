@@ -430,16 +430,38 @@ class TSPHead(nn.Module):
                 sampled_coords = sampled_coords[~matches]
                 diag["com_added"] = int(sampled_features.shape[0])
 
-                # Interpolate and extract original coordinates' potential physical features
-                x_com_features = x.features_at_coordinates(sampled_coords.float())
-                # Supplement and recombine voxel information compensated by multi-modal alignment
-                x_com_features = x_com_features + sampled_features
-                # Concatenate and merge main feature trunk and the newly generated recombined voxel features at the tensor level
-                x = ME.SparseTensor(features=torch.cat((x_ori.features, x_com_features), dim=0), 
-                                    coordinates=torch.cat((x_ori.coordinates, sampled_coords), dim=0), 
-                                    coordinate_manager=x_ori.coordinate_manager, 
-                                    tensor_stride=x_ori.tensor_stride, 
-                                    device=x_ori.device)
+                if sampled_features.shape[0] == 0:
+                    # MinkowskiEngine returns a rank-1 empty tensor for an empty
+                    # coordinate query, which cannot be added to (0, C) features.
+                    x = x_ori
+                else:
+                    # Interpolate and extract original coordinates' potential physical features
+                    x_com_features = x.features_at_coordinates(sampled_coords.float())
+                    if (
+                        x_com_features.shape != sampled_features.shape
+                        and x_com_features.shape == sampled_features.transpose(0, 1).shape
+                    ):
+                        x_com_features = x_com_features.transpose(0, 1).contiguous()
+                    if x_com_features.shape != sampled_features.shape:
+                        # A query outside x's coordinate map can yield (0, C)
+                        # even when one or more completion candidates remain.
+                        # Keep the reconstructed trunk instead of creating an
+                        # invalid sparse tensor with unequal row counts.
+                        logging.warning(
+                            "[TSPHead] Skipping incompatible completion features: "
+                            f"queried={tuple(x_com_features.shape)}, "
+                            f"sampled={tuple(sampled_features.shape)}"
+                        )
+                        x = x_ori
+                    else:
+                        # Supplement and recombine voxel information compensated by multi-modal alignment
+                        x_com_features = x_com_features + sampled_features
+                        # Concatenate and merge main feature trunk and the newly generated recombined voxel features at the tensor level
+                        x = ME.SparseTensor(features=torch.cat((x_ori.features, x_com_features), dim=0),
+                                            coordinates=torch.cat((x_ori.coordinates, sampled_coords), dim=0),
+                                            coordinate_manager=x_ori.coordinate_manager,
+                                            tensor_stride=x_ori.tensor_stride,
+                                            device=x_ori.device)
 
             if i > 0:
                 sampled_coords, sampled_features = [], []

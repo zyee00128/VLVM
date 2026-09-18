@@ -4,17 +4,15 @@ ft_datasets/
 
 # 模型代码
 GroundingDINO/
-vlvm_env_audit.md
-
 # 微调代码
 ft_pipeline/
 
 # 实验日志 / TensorBoard
+iteration/
 lockfiles/
-md/
-results/
 outputs/
 outputs_Stage1/
+outputs_Stage2
 tb/
 
 # Python 缓存与构建产物 / 其他

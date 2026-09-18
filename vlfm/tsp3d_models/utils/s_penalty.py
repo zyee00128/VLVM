@@ -73,7 +73,8 @@ def apply_s_penalty(
     out_log: Optional[List[Dict[str, Any]]] = None,
     per_det_meta: Optional[List[Any]] = None,
     meta_out: Optional[List[Any]] = None,
-
+    conflict_gate: bool = True,
+    conflict_conf_hi: float = 0.80,
 ) -> List[Tuple[float, np.ndarray, Optional[np.ndarray], List[str]]]:
     """S-penalty + admission gate for filtered detections.
 
@@ -84,6 +85,9 @@ def apply_s_penalty(
 
     ``per_det_meta`` is copied item-by-item into ``meta_out`` 
     for each ADMITTED detection.
+
+    冲突门：``conflict_gate=True`` 时，对“conf ≥ conflict_conf_hi ∧ 0 < S < cfg.thresh”
+    的组合在写入口定向拒绝（即便 conf·w_S 已达准入线）。
     """
     import torch  # local import keeps the module torch-free at import time
 
@@ -110,6 +114,11 @@ def apply_s_penalty(
         w_s, _ = compute_w_s(s, cfg)
         conf_amp = conf_f * w_s
         admitted = conf_amp >= sigma_tar
+        # 冲突门：对“conf ≥ conf_hi ∧ 0 < S < thresh”的组合定向拒绝 —— “高 conf
+        # 补偿低 S”的放行通道不再进入写入/锁定链。
+        if admitted and conflict_gate and cfg.enable and s is not None and float(s) > 0.0:
+            if float(conf_f) >= float(conflict_conf_hi) and float(s) < float(cfg.thresh):
+                admitted = False
         if out_log is not None:
             out_log.append(
                 {

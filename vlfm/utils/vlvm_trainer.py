@@ -192,7 +192,7 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
         lo, hi = rng
         return (lo is None or float(v) > lo) and (hi is None or float(v) <= hi)
 
-    if s_vals_all:
+    def _joint_table() -> None:
         print("  joint S x maxscore (cell = n / tp%)")
         print("    " + f"{'S x conf':<18}" + "".join(f"{lab:>14}" for _, _, lab in cols))
         for name, rng in rows:
@@ -201,7 +201,7 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
                 n = tpc = 0
                 for s in stats:
                     for v, sc, f in zip(
-                        s.get("s_vals", []), s.get("scores", []), s.get("tp_flags", [])
+                        s.get("s_vals", []), s.get("scores", []), s.get("tp_flags", []),
                     ):
                         if _in_row(v, rng) and lo <= float(sc) < hi:
                             n += 1
@@ -209,14 +209,17 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
                 cells.append(f"{n}/{tpc / n * 100:.0f}%" if n else "-")
             print("    " + f"{name:<18}" + "".join(f"{c:>14}" for c in cells))
 
+    if s_vals_all:
+        _joint_table()
+
 
 def _print_memory_metrics(episode_records: List[Dict[str, Any]]) -> None:
-    """Per-entry tp / fp of the memorized candidates (A4 measurement #2, §3.7.10).
+    """Per-entry tp / fp of the memorized candidates.
 
-    Splits by proposer tag (`tsp3d` / `gd` / `both`) and reports the suspicious subset,
-    which is the direct input of A2 (lifecycle budget) and A3 (lock-right : lock-wrong).
+    Splits by proposer tag (`tsp3d` / `gd` / `both`) and reports the suspicious subset
+    (deletion-budget / lock-right : lock-wrong inputs).
 
-    M-a (§五 量测): the `gd_conf` column is the mean raw GD sigmoid over the entries of
+    The `gd_conf` column is the mean raw GD sigmoid over the entries of
     that tag that actually carry a GD score (a `tsp3d`-only entry has none), and the
     `gd-conf separability` line compares the tp group with the fp group — that gap is
     the judgement gate of the confidence direction.
@@ -244,7 +247,7 @@ def _print_memory_metrics(episode_records: List[Dict[str, Any]]) -> None:
     )
     print(
         f"{'src':<8}{'entries':>9}{'tp':>7}{'fp':>7}{'tp%':>8}"
-        f"{'n_obs':>8}{'gd_conf':>9}{'geo_ind':>9}"
+        f"{'n_obs':>8}{'gd_conf':>9}"
     )
     for src in sorted({k for s in stats for k in s["by_src"]}):
         n = sum(s["by_src"].get(src, {}).get("n", 0) for s in stats)
@@ -260,13 +263,9 @@ def _print_memory_metrics(episode_records: List[Dict[str, Any]]) -> None:
             for s in with_n
         )
         gconf = (gcs / gcn) if gcn else float("nan")
-        gin = sum(
-            s["by_src"][src].get("geo_ind", 0.0) * s["by_src"][src].get("n", 0)
-            for s in with_n
-        ) / max(1, n)
         print(
             f"{src:<8}{n:>9}{t:>7}{n - t:>7}{t / n * 100:>7.1f}%"
-            f"{nobs:>8.2f}{gconf:>9.2f}{gin:>9.2f}"
+            f"{nobs:>8.2f}{gconf:>9.2f}"
         )
     sus_n = sum(s["suspicious"]["n"] for s in stats)
     sus_tp = sum(s["suspicious"]["tp"] for s in stats)
@@ -278,55 +277,6 @@ def _print_memory_metrics(episode_records: List[Dict[str, Any]]) -> None:
         "gd-conf separability (entries carrying a GD score): "
         f"tp n={tp_gn} mean={tp_mean:.3f} | fp n={fp_gn} mean={fp_mean:.3f} | gap={gap}"
     )
-    # 3-5 shadow（§优化方向 3）：`src=gd` 条目的几何独立票数能否分离 tp / fp。
-    tpn = sum(s.get("geo_ind_tp", {}).get("n", 0) for s in stats)
-    tpi = sum(s.get("geo_ind_tp", {}).get("ind", 0.0) for s in stats)
-    tpg = sum(s.get("geo_ind_tp", {}).get("ge2", 0) for s in stats)
-    fpn = sum(s.get("geo_ind_fp", {}).get("n", 0) for s in stats)
-    fpi = sum(s.get("geo_ind_fp", {}).get("ind", 0.0) for s in stats)
-    fpg = sum(s.get("geo_ind_fp", {}).get("ge2", 0) for s in stats)
-    if tpn or fpn:
-        tp_m = (tpi / tpn) if tpn else float("nan")
-        fp_m = (fpi / fpn) if fpn else float("nan")
-        gap_g = f"{tp_m - fp_m:+.2f}" if (tpn and fpn) else "n/a"
-        print(
-            "geo-ind separability (src=gd entries): "
-            f"tp n={tpn} mean={tp_m:.2f} ge2={tpg}/{tpn} | "
-            f"fp n={fpn} mean={fp_m:.2f} ge2={fpg}/{fpn} | gap={gap_g}"
-        )
-    # D2-4 前提（§优化方向 2）：`g_self` 的 tp / fp 可分性 —— 硬门是否该上的判据。
-    gs: Dict[str, Dict[str, float]] = {}
-    for key in ("gself_tp", "gself_fp"):
-        n = sum((s.get(key) or {}).get("n", 0) for s in stats)
-        d = sum(
-            (s.get(key) or {}).get("density", 0.0) * (s.get(key) or {}).get("n", 0)
-            for s in stats
-        )
-        f_ = sum(
-            (s.get(key) or {}).get("box_frac", 0.0) * (s.get(key) or {}).get("n", 0)
-            for s in stats
-        )
-        gs[key] = {
-            "n": n,
-            "density": (d / n) if n else float("nan"),
-            "box_frac": (f_ / n) if n else float("nan"),
-        }
-    tp_g, fp_g = gs["gself_tp"], gs["gself_fp"]
-    if tp_g["n"] or fp_g["n"]:
-        gap_d = (
-            f"{tp_g['density'] - fp_g['density']:+.4f}"
-            if (tp_g["n"] and fp_g["n"]) else "n/a"
-        )
-        gap_f = (
-            f"{tp_g['box_frac'] - fp_g['box_frac']:+.4f}"
-            if (tp_g["n"] and fp_g["n"]) else "n/a"
-        )
-        print(
-            "g_self separability (entries carrying GD proposals): "
-            f"tp n={tp_g['n']} density={tp_g['density']:.4f} box_frac={tp_g['box_frac']:.4f} | "
-            f"fp n={fp_g['n']} density={fp_g['density']:.4f} box_frac={fp_g['box_frac']:.4f} | "
-            f"gap density={gap_d} box_frac={gap_f}"
-        )
 
 
 def _print_eval_breakdown(episode_records: List[Dict[str, Any]]) -> None:
@@ -424,7 +374,17 @@ class VLVMTrainer(PPOTrainer):
         # Some configurations require not to load the checkpoint, like when using
         # a hierarchical policy
         if self.config.habitat_baselines.eval.should_load_ckpt:
-            ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
+            # PyTorch >= 2.6 defaults `torch.load(weights_only=True)`; habitat's checkpoint
+            # loader does not pass `weights_only`, and the eval checkpoint embeds an
+            # `omegaconf.DictConfig` (the saved config), which the safe unpickler rejects.
+            # The checkpoint is a trusted local artifact -> load in legacy mode;
+            # `TypeError` covers torch < 1.13 where the kwarg does not exist yet.
+            try:
+                ckpt_dict = self.load_checkpoint(
+                    checkpoint_path, map_location="cpu", weights_only=False
+                )
+            except TypeError:
+                ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
             step_id = ckpt_dict["extra_state"]["step"]
             print(f"Loaded checkpoint step: {step_id}")
         else:
@@ -695,15 +655,18 @@ class VLVMTrainer(PPOTrainer):
                     except Exception:
                         detect_stats = None
 
-                    # A4 measurement #2 (§3.7.10): per-entry tp / fp of the final memory.
+                    # Per-entry tp / fp of the final memory (episode-end snapshot).
                     # Read straight from the policy: it only clears its memory on the next
                     # `act()`, so the finished episode's entries are still live here.
                     mem_stats = None
                     try:
                         from vlfm.utils.episode_stats_logger import aggregate_memory_stats
 
+                        stats_logger = getattr(
+                            self._agent.actor_critic, "_stats", None
+                        )
                         snapshot_fn = getattr(
-                            self._agent.actor_critic, "_memory_entries_snapshot", None
+                            stats_logger, "memory_entries_snapshot", None
                         )
                         entries = snapshot_fn() if callable(snapshot_fn) else None
                         mem_stats = aggregate_memory_stats(infos[i], entries) or None

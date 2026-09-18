@@ -2,23 +2,31 @@
 # VLVM 直接依赖清单（Direct requirements）
 # -----------------------------------------------------------------------------
 # 项目 : VLVM —— 3D Native 主动视觉语言导航（VLFM 框架重构 + TSP3D 三维定位）
-# 仓库 : /root/autodl-tmp/vlvm
-# 环境 : conda env `vlvm`（过渡期兼容旧名 `vlfm`），Python 3.9.25
+# 仓库 : <repo>（下文用 $VLVM 代指仓库根；conda 环境名由脚本自动探测，见下表）
 #
 # 说明
-#   1. 本文件只列**需要显式安装**的包（版本取自 2026-09-16 实机 `pip freeze`）。
-#   2. 全量快照（含全部传递依赖与 conda 层）见同目录 `vlvm_env_export.yml`；
-#      整环境复刻请用 `conda env create -f vlvm_env_export.yml`，不要用本文件。
+#   1. 本文件只列**需要显式安装**的包。**两套 CUDA 栈均已实机验证，按机器选其一**：
+#
+#      | 机器 | GPU / CUDA | conda 环境 | 工作区 $WS | 关键差异 |
+#      | :-- | :-- | :-- | :-- | :-- |
+#      | 旧机（当前实验机） | RTX 3090 / cu113 | `vlfm` | `/root/autodl-tmp` | torch 1.12.1 |
+#      | 新机（机器 3） | RTX 5080 / cu128 | `vlvm`   | `/home/iair/vlvm` | torch 2.8.0 |
+#
+#      差异仅：torch / torchvision 安装源、mmcv 构建方式、mmengine 版本（其余共用）。
+#   2. `vlvm_env_export.yml` 是旧 RTX 3090/cu113 的历史快照；RTX 5080 不可原样恢复。
 #   3. 带 PATH 标记的条目与仓库位置强相关，迁移前见 `vlvm环境配置指南.md` §2。
-#   4. 一键迁移：`bash vlvm_setup_env.sh`
+#   4. 一键迁移：`bash vlvm_setup_env.sh`（自动探测路径 / conda 根 / 环境名）。
 # =============================================================================
 
-
-# --- 1. 深度学习底座（版本锁死，由 torch 1.12 生态决定）-----------------------
-torch==1.12.1+cu113
+# --- 1. 深度学习底座（二选一）------------------------------------------------
+# 栈 A：旧机 RTX 3090 / CUDA 11.3（当前实验机在跑）
+torch==1.12.1+cu113             # 安装源：-f https://download.pytorch.org/whl/torch_stable.html
 torchvision==0.13.1+cu113
-    # 安装源：-f https://download.pytorch.org/whl/torch_stable.html
-    # 对应 CUDA 11.3 运行时；驱动需 >= 460（本机 570.124.04，向下兼容）
+    # 驱动需 >= 460（本机 570.124.04，向下兼容）
+# 栈 B：机器 3 RTX 5080 / CUDA 12.8（Blackwell）
+# torch==2.8.0+cu128            # 安装源：--index-url https://download.pytorch.org/whl/cu128
+# torchvision==0.23.0+cu128
+    # RTX 5080 为 sm_120；torch 1.12/cu113 不含该架构，不能只靠驱动向下兼容。
 
 numpy==1.26.4
     # 锁 1.x：habitat-sim 0.2.4 / mmdet3d 1.4.0 不适配 numpy 2.x
@@ -38,16 +46,22 @@ habitat-sim==0.2.4
     # pip 预编译 wheel；headless 渲染需 EGL_PLATFORM=surfaceless
 habitat-lab==0.2.4            # PATH
 habitat-baselines==0.2.4      # PATH
-    # 源码路径：/root/autodl-tmp/vlfm/habitat-lab/{habitat-lab,habitat-baselines}
+    # 源码路径：$WS/habitat-lab-<sha>/{habitat-lab,habitat-baselines}
+    #   旧机：$WS=/root/autodl-tmp，源码在 $WS/vlfm/habitat-lab/
+    #   新机：$WS=/home/iair/vlvm，源码在 $WS/habitat-lab-1639e1ae...-3c3f8586/
 
 # --- 4. TSP3D 三维检测（编译型依赖，最易失败的一层）--------------------------
 MinkowskiEngine==0.5.4
-    # 源码编译；需 openblas + CUDA_HOME + torch 1.12 头文件补丁，见指南 §2.2
+    # 源码编译；需 openblas + 对应 CUDA_HOME + torch 头文件补丁。
+    #   栈 A（cu113/torch 1.12）：按 openblas + CUDA 11.3 编译
+    #   栈 B（cu128/torch 2.8）：需 CUDA 12.8 / torch 2.8 兼容补丁（TDRESIZE 等）
 mmcv==2.1.0
-    # 预编译 wheel：-f https://download.openmmlab.com/mmcv/dist/cu113/torch1.12/index.html
+    # 栈 A：预编译 wheel：-f https://download.openmmlab.com/mmcv/dist/cu113/torch1.12/index.html
+    # 栈 B：无官方 wheel，需 MMCV_WITH_OPS=1 从源码编译 sm_120 wheel。
 mmdet==3.2.0
 mmdet3d==1.4.0
-mmengine==0.10.4
+mmengine==0.10.4               # 栈 A（本机实测）
+# mmengine==0.10.7             # 栈 B：0.10.4 会与 torch 2.8 新增的 adafactor 注册冲突
 openmim==0.3.9
 
 # --- 5. 几何 / 图像 / 服务 ----------------------------------------------------
@@ -73,23 +87,24 @@ tensorboard==2.8.0
 PyYAML==6.0.3
 
 # --- 7. Grounding-DINO 本地源码（editable）-----------------------------------
-GroundingDINO @ file:///root/autodl-tmp/vlvm/GroundingDINO     # PATH
+GroundingDINO @ file://$VLVM/GroundingDINO                   # PATH
 addict==2.4.0
 yapf==0.43.0
 supervision==0.6.0
 detectron2==0.6
 
 # --- 8. 项目本体与子模块（editable）------------------------------------------
-vlfm @ file:///root/autodl-tmp/vlvm                                   # PATH
-frontier_exploration @ file:///root/autodl-tmp/vlfm/frontier_exploration    # PATH ⚠️
-depth_camera_filtering @ file:///root/autodl-tmp/vlfm/depth_camera_filtering  # PATH ⚠️
-    # ⚠️ 这两个包不在 vlvm 仓库内，源码位于**外部目录** /root/autodl-tmp/vlfm/。
-    #    frontier_exploration 还带**注册副作用**：vlfm/run.py 顶部 import 它以注册
+vlfm @ file://$VLVM                                         # PATH
+# frontier_exploration / depth_camera_filtering 无公开 pip 包，且源码不随工作区分发：
+#   旧机：源码在 $WS/vlfm/{frontier_exploration,depth_camera_filtering}
+#   新机：环境内为 site-packages 快照副本（源码未迁入，仅可导入）
+    # ⚠️ frontier_exploration 还带**注册副作用**：vlfm/run.py 顶部 import 它以注册
     #    habitat 的 frontier_sensor / frontier_exploration_map 配置组，缺失会报
     #    Could not load 'habitat/task/lab_sensors/frontier_sensor'。迁移见指南 §2。
+    # ⚠️ Habitat 模拟器（habitat-sim，EGL 无头渲染）
 
 # --- 9. 可选 / 未使用但保持安装 -----------------------------------------------
 psutil
-    # 本机未安装。vlfm_trainer.py 内 try/except 导入，仅用于进程内存打印，缺失不影响运行
-mobile_sam==1.0               # 未使用（2D 时代遗留；源码 /root/autodl-tmp/vlfm/MobileSAM）
+    # vlfm_trainer.py 内 try/except 导入，仅用于进程内存打印，缺失不影响运行。
+mobile_sam==1.0               # 未使用（2D 时代遗留；旧机源码：$WS/vlfm/MobileSAM）
 spacy==3.3.3                  # 未使用（detectron2 / 旧 2D 链路遗留；未装 en_core_web_sm）

@@ -9,6 +9,21 @@ from gym.spaces import Dict as SpaceDict
 from gym.spaces import Discrete
 from torch import Tensor
 
+
+def _torch_load_legacy(path: str, **kwargs: Any):
+    """`torch.load` that works on both torch >= 2.6 and <= 1.12.
+
+    PointNav checkpoints embed an `omegaconf` config next to the state dict, which the
+    torch>=2.6 safe unpickler (`weights_only=True` default) rejects. The files are
+    trusted local artifacts, so request the legacy behaviour; `TypeError` covers
+    torch < 1.13, where the `weights_only` kwarg does not exist yet.
+    """
+    try:
+        return torch.load(path, weights_only=False, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)
+
+
 habitat_version = ""
 
 try:
@@ -169,16 +184,16 @@ def load_pointnav_policy(file_path: str) -> PointNavResNetTensorOutputPolicy:
 
             # print(pointnav_policy)
             pointnav_policy.net = PointNavResNetNet(discrete_actions=True, no_fwd_dict=True)
-            state_dict = torch.load(file_path + ".state_dict", map_location="cpu")
+            state_dict = _torch_load_legacy(file_path + ".state_dict", map_location="cpu")
         else:
-            ckpt_dict = torch.load(file_path, map_location="cpu")
+            ckpt_dict = _torch_load_legacy(file_path, map_location="cpu")
             pointnav_policy = PointNavResNetTensorOutputPolicy.from_config(ckpt_dict["config"], obs_space, action_space)
             state_dict = ckpt_dict["state_dict"]
         pointnav_policy.load_state_dict(state_dict)
         return pointnav_policy
 
     else:
-        ckpt_dict = torch.load(file_path, map_location="cpu")
+        ckpt_dict = _torch_load_legacy(file_path, map_location="cpu")
         pointnav_policy = PointNavResNetTensorOutputPolicy()
         current_state_dict = pointnav_policy.state_dict()
         # Let old checkpoints work with new code

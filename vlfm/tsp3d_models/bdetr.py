@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import torch.nn as nn
 from transformers import RobertaModel, RobertaTokenizerFast
 import MinkowskiEngine as ME
@@ -6,6 +9,12 @@ from .mink_resnet import TSPBackbone
 from .multilevel_head import TSPHead
 from mmdet3d.structures import bbox3d2result
 import time
+
+# 仓库根由本文件位置推导：vlfm/tsp3d_models/bdetr.py -> parents[2] = 仓库根。
+# 语言塔/配置目录默认 <repo>/data/tsp3d_models（可被 TSP3D_DATA_PATH 覆盖）。
+_DEFAULT_DATA_PATH = os.environ.get(
+    "TSP3D_DATA_PATH", str(Path(__file__).resolve().parents[2] / "data" / "tsp3d_models")
+)
 
 
 class BeaUTyDETR(nn.Module):
@@ -17,7 +26,7 @@ class BeaUTyDETR(nn.Module):
                 num_obj_class=485, 
                 input_feature_dim=3,
                 d_model=128,
-                data_path="/root/autodl-tmp/vlvm/data/tsp3d_models/",
+                data_path=_DEFAULT_DATA_PATH,
                 voxel_size=0.01):
         """Initialize layers."""
         super().__init__()

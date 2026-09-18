@@ -192,25 +192,20 @@ def _point_in_target_bbox(
 def aggregate_memory_stats(
     infos: Dict[str, Any], entries: Any = None
 ) -> Dict[str, Any]:
-    """Per-entry tp / fp labels of the episode-end memory (A4 measurement #2, §3.7.10).
+    """Per-entry tp / fp labels of the episode-end memory.
 
-    Entries are read from the policy snapshot (`policy._memory_entries_snapshot()`, read by
-    the trainer right after the episode ends) or, as a fallback, from
+    Entries are read from the stats logger snapshot (`policy._stats.memory_entries_snapshot()`,
+    read by the trainer right after the episode ends) or, as a fallback, from
     ``infos["memory_entries"]``. Every entry is labelled against the static GT target bbox
     with the same transform as ``was_false_positive``; results are split by proposer tag
-    (`src`) and by the suspicious subset, which is what A2 / A3 need to judge
-    "deleted tp share" and "lock-right : lock-wrong".
+    (`src`) and by the suspicious subset, which is what the "deleted tp share" and
+    "lock-right : lock-wrong" judgements need.
 
-    M-a (§五 量测): `gd_conf_*` slots carry the same splits for the raw GD sigmoid.
+    `gd_conf_*` slots carry the same splits for the raw GD sigmoid.
     Only entries with `gd_conf > 0` (entries that ever carried a GD vote) enter those
     means — a `tsp3d`-only entry writes no GD score and would otherwise dilute the
     average with zeros. `gd_conf_tp` vs `gd_conf_fp` is the separability read-out the
     confidence direction needs (a flat pair = GD score cannot rank tp over fp).
-
-    3-5 shadow (§优化方向 3): `geo_ind_*` groups the `src=gd` entries by tp / fp and
-    sums their geometric-independent vote count (`gd_geo_ind` from the memory manager)
-    plus how many reach `>= 2` (`ge2`) — the read-out for whether that criterion can
-    replace the raw `num_obs` lock count.
     """
     if entries is None:
         entries = infos.get("memory_entries")
@@ -228,20 +223,13 @@ def aggregate_memory_stats(
 
     def _gslot() -> Dict[str, float]:
         # n = entries, gd_conf_n = entries WITH a GD score, gd_conf = sum over those.
-        # geo_ind = sum of the 3-5 geometric-independent vote count over the entries.
         return {"n": 0, "tp": 0, "num_obs": 0.0,
-                "gd_conf": 0.0, "gd_conf_n": 0.0, "geo_ind": 0.0}
+                "gd_conf": 0.0, "gd_conf_n": 0.0}
 
     out: Dict[str, Any] = {
         "total": 0, "tp": 0, "by_src": {},
         "suspicious": {"n": 0, "tp": 0},
         "gd_conf_tp": _gslot(), "gd_conf_fp": _gslot(),
-        # 3-5 前提量测：`src=gd` 条目的几何独立票数 tp / fp 分组（`ge2` = ind>=2 的条目数）。
-        "geo_ind_tp": {"n": 0, "ind": 0.0, "ge2": 0},
-        "geo_ind_fp": {"n": 0, "ind": 0.0, "ge2": 0},
-        # D2-4 前提量测：逐条目 `g_self`（簇密度 / 框面积占比）的 tp / fp 分离。
-        "gself_tp": {"n": 0, "density": 0.0, "box_frac": 0.0},
-        "gself_fp": {"n": 0, "density": 0.0, "box_frac": 0.0},
     }
     for entry in entries:
         try:
@@ -259,19 +247,10 @@ def aggregate_memory_stats(
         slot["n"] += 1
         slot["tp"] += int(is_tp)
         slot["num_obs"] += float(entry.get("num_obs", 0.0))
-        geo_ind = float(entry.get("gd_geo_ind", 0.0) or 0.0)
-        slot["geo_ind"] += geo_ind
-        if src == "gd":
-            # 3-5 shadow: the criterion is a candidate replacement of `num_obs` for
-            # `gd` single votes — group those entries by tp / fp.
-            grp_geo = out["geo_ind_tp"] if is_tp else out["geo_ind_fp"]
-            grp_geo["n"] += 1
-            grp_geo["ind"] += geo_ind
-            grp_geo["ge2"] += int(geo_ind >= 2)
         if gconf > 0.0:
             slot["gd_conf"] += gconf
             slot["gd_conf_n"] += 1
-        # tp / fp split of the GD score itself (the M-a judgement gate).
+        # tp / fp split of the GD score itself.
         if gconf > 0.0:
             grp = out["gd_conf_tp"] if is_tp else out["gd_conf_fp"]
             grp["n"] += 1
@@ -279,21 +258,11 @@ def aggregate_memory_stats(
         if entry.get("suspicious"):
             out["suspicious"]["n"] += 1
             out["suspicious"]["tp"] += int(is_tp)
-        # D2-4 前提：带 GD 提案特征的条目按 tp / fp 分组累计（g_self 可分性）。
-        if float(entry.get("gself_n", 0) or 0) > 0:
-            grp = out["gself_tp"] if is_tp else out["gself_fp"]
-            grp["n"] += 1
-            grp["density"] += float(entry.get("gself_density", 0.0) or 0.0)
-            grp["box_frac"] += float(entry.get("gself_box_frac", 0.0) or 0.0)
     for slot in out["by_src"].values():
         slot["num_obs"] /= max(1, slot["n"])
         slot["gd_conf"] /= max(1.0, slot["gd_conf_n"])
-        slot["geo_ind"] /= max(1, slot["n"])
     for key in ("gd_conf_tp", "gd_conf_fp"):
         out[key]["gd_conf"] /= max(1.0, out[key]["n"])
-    for key in ("gself_tp", "gself_fp"):
-        out[key]["density"] /= max(1, out[key]["n"])
-        out[key]["box_frac"] /= max(1, out[key]["n"])
     return out
 
 

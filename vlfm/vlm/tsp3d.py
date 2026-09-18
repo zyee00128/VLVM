@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
@@ -15,16 +16,38 @@ from vlfm.tsp3d_models.bdetr import BeaUTyDETR
 
 PROMPT_SEPARATOR = "|"
 
+# 仓库根由本文件位置推导：vlfm/vlm/tsp3d.py -> parents[2] = 仓库根。
+# 权重/配置目录默认 <repo>/data/tsp3d_models（可被 TSP3D_DATA_PATH / TSP3D_CHECKPOINT 覆盖）。
+TSP3D_DATA_DIR = str(Path(__file__).resolve().parents[2] / "data" / "tsp3d_models")
+
+
+def _default_checkpoint(data_dir: str) -> str:
+    """默认权重路径：按候选名探测（各机在位的档名不同），都无则回退旧默认名。"""
+    for name in ("tsp3d_scanrefer.pth", "ckpt_sr3d.pth", "ckpt_nr3d.pth"):
+        candidate = os.path.join(data_dir, name)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(data_dir, "tsp3d_scanrefer.pth")
+
+
+TSP3D_DEFAULT_CHECKPOINT = os.environ.get("TSP3D_CHECKPOINT") or _default_checkpoint(
+    os.environ.get("TSP3D_DATA_PATH", TSP3D_DATA_DIR)
+)
+
+
 class TSP3D:
     def __init__(
         self,
         d_model=128,
         voxel_size: float = 0.01,
-        data_path: str = os.environ.get("TSP3D_DATA_PATH", "/root/autodl-tmp/vlvm/data/tsp3d_models/"),
+        data_path: str = os.environ.get("TSP3D_DATA_PATH", TSP3D_DATA_DIR),
         config_path: Optional[str] = None,
-        weights_path: str = os.environ.get("TSP3D_CHECKPOINT", "/root/autodl-tmp/vlvm/data/tsp3d_models/tsp3d_scanrefer.pth"),
+        weights_path: Optional[str] = None,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     ):
+        # 权重：显式传入 > TSP3D_CHECKPOINT > 按候选名探测 data_path 目录。
+        if weights_path is None:
+            weights_path = os.environ.get("TSP3D_CHECKPOINT") or _default_checkpoint(data_path)
         self.device = device
         self.voxel_size = voxel_size
         self._infer_seed_base = int(os.environ.get("TSP3D_SEED", "0"))
@@ -34,7 +57,12 @@ class TSP3D:
         self.model = BeaUTyDETR(d_model=d_model, voxel_size=voxel_size,
                     data_path=data_path)
         if os.path.exists(weights_path):
-            checkpoint = torch.load(weights_path, map_location=device)
+            try:
+                # torch >= 2.6 的 torch.load 默认 weights_only=True；本 checkpoint 含 config
+                # 元数据（argparse.Namespace），必须显式关闭。torch < 1.13 无该参数 ⇒ 回退。
+                checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(weights_path, map_location=device)
             # Checkpoint format: {'config': ..., 'model': OrderedDict, ...}
             # Use 'model' key first, fall back to 'state_dict', then raw dict
             if 'model' in checkpoint:

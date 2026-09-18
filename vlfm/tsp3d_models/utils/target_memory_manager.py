@@ -4,7 +4,7 @@ import numpy as np
 
 from vlfm.utils.geometry_utils import within_fov_cone
 
-# Proposer tags of a memory entry (§3.6.4 cross-frame vote merge).
+# Proposer tags of a memory entry (cross-frame vote merge).
 TSP3D_SRC = "tsp3d"
 GD_SRC = "gd"
 BOTH_SRC = "both"
@@ -32,18 +32,14 @@ class MemoryManagerConfig:
     merge_dist_thresh: float = 0.5        # merge two observations of the same class within this distance (m)
     ema_weight_old: float = 0.8           # EMA smoothing: old * 0.8 + new * 0.2
 
-    # 几何独立票量测（零行为）：连续写入同一条目时，位移 >= `gd_geo_move_m` (m)
-    # 或朝向变化 >= `gd_geo_yaw_deg` (deg) 记为一次"独立票"，按条目计数
-    # （`gd_geo_obs` / `gd_geo_ind`），供停止侧诊断（[STOP] 的 geo_ind 字段）。
-    gd_geo_move_m: float = 0.5
-    gd_geo_yaw_deg: float = 30.0
 
     # native anti-hallucination fallback (baseline mechanism)
     enable_fallback: bool = True          # native near-field hysteresis fallback master switch
     fb_near_radius: float = 2.5           # near-field FOV-cone radius (m); == max_depth * 0.5
     fb_hysteresis: int = 5                # trusted target: consecutive near-field miss frames before deletion
     fb_suspicious_hysteresis: int = 2     # suspicious target: consecutive near-field miss frames before deletion
-    fb_suspicious_conf: float = 0.75      # trusted/suspicious confidence boundary (must be > sigma_tar)
+    fb_suspicious_conf: float = 0.75      # trusted/suspicious confidence boundary.
+                                          # ⚠️ GD 启用时不作用：新条目恒被标可疑、合并写不重算（仅 `both` 清除）——现值仅留档。
 
 
 class TargetMemoryManager:
@@ -97,15 +93,15 @@ class TargetMemoryManager:
 
         `src` is the proposer tag of this write: "tsp3d" (default) / "gd" (GD-only
         single vote) / "both". Two different tags on the same entry make it "both"
-        (cross-frame vote merge, §3.6.4); it never changes the confidence scale.
+        (cross-frame vote merge); it never changes the confidence scale.
 
-        Vote policy (§3.6.4):
+        Vote policy:
           * `both` always follows the normal path — a merged `both` entry has its
             suspicious flag cleared (the 2-frame suspicion budget no longer applies);
           * single-side evidence may be marked suspicious: `new_suspicious` marks a
             newly created entry, `suspicious_override=True` forces the flag on.
 
-        M-a (§五 量测, default-neutral): `gd_conf` is the RAW GD sigmoid score of
+        Measurement-only `gd_conf`: the RAW GD sigmoid score of
         this write (0.0 = the write carries no GD score, i.e. a pure `tsp3d`
         write). Unlike `confidence` — which for a `gd` entry is the constant
         `sigma_tar` and for a `both` entry is the TSP3D `c'` — `gd_conf` keeps the
@@ -114,8 +110,7 @@ class TargetMemoryManager:
         all writes, i.e. the strongest GD evidence ever seen on that entry.
 
         Returns a small record of the write: `{merged, src, num_obs, suspicious,
-        suspicion_cleared, gd_conf, gd_geo_obs, gd_geo_ind}` (for caller-side
-        logging / accounting; the `gd_geo_*` pair is the geometric-vote count).
+        suspicion_cleared, gd_conf}` (for caller-side logging / accounting).
         """
         r_xyz = np.zeros(3) if robot_xyz is None else np.asarray(robot_xyz, dtype=np.float64)
         r_xy = r_xyz[:2]
@@ -123,6 +118,8 @@ class TargetMemoryManager:
         s_np = np.asarray(near_surface, dtype=np.float64) if near_surface is not None else c_np
 
         # Suspicious flag: low confidence or beyond the trustworthy range.
+        # ⚠️ GD 启用时本子句不参与决策：两处写入口恒推 True（TSP3D `new_suspicious=_gd_on`、
+        # GD `suspicious_override=True`），合并写不重算 —— 仅 GD-off 工况按 `fb_suspicious_conf` 分档。
         if c_np.shape[0] >= 3:
             detect_dist = float(np.linalg.norm(c_np - r_xyz))
         else:
@@ -139,41 +136,13 @@ class TargetMemoryManager:
             suspicious = True
 
         def _m_a(state: Dict[str, Any]) -> Dict[str, Any]:
-            # M-a (§五 量测): keep the strongest raw GD score ever written on this
-            # entry. Never feeds a decision; it is only read back for logging.
+            # Keep the strongest raw GD score ever written on this entry.
+            # Never feeds a decision; it is only read back for logging.
             if float(gd_conf) > 0.0:
                 state["gd_conf"] = max(
                     float(state.get("gd_conf", 0.0)), float(gd_conf)
                 )
             return {"gd_conf": float(state.get("gd_conf", 0.0))}
-
-        def _geo(state: Dict[str, Any]) -> Dict[str, Any]:
-            # 3-5 shadow (§优化方向 3, 零行为量测): count this write as a geometrically
-            # independent vote when the robot moved >= gd_geo_move_m or its heading
-            # changed >= gd_geo_yaw_deg since the last counted vote of this entry.
-            # (`gd_geo_obs` = total writes counted, `gd_geo_ind` = independent ones.)
-            obs = int(state.get("gd_geo_obs", 0)) + 1
-            state["gd_geo_obs"] = obs
-            pose = state.get("gd_geo_pose")
-            if pose is None:
-                ind = 1
-                state["gd_geo_ind"] = ind
-                state["gd_geo_pose"] = [float(r_xy[0]), float(r_xy[1]), float(robot_yaw)]
-            else:
-                moved = float(np.hypot(
-                    float(r_xy[0]) - float(pose[0]), float(r_xy[1]) - float(pose[1])
-                )) >= float(self.config.gd_geo_move_m)
-                dyaw = abs(float(np.arctan2(
-                    np.sin(float(robot_yaw) - float(pose[2])),
-                    np.cos(float(robot_yaw) - float(pose[2])),
-                )))
-                if moved or dyaw >= float(np.deg2rad(float(self.config.gd_geo_yaw_deg))):
-                    ind = int(state.get("gd_geo_ind", 0)) + 1
-                    state["gd_geo_ind"] = ind
-                    state["gd_geo_pose"] = [float(r_xy[0]), float(r_xy[1]), float(robot_yaw)]
-                else:
-                    ind = int(state.get("gd_geo_ind", 0))
-            return {"gd_geo_obs": obs, "gd_geo_ind": int(ind)}
 
         recs = self._mem.get(target_class)
         if not recs:
@@ -185,7 +154,7 @@ class TargetMemoryManager:
             self._fb[target_class] = [state]
             return {"merged": False, "src": _src_tag(src), "num_obs": 1,
                     "suspicious": bool(suspicious), "suspicion_cleared": False,
-                    **_m_a(state), **_geo(state)}
+                    **_m_a(state)}
 
         # Keep the side lists in sync
         if target_class not in self._surf:
@@ -222,7 +191,7 @@ class TargetMemoryManager:
             return {"merged": True, "src": merged_src, "num_obs": int(v_old[0]) + 1,
                     "suspicious": bool(prev_state.get("suspicious")),
                     "suspicion_cleared": cleared,
-                    **_m_a(prev_state), **_geo(prev_state)}
+                    **_m_a(prev_state)}
         else:
             recs.append(c_np)
             self._surf[target_class].append(s_np)
@@ -232,15 +201,15 @@ class TargetMemoryManager:
             self._fb[target_class].append(state)
             return {"merged": False, "src": _src_tag(src), "num_obs": 1,
                     "suspicious": bool(suspicious), "suspicion_cleared": False,
-                    **_m_a(state), **_geo(state)}
+                    **_m_a(state)}
 
     def state_of(self, centroid: np.ndarray, tol: float = 0.3) -> Dict[str, Any]:
         """Lifecycle / vote state dict of the entry nearest to ``centroid``.
 
-        Holds `suspicious`, `near_miss`, `src` and the M-a raw GD score (`gd_conf`);
+        Holds `suspicious`, `near_miss`, `src` and the raw GD score (`gd_conf`);
         an empty dict when no entry is within ``tol``. Returns a *shallow copy* with
-        `num_obs` merged in from the verify state, so callers (e.g. the 3-9 stop gate)
-        can read the live observation count without mutating the stored state.
+        `num_obs` merged in from the verify state, so callers can read the live
+        observation count without mutating the stored state.
         """
         c = np.asarray(centroid, dtype=np.float64).reshape(-1)
         if c.size < 2:
@@ -275,12 +244,12 @@ class TargetMemoryManager:
         reason: str,
         near_miss: int,
     ) -> Dict[str, Any]:
-        """One deletion record (A2 measurement #3, §3.9).
+        """One deletion record.
 
         Carries what the episode logger needs to label the deleted entry tp / fp and to
         split it by proposer tag: `src` / `num_obs` / `conf` / `gd_conf` /
         `near_miss` (`conf` = the entry's stored `c'`, `gd_conf` = its strongest raw GD
-        sigmoid, M-a §五 量测).
+        sigmoid).
         """
         try:
             conf = float(v_state[3]) if len(v_state) > 3 else 0.0
@@ -300,7 +269,7 @@ class TargetMemoryManager:
 
     @staticmethod
     def _log_deletion(rec: Dict[str, Any]) -> None:
-        """Print one deletion together with the A2 fields (one line, grep-able)."""
+        """Print one deletion together with its accounting fields (one line, grep-able)."""
         head, c = rec["reason"], np.round(np.asarray(rec["centroid"], dtype=np.float64), 3)
         tail = (
             f"suspicious={rec['suspicious']}, near_miss={rec['near_miss']}, "
@@ -325,13 +294,10 @@ class TargetMemoryManager:
     ) -> List[Dict[str, Any]]:
         """One-step lifecycle over all memory records.
 
-        Native near-field hysteresis fallback with the near-field exemption.
-
-        3-9 配套（§优化方向 3）: with `exempt_nav_goal=True` and a `nav_goal_xy`,
-        the entry within 0.5 m of the current navigation goal is exempt from the
-        near-field `near_miss` budget — otherwise a blocked stop (robot parked at
-        the goal, no new writes) would delete the entry and turn "delayed stop"
-        into "lost entry" (results/VLVM-V8.md §3.15.8 chain 3).
+        Native near-field hysteresis fallback with the near-field exemption:
+        with `exempt_nav_goal=True` and a `nav_goal_xy`, the entry within 0.5 m of
+        the current navigation goal is exempt from the near-field `near_miss` budget
+        — otherwise a blocked stop (no new writes) would delete the entry.
 
         Returns per-deletion logs with `reason` in {"hysteresis_exceeded"}.
         """
@@ -352,7 +318,8 @@ class TargetMemoryManager:
             f_states = self._fb.get(target_class, [])
             if len(f_states) != len(centroids):
                 # Defensive: keep fallback state in sync with centroids.
-                f_states = [{"suspicious": False, "near_miss": 0, "src": TSP3D_SRC} for _ in centroids]
+                f_states = [{"suspicious": False, "near_miss": 0, "src": TSP3D_SRC,
+                             "gd_conf": 0.0} for _ in centroids]
                 self._fb[target_class] = f_states
 
             keep_c: List[np.ndarray] = []
@@ -378,7 +345,7 @@ class TargetMemoryManager:
                         points=query_pt,
                     )
                     if len(in_cone) > 0:
-                        # 3-9 配套：navigate 模式下当前 nav goal 条目豁免 near_miss 预算。
+                        # navigate 模式下当前 nav goal 条目豁免 near_miss 预算。
                         _exempt = False
                         if exempt_nav_goal and ng_xy is not None:
                             _exempt = float(np.linalg.norm(c_np[:2] - ng_xy)) <= 0.5

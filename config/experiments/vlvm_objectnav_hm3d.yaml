@@ -74,15 +74,15 @@ habitat_baselines:
       init_turn_steps: 12
       min_depth: 0.5
       max_depth: 5.0
-      pointnav_stop_radius: 0.90 # 0.90
+      pointnav_stop_radius: 0.90
       # Anti-hallucination fallback
       enable_fb: True
-      fb_near_radius: 2.5
+      fb_near_radius: 2.5              # 有意失效：实现内固定 = max_depth×0.5（对齐 VLFM）；本键仅留档
       fb_hysteresis: 5
       fb_suspicious_hysteresis: 2
-      fb_suspicious_conf: 0.75
+      fb_suspicious_conf: 0.75         # GD 启用时不作用：新条目恒被标可疑、合并写不重算（仅 `both` 合并可清除）
       # obstacle map
-      om_style: "probabilistic" # probabilistic/ obstacle
+      om_style: "probabilistic" # probabilistic / obstacle
       voxel_size: 0.05
       min_obstacle_height: 0.15
       max_obstacle_height: 1.50
@@ -97,7 +97,7 @@ habitat_baselines:
       agent_height: 0.88
       nav_slice_height: 0.30
       # value map
-      vm_style: "region"  # "region" (V1) / "surface" (V2)
+      vm_style: "region"  # "region" / "surface"
       h_lam: 0.3
       h_norm_max: 1.0
       h_z_min: 0.15
@@ -113,8 +113,8 @@ habitat_baselines:
       near_field_sigma_scale: 0.8
       # TSP3D Input Processing
       use_vlfm_nlp: False
-      fusion_style: world # Fusion route: "camera" / "world" / "panoramic" / "none" / world+scan (enable_scan)
-      enable_scan: False
+      fusion_style: world   # Fusion route: "camera" / "world" / "panoramic (scan)" / "none"
+      enable_scan: False    # world + scan
       frontier_trigger: True
       scan_min_gap: 90 
       scan_opportunistic_after: 60
@@ -127,7 +127,7 @@ habitat_baselines:
       wm_max_frames: 8
       wm_voxel_size: 0.02
       wm_max_voxels: 400000
-      wm_radius: 6.0 # 5 ~ 7 m
+      wm_radius: 6.0
       wm_min_view_disp: 0.15
       wm_min_view_yaw: 15.0
       wm_near_refresh_radius: 3.0
@@ -151,17 +151,11 @@ habitat_baselines:
       s_penalty_thresh: 0.15
       s_penalty_floor: 0.3
       s_penalty_radius_m: 0.5
-      s_penalty_uncovered_w: 1.0         # 无覆盖（S≤0/None）权重：1.0=免罚（A1）；<1.0=轻微惩罚
-      # geometric admission module (occ-consistency + density gates)
+      s_penalty_uncovered_w: 1.0         # 无覆盖（S≤0/None）权重：1.0=免罚；<1.0=轻微惩罚
+      # geometric admission module (occupancy-consistency gate)
       enable_occ_consistency: True
       occ_min_voxels: 8
       occ_min_ratio: 0.001
-      enable_density_gate: True
-      density_occ_support: True
-      density_min_points: 150
-      density_min_frames: 2
-      density_cluster_merge_dist: 0.5
-      density_min_view_span_deg: 20.0
       # target-memory lifecycle
       merge_dist_thresh: 0.5
       ema_weight_old: 0.8
@@ -180,13 +174,10 @@ habitat_baselines:
       gdp_every_n: 5
       lock_min_obs: 2
       lock_exempt: True
-
-      # direction-2 mechanisms (§优化方向 2; 默认全关，实验档显式打开；R0 记账恒开)
-      # D2-1 / D2-6（停止闸）、D2-3（`both` 软加权）、D2-4（单票自洽硬门）已判负删除（2026-09-16）
-      # 3-4 / 3-5 / 3-9 / M1 / M2 / M3 / P2a / FSE v2 已判负或零效应删除（2026-09-17 清理）
-      d2_pick_src_first: False     # D2-2 同距离带内票型优先（both > gd > tsp3d，2026-09-16 修正序）
-      d2_pick_src_band: 0.5        # D2-2 距离带宽度（m）
-      d2_gd_skip_classes: ""       # D2-8 GD 类别白名单（这些目标类不跑 GD）
+      lock_exempt_identity: True   # True = 按条目身份豁免（质心匹配）；False = nav goal 近表面点
+      gd_skip_classes: ""           # GD 类别白名单（这些目标类不跑 GD）
+      sx_conflict_gate: True        # 冲突门：conf>=0.80 且 0<S<0.15 的检测写入口定向拒绝
+      enable_stats: True            # 通用前置量测开关（[NAV]/[STOP] 打印与逐集摘要；零行为）
 
     ppo:
       clip_param: 0.2

@@ -30,10 +30,10 @@ from vlfm.tsp3d_models.utils.s_penalty import (
     query_semantic_at,
 )
 from vlfm.tsp3d_models.utils.target_memory_manager import MemoryManagerConfig, TargetMemoryManager
+from vlfm.utils.vlvm_stats_logger import VlvmStatsLogger
 from vlfm.tsp3d_models.utils.target_geometric_gating import (
     TargetGeometricGatingEngine,
     BoxOccupancyConfig,
-    BoxPointDensityConfig,
 )
 from vlfm.tsp3d_models.grounding_dino import (
     BOTH,
@@ -50,6 +50,7 @@ from vlfm.tsp3d_models.grounding_dino import (
 
 
 PROMPT_SEPARATOR = "|"
+
 
 class TSP3DObjectNavPolicy(BasePolicy):
     """TSP3D-based 3D active semantic target navigation policy."""
@@ -87,8 +88,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             near_field_dist: float = 1.0,
             near_field_sigma_scale: float = 0.8,
             use_vlfm_nlp: bool = False,
-            fusion_style: str = "world",  # "camera" / "world" / "panoramic" (fusion routes)
-            enable_scan: bool = False,
+            fusion_style: str = "world",  # "camera" / "world" / "panoramic (scan)" / "none"
+            enable_scan: bool = False,    # world + scan
             frontier_trigger: bool = True,
             scan_min_gap: int = 90,
             scan_opportunistic_after: int = 60,
@@ -131,16 +132,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_floor: float = 0.3,
             s_penalty_radius_m: float = 0.5,
             s_penalty_uncovered_w: float = 1.0,
+            sx_conflict_gate: bool = True,
             # geometric admission module
             enable_occ_consistency: bool = True,
             occ_min_voxels: int = 8,
             occ_min_ratio: float = 0.001,
-            enable_density_gate: bool = True,
-            density_occ_support: bool = True,
-            density_min_points: int = 150,
-            density_min_frames: int = 2,
-            density_cluster_merge_dist: float = 0.5,
-            density_min_view_span_deg: float = 20.0,
             # target-memory manager
             merge_dist_thresh: float = 0.5,
             ema_weight_old: float = 0.8,
@@ -157,14 +153,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
             gdp_merge_iau: float = 0.3,
             gdp_port: int = 12181,
             lock_min_obs: int = 2,
-            lock_exempt: bool = False,
-
-            # D2-2 pick ranking: vote-type priority inside a distance band (ranking only).
-            d2_pick_src_first: bool = False,
-            d2_pick_src_band: float = 0.5,
-            # D2-8: GD class whitelist — these object goals skip the GD source entirely.
-            d2_gd_skip_classes: str = "",
-
+            lock_exempt: bool = True,
+            lock_exempt_identity: bool = True,
+            gd_skip_classes: str = "",
+            enable_stats: bool = True,
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -240,6 +232,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._init_memory_manager(
             merge_dist_thresh=merge_dist_thresh,
             ema_weight_old=ema_weight_old,
+            lock_exempt=lock_exempt,
+            lock_exempt_identity=lock_exempt_identity,
         )
         self._init_fusion(
             fusion_style=fusion_style,
@@ -283,17 +277,12 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_uncovered_w=s_penalty_uncovered_w,
             s_penalty_use_surface=s_penalty_use_surface,
             goal_use_surface=goal_use_surface,
+            sx_conflict_gate=sx_conflict_gate,
         )
         self._init_geom_gate(
             enable_occ_consistency=enable_occ_consistency,
             occ_min_voxels=occ_min_voxels,
             occ_min_ratio=occ_min_ratio,
-            enable_density_gate=enable_density_gate,
-            density_occ_support=density_occ_support,
-            density_min_points=density_min_points,
-            density_min_frames=density_min_frames,
-            density_cluster_merge_dist=density_cluster_merge_dist,
-            density_min_view_span_deg=density_min_view_span_deg,
         )
         self._init_gd_proposer(
             gdp_enable=gdp_enable,
@@ -305,14 +294,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
             gdp_merge_dist=gdp_merge_dist,
             gdp_merge_iau=gdp_merge_iau,
             gdp_port=gdp_port,
+            gd_skip_classes=gd_skip_classes,
+            lock_min_obs=lock_min_obs,
         )
-        self._init_d2(
-            d2_pick_src_first=d2_pick_src_first,
-            d2_pick_src_band=d2_pick_src_band,
-            d2_gd_skip_classes=d2_gd_skip_classes,
-            lock_exempt=lock_exempt,
-        )
-        self._lock_min_obs = max(int(lock_min_obs), 1)
+        # 通用前置量测器
+        self._stats = VlvmStatsLogger(self, enabled=enable_stats)
 
         # 3D visual grounding and vision-language evaluation clients
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
@@ -322,13 +308,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         self._det_seed = int(det_seed)
         self._rng_step = 0            # monotonic numpy-RNG seed counter (never reset)
-        self._nav_pick_key: Optional[tuple] = None   # dedup of the `[NAV] pick` print (M-b measurement)
-        # D2-1 / D2-6 measurements: stop-time & approach-time TSP3D co-confirmation.
-        self._nav_stats: Dict[str, Any] = {}         # per-episode counters (printed in `_reset`)
-        self._frame_admitted: List[Tuple[str, np.ndarray]] = []   # this frame's admitted candidates (cls, XY)
-        self._approach_key: Optional[tuple] = None   # dedup of the `[NAV] approach` print (0.5 m band)
-        self._last_pick_meta: Dict[str, Any] = {}    # src / n_obs / gd_conf / XY of the current nav pick
-        self._lock_step: int = -1                    # step at which the current lock started (-1 = no lock)
 
     def _reset(self) -> None:
         """Reset memories, step counters, pointnav model, and 3D occupancy map."""
@@ -353,8 +332,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._target_surface_memory.clear()
         self._target_verify_state.clear()
         self._target_fallback_state.clear()
-        # D2-1 measurement: episode-level stop / pick read-out of the finished episode.
-        self._log_nav_summary()
+        self._stats.episode_summary()
         self._last_target_coord = None
         self._geom_gate_engine.reset()
         self._scan_in_progress = False
@@ -369,14 +347,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._obstacle_map3d.reset()
         self._preprocessor.reset()
         self._detect_logs = []
-        self._nav_pick_key = None
-        self._approach_key = None
-        self._last_pick_meta = {}
-        self._frame_admitted = []
-        self._r0 = {"hit": 0, "miss": 0, "invis": 0}
-        self._gself_recs = []
         self._lock_step = -1
+        self._stats.reset()
         self._did_reset = True
+    
     # ==========================================================================
     # Mechanism initialisation (one `_init_*` per module) 
     # 3D spatial representations / target-memory lifecycle /
@@ -438,14 +412,19 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 occ_threshold=self._occ_threshold,
                 free_threshold=self._free_threshold,
             )
+
     def _init_memory_manager(
         self,
         *,
         merge_dist_thresh: float,
         ema_weight_old: float,
+        lock_exempt: bool = True,
+        lock_exempt_identity: bool = True,
     ) -> None:
-        """Target-memory lifecycle manager (EMA merge + fallback + erasure) bound to the
-        policy's memory dicts."""
+        """
+        Target-memory lifecycle manager (EMA merge + fallback + erasure) 
+        bound to the policy's memory dicts.
+        """
         self._memory_manager = TargetMemoryManager(MemoryManagerConfig(
             enable_fallback=self._enable_fb,
             fb_near_radius=self._fb_near_radius,
@@ -459,6 +438,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
             self._target_3d_memory, self._target_surface_memory,
             self._target_verify_state, self._target_fallback_state,
         )
+        self._lock_exempt = bool(lock_exempt)
+        self._lock_exempt_identity = bool(lock_exempt_identity)
+        self._lock_step: int = -1
+
     def _init_fusion(
         self,
         *,
@@ -517,7 +500,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         # the scan-end direction decision ranks them by c'.
         self._last_pending: list = []
         self._scan_value_views: list = []
-        self._scan_pos: Optional[np.ndarray] = None     # last scan / init pose (min-move novelty guard)
+        self._scan_pos: Optional[np.ndarray] = None      # last scan / init pose (min-move novelty guard)
         self._scan_remaining: int = 0                    # remaining in-place turn frames of a scan
         self._scan_pcd_frames: list = []                 # world-frame pcd slices of the in-progress scan
         self._scan_voxel_size = float(panoramic_voxel_size)
@@ -552,6 +535,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             panoramic_max_points=panoramic_max_points,
             panoramic_min_move=panoramic_min_move,
         )
+
     def _init_fallback(
         self,
         *,
@@ -581,8 +565,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
         s_penalty_uncovered_w: float,
         s_penalty_use_surface: bool,
         goal_use_surface: bool,
+        sx_conflict_gate: bool = True,
     ) -> None:
-        """S-penalty: c' = c * w_S(semantic field), plus the surface-point goal option."""
+        """
+        S-penalty: c' = c * w_S(semantic field), plus the surface-point goal option.
+        """
         self._s_penalty_cfg = SPenaltyConfig(
             enable=enable_s_penalty,
             thresh=s_penalty_thresh,
@@ -592,83 +579,25 @@ class TSP3DObjectNavPolicy(BasePolicy):
         )
         self._s_penalty_use_surface = s_penalty_use_surface
         self._goal_use_surface = goal_use_surface
+        self._sx_conflict_gate = bool(sx_conflict_gate)
+
     def _init_geom_gate(
         self,
         *,
         enable_occ_consistency: bool,
         occ_min_voxels: int,
         occ_min_ratio: float,
-        enable_density_gate: bool,
-        density_occ_support: bool,
-        density_min_points: int,
-        density_min_frames: int,
-        density_cluster_merge_dist: float,
-        density_min_view_span_deg: float,
     ) -> None:
-        """Geometric admission gate (occ-consistency + density). Runs before S-penalty."""
+        """
+        Geometric admission gate (occupancy-consistency). Runs before S-penalty.
+        """
         self._geom_gate_engine = TargetGeometricGatingEngine(
             occ_cfg=BoxOccupancyConfig(
                 enable=enable_occ_consistency,
                 min_occupied_voxels=occ_min_voxels,
                 min_occupancy_ratio=occ_min_ratio,
             ),
-            density_cfg=BoxPointDensityConfig(
-                enable=enable_density_gate,
-                min_points_confirm=density_min_points,
-                min_frames_confirm=density_min_frames,
-                cluster_merge_dist=density_cluster_merge_dist,
-                use_occupancy_support=density_occ_support,
-                min_view_span_deg=density_min_view_span_deg,
-            ),
         )
-
-    def _init_d2(
-        self,
-        *,
-        d2_pick_src_first: bool,
-        d2_pick_src_band: float,
-        d2_gd_skip_classes: str,
-        lock_exempt: bool,
-    ) -> None:
-        """Retained direction-2 / baseline switches, one per item:
-
-          D2-2 pick ranking          — vote-type priority inside a distance band (`both > gd > tsp3d`);
-          D2-5 R0 bookkeeping        — checked & hit / checked & miss counters (always on);
-          D2-8 GD class whitelist    — listed object goals skip the GD source;
-          V9 lock_exempt             — navigate 模式下 nav goal 条目豁免 near_miss 预算（基线机制）。
-
-        已判负删除（2026-09-16，results/VLVM-V8.md §3.15.4 / §3.15.7–§3.15.13）：
-        D2-1 / D2-6（旧停止闸）、D2-3（`both` 软加权）、D2-4（单票自洽硬门）；
-        已判负/零效应删除（2026-09-17 清理，results/VLVM-V8_1.md §四/§五）：
-        3-4 帧级补框、3-5 几何独立票锁门、3-9 停止闸 v2、M1 ITM 停机复核、
-        M2 停机帧 GD 复核、M3 关联影子、P2a（`lock_max_dist`）、free-space erasure v2。
-        `g_self` / R0 记录保留为量测（零行为）。
-        """
-        self._d2_pick_src_first = bool(d2_pick_src_first)
-        self._d2_pick_band = max(float(d2_pick_src_band), 0.0)
-        self._d2_gd_skip = {
-            c.strip() for c in str(d2_gd_skip_classes).split("|") if c.strip()
-        }
-        self._lock_exempt = bool(lock_exempt)
-        # R0 counters (per episode) + `g_self` 特征量测（零行为）：每个 GD 提案记录
-        # `(xy2, density, box_frac, vote)`，供条目级 tp/fp 可分性判定（D2-4 已删，仅留量测）。
-        self._r0: Dict[str, int] = {"hit": 0, "miss": 0, "invis": 0}
-        self._gself_recs: list = []
-
-    @staticmethod
-    def _self_features(proposal: Any, cam: Any) -> tuple:
-        """Cluster-level features of a `gd` proposal — **量测用，不影响行为**。
-
-        `density` = cluster points per box pixel, `box_frac` = box area / image area；
-        逐提案记录进 `_gself_recs`，供 `g_self separability` 判定（D2-4 门已判负删除）。
-        """
-        box = np.asarray(getattr(proposal, "box_px", np.zeros(4)), dtype=np.float64).reshape(-1)
-        w = max(float(box[2] - box[0]), 1.0) if box.size >= 4 else 1.0
-        h = max(float(box[3] - box[1]), 1.0) if box.size >= 4 else 1.0
-        area = w * h
-        img = max(float(getattr(cam, "width", 1)) * float(getattr(cam, "height", 1)), 1.0)
-        density = float(getattr(proposal, "n_points", 0)) / area
-        return density, area / img
 
     def _init_gd_proposer(
         self,
@@ -682,9 +611,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
         gdp_merge_dist: float,
         gdp_merge_iau: float,
         gdp_port: int,
+        gd_skip_classes: str = "",
+        lock_min_obs: int = 2,
     ) -> None:
-        """New GD auxiliary mechanism: an independent per-frame proposer + vote.
-        GD only proposes and votes (`both` / `gd`).
+        """
+        GD 辅助机制：独立每帧提议源 + 帧级两票（`both` / `gd`）。
         """
         self._gd_proposer = GdProposer(GdProposalConfig(
             enabled=bool(gdp_enable),
@@ -702,8 +633,14 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._gd_stats = {
             "both": 0, "gd": 0, "gd_rejected": 0, "both_cleared": 0, "tsp3d_new": 0,
         }
+        # GD 类别白名单
+        self._gd_skip_classes = {
+            c.strip() for c in str(gd_skip_classes).split("|") if c.strip()
+        }
+        # GD 弱证不锁门槛
+        self._lock_min_obs = max(int(lock_min_obs), 1)
 
-    # ---- new GD mechanism runtime ----
+
     def _gd_geom_admit(
         self,
         proposal: Any,
@@ -715,7 +652,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         Geometric admission of a `gd` single-vote candidate (the SAME gate as TSP3D).
 
         No new confidence threshold: the GD box only has to survive the existing
-        occ-consistency / density gate, exactly like a TSP3D candidate.
+        occupancy-consistency gate, exactly like a TSP3D candidate.
         """
         eng = self._geom_gate_engine
         if not eng.enabled:
@@ -731,34 +668,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         )
         if status == "REJECTED":
             return False
-        if eng.density_acc.cfg.enable and status != "HARD_CONFIRMED":
-            return False
         return True
-
-    @staticmethod
-    def _world_to_pixel(
-        point: np.ndarray, cam: Any
-    ) -> Union[None, Tuple[float, float, float]]:
-        """World point -> (u, v, forward depth) in the current frame; None when not visible.
-
-        R0 visibility test of the R2 negative-side accounting (§3.11 三): the inverse of
-        `_project_rgbd_to_3d_point_cloud`, with the camera-base axes `(forward, left, up)`.
-        A point behind the camera, outside the image, or beyond the depth range counts as
-        "not checked" and therefore **never** as negative evidence.
-        """
-        tf = np.asarray(cam.tf_camera_to_episodic, dtype=np.float64)
-        p = np.asarray(point, dtype=np.float64).reshape(-1)[:3]
-        if p.size < 3 or not np.all(np.isfinite(p)):
-            return None
-        base = tf[:3, :3].T @ (p - tf[:3, 3])
-        fwd, left, up = float(base[0]), float(base[1]), float(base[2])
-        if not (float(cam.min_depth) < fwd < float(cam.max_depth)):
-            return None
-        u = (-left) * float(cam.fx) / fwd + float(cam.width) / 2.0
-        v = (-up) * float(cam.fy) / fwd + float(cam.height) / 2.0
-        if not (0.0 <= u < float(cam.width) and 0.0 <= v < float(cam.height)):
-            return None
-        return (u, v, fwd)
 
     def _gd_apply(
         self,
@@ -788,8 +698,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
         prog = self._gd_proposer
         if prog is None or not prog.cfg.enabled or not self._done_initializing:
             return
-        # D2-8: object-goal classes on the whitelist skip the GD source entirely.
-        if self._d2_gd_skip and any(c.strip() in self._d2_gd_skip for c in target_classes):
+        # 类别白名单：列出的目标类完全跳过 GD 源。
+        if self._gd_skip_classes and any(c.strip() in self._gd_skip_classes for c in target_classes):
             return
         if not should_run(self._num_steps, prog.cfg.every_n):
             return
@@ -818,25 +728,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             np.asarray(robot_xyz, dtype=np.float64)[:2], rng,
         )
 
-        # D2-5 R0 three-state bookkeeping (checked & hit / checked & miss): live entries
-        # visible in this GD frame, split by whether a GD proposal co-locates with them.
-        for _cls_name, _centroids in self._target_3d_memory.items():
-            for _cen in _centroids:
-                _c_full = np.asarray(_cen, dtype=np.float64).reshape(-1)
-                if self._world_to_pixel(_c_full, cam) is None:
-                    # 三态记账（D2-5）：不可见 = "未检查"，既非命中亦非否定证据。
-                    self._r0["invis"] = int(self._r0.get("invis", 0)) + 1
-                    continue
-                _c2 = _c_full[:2]
-                _hit = any(
-                    float(np.linalg.norm(
-                        _c2 - np.asarray(p.centroid, dtype=np.float64).reshape(-1)[:2]))
-                    <= float(prog.cfg.merge_dist)
-                    for p in proposals
-                )
-                _key = "hit" if _hit else "miss"
-                self._r0[_key] = int(self._r0.get(_key, 0)) + 1
-
         if not proposals:
             return
 
@@ -850,17 +741,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
             for conf_amp, centroid_np, _surf, _classes in pending
         ]
         for proposal, vote, matched_idx in attach_votes(proposals, candidates, prog.cfg):
-            # `g_self` 特征量测（零行为）：记录每个 GD 提案的特征；逐条目的
-            # tp/fp 可分性在 episode 汇总的 "g_self separability" 行判定。
-            _den, _frac = self._self_features(proposal, cam)
-            self._gself_recs.append((
-                np.asarray(proposal.centroid, dtype=np.float64).reshape(-1)[:2].copy(),
-                float(_den), float(_frac), str(vote),
-            ))
             if vote == BOTH and matched_idx is not None:
                 conf_amp, centroid_np, _surf, classes = pending[matched_idx]
-                # 注：D2-3 的 `both` 共位软加权（c'' = c' + w * g_geo）已判负删除
-                # （2026-09-16，逐集 bit-identical）；此处保持 TSP3D 的 conf_amp。
+                # `both` 沿用 TSP3D 的 c'（GD 分数不改变置信度尺度）。
                 conf_use = float(np.clip(float(conf_amp), 0.0, 1.0))
                 res: Dict[str, Any] = {}
                 for cls in classes:
@@ -904,8 +787,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             print(f"[GD2] gd -> single vote '{cls}' at "
                   f"{np.round(np.asarray(proposal.centroid, dtype=np.float64)[:3], 2)} "
                   f"(gd={float(proposal.conf):.2f} n_obs={res.get('num_obs')} "
-                  f"geo_ind={res.get('gd_geo_ind')} "
-                  f"density={_den:.3f} box_frac={_frac:.3f} "
                   f"src={res.get('src')} suspicious={res.get('suspicious')} "
                   f"robot={np.round(np.asarray(robot_xyz, dtype=np.float64)[:2], 2)} "
                   f"yaw={float(robot_yaw):.2f}) -> pending")
@@ -1030,8 +911,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
     ) -> ObjectDetections:
         """Geometric admission on the current candidates.
 
-        REJECTED (empty-air) and (when the density gate is on) unconfirmed
-        SOFT_ACCUMULATING detections are dropped before the S-penalty gate.
+        REJECTED (empty-air) detections are dropped before the S-penalty gate.
         """
         engine = self._geom_gate_engine
         n = detections.num_detections
@@ -1040,7 +920,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         boxes_np = detections.boxes.detach().cpu().numpy()
         logits_np = detections.logits.detach().cpu().numpy()
         keep = np.ones(n, dtype=bool)
-        density_on = engine.density_acc.cfg.enable
         for i in range(n):
             status, _cluster, _diag = engine.process_detection(
                 target_class=detections.phrases[i],
@@ -1051,7 +930,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 step=self._num_steps,
                 robot_xyz=robot_xyz,
             )
-            drop = (status == "REJECTED") or (density_on and status == "SOFT_ACCUMULATING")
+            drop = status == "REJECTED"
             keep[i] = not drop
         if not keep.all():
             detections.filter_by_mask(keep)
@@ -1067,7 +946,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         valid_goals: List[np.ndarray] = []
         valid_obs: List[int] = []
         valid_src: List[str] = []
-        # M-a (§五 量测): raw GD sigmoid of each candidate entry (0.0 = no GD vote).
+        # 各候选条目的原始 GD sigmoid（0.0 = 无 GD 票；量测用）。
         valid_gconf: List[float] = []
         target_classes = self._target_object.split("|")
         for cls in target_classes:
@@ -1080,8 +959,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         v = verify_list[i]
                         obs = int(v[0]) if len(v) >= 1 else 1
 
-                    # Weak evidence does not lock (§3.6.4): a `gd` single vote needs
-                    # `lock_min_obs` observations before it may drive explore -> navigate.
+                    # 弱证不锁：`gd` 单票需 ≥ `lock_min_obs` 次观测才可驱动 explore -> navigate。
                     st = self._memory_manager.state_of(centroid)
                     src = str(st.get("src") or "tsp3d")
                     if not is_lockable(src, obs, self._lock_min_obs, self._gd_weak_guard):
@@ -1101,22 +979,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         robot_xy = np.asarray(position)[:2]
         centroids = np.array(valid_centroids)
         dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
-        if self._d2_pick_src_first:
-            # D2-2′: inside a ±band of the nearest centroid, prefer the stronger vote type
-            # **`both` > `gd` > `tsp3d`**（实测条目正确率 both 63.2% > gd 41.9% >
-            # tsp3d 28.8%，原序与实测相反，2026-09-16 修正）；ranking only — `c'` 与阈值不动。
-            _rank = {"tsp3d": 0, "gd": 1, "both": 2}
-            d_min = float(dists_2d.min())
-            in_band = [
-                i for i in range(len(dists_2d))
-                if float(dists_2d[i]) <= d_min + self._d2_pick_band
-            ]
-            chosen_idx = int(max(
-                in_band,
-                key=lambda i: (_rank.get(str(valid_src[i]), 1), -float(dists_2d[i])),
-            ))
-        else:
-            chosen_idx = int(np.argmin(dists_2d))
+        chosen_idx = int(np.argmin(dists_2d))
 
         chosen_2d = valid_goals[chosen_idx][:2].copy()
         if self._last_target_coord is None:
@@ -1132,82 +995,12 @@ class TSP3DObjectNavPolicy(BasePolicy):
             else:
                 self._last_target_coord = chosen_2d
 
-        # M-b (§五 量测): what the navigation decision actually locked.
-        self._log_nav_pick(
+        self._stats.note_pick(
             valid_centroids, valid_obs, valid_src, chosen_idx, position,
             valid_gconf=valid_gconf,
         )
 
         return self._last_target_coord
-
-    def _log_nav_pick(
-        self,
-        valid_centroids: List[np.ndarray],
-        valid_obs: List[int],
-        valid_src: List[str],
-        chosen_idx: int,
-        position: np.ndarray,
-        valid_gconf: Optional[List[float]] = None,
-    ) -> None:
-        """Log the chosen navigation entry: src / num_obs / GD score / distance / pose,
-        plus a compact dump of the whole candidate set (M-b §五 量测).
-
-        M-b: `cands=[src:o<n_obs>:g<gd_conf>@<dist>*]` lists every candidate of the same
-        decision (nearest first, `*` = the one actually locked), so any alternative
-        ranking key (score-first, in-band vote-type priority, ...) can be evaluated
-        offline (what-if) instead of by blind online A/B. The dedup key is unchanged,
-        so the print volume of earlier arms stays comparable.
-        """
-        src = str(valid_src[chosen_idx])
-        obs = int(valid_obs[chosen_idx])
-        robot_xy = np.asarray(position, dtype=np.float64).reshape(-1)[:2]
-
-        def _gconf(j: int) -> float:
-            if valid_gconf is None or j >= len(valid_gconf):
-                return 0.0
-            return float(valid_gconf[j] or 0.0)
-
-        def _dist(j: int) -> float:
-            cen = np.asarray(valid_centroids[j], dtype=np.float64).reshape(-1)
-            return float(np.linalg.norm(cen[:2] - robot_xy))
-
-        gconf = _gconf(chosen_idx)
-        dist = _dist(chosen_idx)
-        # 3-5 shadow：被锁定条目的几何独立票数（判据 = 位移 >= 0.5 m 或 视角差 >= 30°）。
-        _geo_ind = int(
-            self._memory_manager.state_of(valid_centroids[chosen_idx]).get("gd_geo_ind", 0) or 0
-        )
-        # D2-1 measurement: remember the locked entry (stop-time evidence) and count the
-        # vote-type split of the picks, unfiltered by the print dedup below.
-        self._last_pick_meta = {
-            "src": src, "n_obs": obs, "gd_conf": gconf, "geo_ind": _geo_ind,
-            "xy": np.asarray(valid_centroids[chosen_idx], dtype=np.float64).reshape(-1)[:2].copy(),
-        }
-        pick = self._nav_stats.setdefault("pick", {})
-        pick["n"] = int(pick.get("n", 0)) + 1
-        pick[src] = int(pick.get(src, 0)) + 1
-        key = (src, obs, round(dist / 0.5))
-        if key == self._nav_pick_key:
-            return
-        self._nav_pick_key = key
-        cands = sorted(
-            (
-                (_dist(j), int(j), str(valid_src[j]), int(valid_obs[j]), _gconf(j))
-                for j in range(len(valid_centroids))
-            ),
-            key=lambda t: (t[0], t[1]),
-        )
-        brief = ", ".join(
-            f"{s}:o{o}:g{g:.2f}@{d:.1f}{'*' if j == chosen_idx else ''}"
-            for d, j, s, o, g in cands[:4]
-        )
-        yaw = float(self._observations_cache.get("robot_heading", 0.0))
-        print(
-            f"[NAV] pick src={src} n_obs={obs} gd_conf={gconf:.2f} geo_ind={_geo_ind} "
-            f"dist={dist:.2f} "
-            f"robot={np.round(robot_xy, 2)} yaw={yaw:.2f} "
-            f"n_cand={len(valid_centroids)} cands=[{brief}]"
-        )
 
     def _update_object_map(
         self,
@@ -1323,22 +1116,19 @@ class TSP3DObjectNavPolicy(BasePolicy):
             out_log=self._detect_logs,
             per_det_meta=None,
             meta_out=admitted_meta,
+            conflict_gate=bool(self._sx_conflict_gate),
         )
         # Kept for the scan-end direction decision (c' ranking); see `scan_behavior`.
         self._last_pending = list(pending)
-        # D2-1 measurement: keep this frame's admitted candidates (class, XY) so that the
-        # stop-time / approach-time co-confirmation can be attributed to TSP3D.
-        self._frame_admitted = [
-            (str(cls), np.asarray(centroid_np, dtype=np.float64).reshape(-1)[:2])
-            for _conf, centroid_np, _surf, classes in pending
-            for cls in classes
-        ]
+        self._stats.note_frame_admitted(pending)
 
         # With the GD source on, a TSP3D-only write is "single-side" evidence: a NEW
         # entry starts suspicious and a same-frame `both` vote clears the flag again.
         # With GD off there is no second vote at all.
         _gd_on = self._gd_proposer is not None and self._gd_proposer.cfg.enabled
-        for (conf_amp, centroid_np, near_surface, active_classes), susp in zip(pending, admitted_meta):
+        for (conf_amp, centroid_np, near_surface, active_classes), susp in zip(
+            pending, admitted_meta
+        ):
             for cls in active_classes:
                 res = self._memory_manager.accumulate(
                     cls, centroid_np, confidence=conf_amp, near_surface=near_surface,
@@ -1361,12 +1151,18 @@ class TSP3DObjectNavPolicy(BasePolicy):
         camera_pos = tf_camera_to_episodic[:3, 3]
         camera_yaw = extract_yaw(tf_camera_to_episodic)
         cone_fov = get_fov(self._fx, self._depth_image_shape[1])
-        # 3-9 配套（`lock_exempt`）：navigate 模式下 nav goal 条目豁免 near_miss 预算。
+        # `lock_exempt`：navigate 模式下 nav goal 条目豁免 near_miss 预算。
         _nav_goal = self._last_target_coord if int(self._lock_step) >= 0 else None
+        # `lock_exempt_identity`：用被 pursue 条目质心替代 nav goal 做 0.5 m 匹配。
+        _exempt_ref = _nav_goal
+        if self._lock_exempt_identity:
+            _pxy_ref = (self._stats.last_meta or {}).get("xy")
+            if _pxy_ref is not None:
+                _exempt_ref = _pxy_ref
         self._memory_manager.step(
             camera_pos, camera_yaw, cone_fov,
             robot_xyz=robot_xyz,
-            nav_goal_xy=_nav_goal,
+            nav_goal_xy=_exempt_ref,
             exempt_nav_goal=bool(self._lock_exempt),
         )
 
@@ -1410,7 +1206,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         self._policy_info["rho_theta"] = np.array([rho, theta])
         if rho < self._pointnav_stop_radius and stop:
-            self._log_stop_confirm(goal, allowed=True)
+            self._stats.note_stop(allowed=True)
             self._called_stop = True
             return self._stop_action
 
@@ -1472,7 +1268,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             elif goal_3d is None:
                 # No lockable entry: drop the lock bookkeeping and keep exploring.
                 self._lock_step = -1
-                self._approach_key = None
                 mode = "explore"
                 action = self._explore(observations)
             else:
@@ -1480,7 +1275,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     self._lock_step = self._num_steps
                 mode = "navigate"
                 print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
-                self._log_approach(goal_3d, robot_xyz)
+                self._stats.note_approach(goal_3d, robot_xyz)
                 action = self._pointnav(goal_3d[:2], stop=True)
 
         action_np = action.detach().cpu().numpy()[0]
@@ -1495,132 +1290,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         return action, rnn_hidden_states
 
-
-    # D2-1 / D2-6 measurements: stop-time & approach-time TSP3D co-confirmation
-    def _tsp3d_confirms(self, xy: Any, tol: float = 0.5) -> bool:
-        """True when this frame's admitted TSP3D candidates co-locate with `xy`."""
-        if xy is None:
-            return False
-        p = np.asarray(xy, dtype=np.float64).reshape(-1)[:2]
-        for _cls, cxy in self._frame_admitted:
-            c = np.asarray(cxy, dtype=np.float64).reshape(-1)[:2]
-            if float(np.linalg.norm(c - p)) <= float(tol):
-                return True
-        return False
-
-    def _log_stop_confirm(self, goal: np.ndarray, allowed: bool = True) -> None:
-        """Stop-time measurement：本次停止的票型 / 单帧共位 / 距锁步数。
-
-        放行的停止计入 `stops` / 共位分档（`allowed=False` 的入口保留给诊断用途）。
-        """
-        meta = self._last_pick_meta or {}
-        confirm = self._tsp3d_confirms(meta.get("xy"))
-        steps_since_lock = (
-            int(self._num_steps) - int(self._lock_step) if self._lock_step >= 0 else -1
-        )
-        nav = self._nav_stats.setdefault("nav", {})
-        if allowed:
-            nav["stops"] = int(nav.get("stops", 0)) + 1
-            key = "stop_confirmed" if confirm else "stop_unconfirmed"
-            nav[key] = int(nav.get(key, 0)) + 1
-            if 0 <= steps_since_lock <= 5:
-                nav["stops_within5"] = int(nav.get("stops_within5", 0)) + 1
-        print(f"[STOP] step={self._num_steps} src={meta.get('src', '?')} "
-              f"n_obs={meta.get('n_obs', 1)} "
-              f"gd_conf={float(meta.get('gd_conf', 0.0) or 0.0):.2f} "
-              f"geo_ind={int(meta.get('geo_ind', 0) or 0)} "
-              f"tsp3d_confirm={confirm} steps_since_lock={steps_since_lock} "
-              f"stop_allowed={bool(allowed)}")
-
-    def _log_approach(self, goal: np.ndarray, robot_xyz: np.ndarray) -> None:
-        """Approach-time evidence (D2-6): distance to the locked entry + whether this
-        frame's TSP3D candidates confirm it, printed when the 0.5 m band changes so the
-        confirmation window (distance / frames) can be sized offline."""
-        meta = self._last_pick_meta or {}
-        g = np.asarray(goal, dtype=np.float64).reshape(-1)[:2]
-        robot = np.asarray(robot_xyz, dtype=np.float64).reshape(-1)[:2]
-        dist = float(np.linalg.norm(g - robot))
-        dedup = (str(meta.get("src", "?")), int(round(dist / 0.5)))
-        if dedup == self._approach_key:
-            return
-        self._approach_key = dedup
-        confirm = self._tsp3d_confirms(meta.get("xy"))
-        nav = self._nav_stats.setdefault("nav", {})
-        key = "approach_confirm" if confirm else "approach_unconfirm"
-        nav[key] = int(nav.get(key, 0)) + 1
-        print(f"[NAV] approach step={self._num_steps} src={meta.get('src', '?')} "
-              f"n_obs={meta.get('n_obs', 1)} dist={dist:.2f} tsp3d_confirm={confirm}")
-
-    def _log_nav_summary(self) -> None:
-        """Episode-level D2-1 read-out of the finished episode (printed on `_reset`)."""
-        nav = self._nav_stats.get("nav") or {}
-        pick = self._nav_stats.get("pick") or {}
-        if nav or pick:
-            print(f"[NAV] episode summary: stops={nav.get('stops', 0)} "
-                  f"stops_within5={nav.get('stops_within5', 0)} "
-                  f"stop_confirmed={nav.get('stop_confirmed', 0)} "
-                  f"stop_unconfirmed={nav.get('stop_unconfirmed', 0)} "
-                  f"approach_confirmed={nav.get('approach_confirm', 0)} "
-                  f"approach_unconfirmed={nav.get('approach_unconfirm', 0)} "
-                  f"picks={pick.get('n', 0)} pick_gd={pick.get('gd', 0)} "
-                  f"pick_both={pick.get('both', 0)} pick_tsp3d={pick.get('tsp3d', 0)} "
-                  f"r0_hit={self._r0.get('hit', 0)} r0_miss={self._r0.get('miss', 0)} "
-                  f"r0_invis={self._r0.get('invis', 0)}")
-        self._nav_stats = {}
-
-    def _memory_entries_snapshot(self) -> Dict[str, Dict[str, Any]]:
-        """Compact snapshot of the live memory entries (A4 measurement #2, §3.7.10).
-
-        Read by the evaluation trainer right after an episode finishes (the policy only
-        resets its memory on the next `act()`), so the finished episode's entries can be
-        labelled tp / fp against the GT target bbox. Plain scalars only, keyed
-        `"<class>[i]"` (never injected into `policy_info`: habitat's
-        `extract_scalars_from_info` would try `float()` on non-scalar payloads).
-        `gd_conf` (M-a §五 量测) is the entry's strongest raw GD sigmoid, kept next to
-        `conf` (the entry's `c'`) so the two scales can be compared per entry.
-        """
-        out: Dict[str, Dict[str, Any]] = {}
-        for cls, centroids in self._target_3d_memory.items():
-            ver = self._target_verify_state.get(cls, [])
-            states = self._target_fallback_state.get(cls, [])
-            for i, centroid in enumerate(centroids):
-                st = states[i] if i < len(states) else {}
-                v = ver[i] if i < len(ver) else (1, np.zeros(2), 0.0, 0.0)
-                c = np.asarray(centroid, dtype=np.float64).reshape(-1)
-                _gs = self._gself_of(c[:2])
-                out[f"{cls}[{i}]"] = {
-                    "class": str(cls),
-                    "x": float(c[0]),
-                    "y": float(c[1]) if c.size > 1 else 0.0,
-                    "src": str(st.get("src") or "tsp3d"),
-                    "num_obs": int(v[0]) if len(v) >= 1 else 1,
-                    "conf": float(v[3]) if len(v) > 3 else 0.0,
-                    "gd_conf": float(st.get("gd_conf", 0.0) or 0.0),
-                    "suspicious": bool(st.get("suspicious", False)),
-                    "gd_geo_obs": int(st.get("gd_geo_obs", 0) or 0),
-                    "gd_geo_ind": int(st.get("gd_geo_ind", 0) or 0),
-                    "gself_n": int(_gs[0]),
-                    "gself_density": float(_gs[1]),
-                    "gself_box_frac": float(_gs[2]),
-                }
-        return out
-
-    def _gself_of(self, xy: np.ndarray) -> tuple:
-        """Mean `g_self` features of the GD proposals that touched this entry (量测).
-
-        Matches the per-proposal records within 0.5 m of the entry centroid, so the
-        EMA merge (which moves a live centroid) cannot break the attribution.
-        """
-        p = np.asarray(xy, dtype=np.float64).reshape(-1)[:2]
-        n, dsum, fsum = 0, 0.0, 0.0
-        for r in self._gself_recs:
-            if float(np.linalg.norm(np.asarray(r[0], dtype=np.float64) - p)) <= 0.5:
-                n += 1
-                dsum += float(r[1])
-                fsum += float(r[2])
-        if n == 0:
-            return (0, 0.0, 0.0)
-        return (n, dsum / n, fsum / n)
 
     def _get_policy_info(self, detections: ObjectDetections) -> Dict[str, Any]:
         has_target = any(cls in self._target_3d_memory 
@@ -1669,10 +1338,10 @@ class VLVMConfig:
     pointnav_stop_radius: float = 0.30  # Distance (m) at which the agent stops near the goal; larger = stops farther from the target.
     # Phase 6b: Anti-hallucination fallback
     enable_fb: bool = True              # Delete confirmed-false centroids near the FOV cone -> fallback to explore.
-    fb_near_radius: float = 2.5         # Near-field confirmation cone radius (m); VLFM uses max_depth*0.5 (2.5m @ max_depth=5).
+    fb_near_radius: float = 2.5         # Near-field confirmation cone radius (m); VLFM uses max_depth*0.5 (2.5m @ max_depth=5). 有意失效（实现内固定）。
     fb_hysteresis: int = 5              # Trusted centroid: consecutive near-field frames without a fresh merge before deletion.
     fb_suspicious_hysteresis: int = 2   # Suspicious centroid (far/low-conf): fewer frames before deletion.
-    fb_suspicious_conf: float = 0.75    # Trust boundary (two-tier, must be > sigma_tar to activate): detections in [sigma_tar, fb_suspicious_conf) are flagged suspicious and deleted if not re-detected within 2 near-field frames; 0.75 is the most conservative active tier (V4.1).
+    fb_suspicious_conf: float = 0.75    # Trust boundary。GD 启用时**不作用**：新条目恒被 `new_suspicious=_gd_on` 标可疑、合并写不重算该标志，仅 `both` 合并可清除；现值仅留档（GD-off 工况才生效
 
     # Phase 3a: 3D Mapping & Occupancy Grid
     om_style: str = "obstacle"
@@ -1751,21 +1420,16 @@ class VLVMConfig:
     s_penalty_floor: float = 0.3            # Lower bound of the dynamic penalty weight w_S = max(floor, S/thresh) when S < thresh (non-zero -> keep recall; S->0 -> floor).
     s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection point.
     s_penalty_uncovered_w: float = 1.0      # weight when S=None/<=0 (no coverage): 1.0 = free pass (A1), <1.0 = mild penalty on unverifiable detections.
-    s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
-    goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
-    # Phase 7b: geometric admission module (occ-consistency + density gates)
+    sx_conflict_gate: bool = True        # 冲突门：conf≥0.80 ∧ 0<S<thresh 的检测写入口定向拒绝
+    # Phase 7b: geometric admission module (occupancy-consistency gate)
     enable_occ_consistency: bool = True     # box must have occupied-voxel support in the 3D grid
     occ_min_voxels: int = 8                 # occ gate: min occupied voxels supporting the box
     occ_min_ratio: float = 0.001            # occ gate: min occupied/(box volume) ratio
-    enable_density_gate: bool = True        # density x occupancy fusion gate (occ support OR density HARD-confirm)
-    density_occ_support: bool = True        # density gate: occupancy support as parallel spatio-temporal evidence
-    density_min_points: int = 150           # density gate: min accumulated in-box points to confirm
-    density_min_frames: int = 2             # density gate: min observation frames to confirm
-    density_cluster_merge_dist: float = 0.5 # density gate: cross-frame cluster association radius (m)
-    density_min_view_span_deg: float = 20.0 # density path: required multi-view azimuth span (deg, 0=off)
     # Phase 7c: target-memory lifecycle
     merge_dist_thresh: float = 0.5          # cross-view EMA merge distance threshold (m)
     ema_weight_old: float = 0.8             # cross-view EMA smoothing (old * w + new * (1 - w))
+    s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
+    goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
     
     # Phase 7d: new GD auxiliary mechanism — independent proposer + frame-level vote
     gdp_enable: bool = True              # master switch: run the GD proposal source on the current frame
@@ -1778,16 +1442,11 @@ class VLVMConfig:
     gdp_merge_iau: float = 0.3           # frame-level "same object" AABB IaU
     gdp_port: int = 12181                # Grounding-DINO server port
     lock_min_obs: int = 2                # a `gd` single-vote entry needs >= this many observations to be lockable
+    lock_exempt: bool = True             # 锁保持：navigate 锁定期间 nav goal 条目豁免近场 near_miss 预算
+    lock_exempt_identity: bool = True    # 豁免匹配基准：True = 被追踪条目质心（身份）；False = nav goal 近表面点
+    gd_skip_classes: str = ""            # object goals that skip the GD source (e.g. "couch")
 
-
-    # Phase 7h: direction-2 mechanisms (§优化方向 2; all default OFF except the R0 counters)
-    # 注：D2-1 / D2-6（停止闸）、D2-3（`both` 软加权）、D2-4（单票自洽硬门）已判负删除（2026-09-16）
-    d2_pick_src_first: bool = False      # D2-2: vote-type priority inside a distance band (ranking only)
-    d2_pick_src_band: float = 0.5        # D2-2: band width (m)
-    d2_gd_skip_classes: str = ""         # D2-8: object goals that skip the GD source (e.g. "couch")
-
-    # V9 baseline mechanism（2026-09-17 采纳）：nav-goal entry exempt from the near-field near_miss budget
-    lock_exempt: bool = False            # V9: nav-goal entry exempt from the near-field near_miss budget
+    enable_stats: bool = True     # 通用前置量测开关（[NAV]/[STOP] 打印与逐集摘要；零行为）
 
 
 cs = ConfigStore.instance()
