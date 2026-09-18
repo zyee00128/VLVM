@@ -8,9 +8,13 @@
 #      （例如把 transformers 从 4.26.0 拉高而破坏 BLIP-2）。
 #   2) 发行名与包名保持 `vlfm`，不随环境名改动：import 名 `vlfm` 被全部代码
 #      （`import vlfm...` 共百余处）与全部启动命令（`python -m vlfm.run` /
-#      `python -m vlfm.vlm.tsp3d` 等）固定引用，改名无收益且必致不一致。
+#      `python -m vlfm.vlm.tsp3d` 等）固定引用。
 #   3) packages.find.where = ["vlfm"] —— 与原 VLFM 一致：包根即 vlfm/，
 #      故 `import vlfm` → <repo>/vlfm/__init__.py。
+#   4) 不声明 license / readme 字段 —— 仓库暂无 LICENSE 与 README 文件；
+#      补齐文件后再声明（build 引用不存在的文件会直接报错）。
+#   5) authors / urls / keywords / classifiers 仅作元数据（GitHub 展示与
+#      `pip show` 可读），不影响安装与运行行为。
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -21,6 +25,24 @@ name = "vlfm"
 version = "0.1"
 description = "VLVM: 3D-Native ObjectNav (TSP3D grounder) built on the VLFM framework"
 requires-python = ">=3.9"
+authors = [{ name = "zyee00128" }]
+keywords = [
+    "Embodied AI",
+    "ObjectNav",
+    "Vision-Language Navigation",
+    "3D Semantic Mapping",
+    "TSP3D",
+    "Habitat",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/zyee00128/VLVM"
 
 [tool.setuptools.packages.find]
 where = ["vlfm"]
