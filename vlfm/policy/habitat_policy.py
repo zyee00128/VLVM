@@ -125,6 +125,13 @@ class Habitat3DMixin:
         else:
             raise ValueError("Dataset type could not be inferred from habitat config")
 
+        # GD class list follows the dataset (HM3D 6 classes / MP3D 21 classes, kept separate); 
+        # an explicitly non-empty `gdp_vocab` from the YAML still wins.
+        if not kwargs.get("gdp_vocab"):
+            kwargs["gdp_vocab"] = (
+                list(MP3D_ID_TO_NAME) if kwargs["dataset_type"] == "mp3d" else list(HM3D_ID_TO_NAME)
+            )
+
         return cls(**kwargs)
 
     def act(

@@ -8,6 +8,7 @@ import MinkowskiEngine as ME
 from mmdet3d.structures.bbox_3d import DepthInstance3DBoxes
 from .trans_modules import (BiEncoder, BiEncoderLayer, PositionEmbeddingLearned)
 
+
 def bias_init_with_prob(prior_prob):
     """initialize conv/fc bias value according to giving probability."""
     bias_init = float(-np.log((1 - prior_prob) / prior_prob))
@@ -37,7 +38,6 @@ class MinkowskiFeatureFusionBlock(nn.Module):
         batch_indices = backbone_feats.C[:, 0].long()  
         # Repeat text features for each point in the corresponding batch
         repeated_text_feats = text_feats[batch_indices]
-        
         # Combine the backbone and text features
         combined_features = torch.cat([backbone_feats.F, repeated_text_feats], dim=1)
         combined_feats = ME.SparseTensor(
@@ -173,7 +173,8 @@ class TSPHead(nn.Module):
         self.fuse = MinkowskiFeatureFusionBlock(128, 128, 128)
 
     def _prune_inference(self, x, scores, layer_id, prune_threshold=None):
-        """Prunes the tensor by score thresholding.
+        """
+        Prunes the tensor by score thresholding.
 
         Args:
             x (SparseTensor): Tensor to be pruned.
@@ -198,6 +199,7 @@ class TSPHead(nn.Module):
                 mask = score > threshold
                 mask = mask.reshape([len(score)])
                 prune_mask[permutation[mask]] = True
+        
         # Call the MinkowskiEngine backend physical level 
         # to remove the voxels designated for pruning from the hash map entirely
         if prune_mask.sum() != 0:
@@ -209,7 +211,9 @@ class TSPHead(nn.Module):
 
     @staticmethod
     def _bbox_pred_to_bbox(points, bbox_pred):
-        """Transform predicted bbox parameters to bbox.
+        """
+        Transform predicted bbox parameters to bbox.
+
         Args:
             points (Tensor): Final locations of shape (N, 3)
             bbox_pred (Tensor): Predicted bbox parameters of shape (N, 6) or (N, 8).
@@ -245,7 +249,8 @@ class TSPHead(nn.Module):
 
     def _get_bboxes_single(self, bbox_preds, cls_preds, points, img_meta):
         """ 
-        Merge predicted features and apply score coarse filtering, transformation, and NMS to generate final single-batch 3D boundaries
+        Merge predicted features and apply score coarse filtering, transformation, 
+        and NMS to generate final single-batch 3D boundaries
         """
         scores = torch.cat(cls_preds).sigmoid()
         bbox_preds = torch.cat(bbox_preds)
@@ -304,7 +309,8 @@ class TSPHead(nn.Module):
         """ 
         Pure inference forward pass main loop: 
         Implement multi-layer transposed convolution geometric upsampling, dynamic scene pruning, 
-        and bi-directional feature compensation/completion for missing voxels """
+        and bi-directional feature compensation/completion for missing voxels
+        """
 
         inputs = x[1:]
         x = inputs[-1]

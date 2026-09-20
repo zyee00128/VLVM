@@ -155,11 +155,8 @@ class BoxOccupancyGate:
 
 # Unified admission engine (occupancy-consistency gate)
 class TargetGeometricGatingEngine:
-    """Unified geometric admission engine: occupancy-consistency gate only.
-
-    历史注记（results/VLVM-V8_2.md 最终基座判定）：原 M3「盒内点数×帧数」密度门实测
-    与关闭时逐集零差异（occ 门同阈值前置硬拒 ⇒ 其 occ 捷径恒真），已按预注册处置整套
-    删除；引擎只保留 occ 一致性门。
+    """
+    Unified geometric admission engine: occupancy-consistency gate only.
     """
 
     def __init__(self, occ_cfg: Optional[BoxOccupancyConfig] = None):
@@ -184,10 +181,12 @@ class TargetGeometricGatingEngine:
         step: int,
         robot_xyz: Optional[np.ndarray] = None,
     ) -> Tuple[str, Optional[Any], Dict[str, Any]]:
-        """Run one detection through the occupancy-consistency gate.
+        """
+        Run one detection through the occupancy-consistency gate.
 
-        Returns status 'REJECTED' | 'HARD_CONFIRMED' — 'REJECTED' = empty-air box
-        (no occupied-voxel support) which the caller drops before the S-penalty gate.
+        Returns status 'REJECTED' | 'HARD_CONFIRMED'
+        'REJECTED' = empty-air box (no occupied-voxel support) 
+        which the caller drops before the S-penalty gate.
         The remaining arguments are kept for call-site compatibility.
         """
         diag_summary: Dict[str, Any] = {}

@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
 import numpy as np
 
 @dataclass
@@ -8,20 +7,20 @@ class SPenaltyConfig:
     """S-penalty hyper-parameters."""
 
     enable: bool = True
-    thresh: float = 0.15   # S below this -> penalty (ITM raw cosine scale ~0.10-0.15)
-    floor: float = 0.3     # w_S lower bound (keeps recall for borderline true targets)
-    radius_m: float = 0.5  # S query radius (m) around the detection point
+    thresh: float = 0.15    # S below this -> penalty (ITM raw cosine scale ~0.10-0.15)
+    floor: float = 0.3      # w_S lower bound (keeps recall for borderline true targets)
+    radius_m: float = 0.5   # S query radius (m) around the detection point
     uncovered_w: float = 1.0  # weight when there is NO semantic coverage (S=None/<=0);
                               # 1.0 = free pass (A1 default), <1.0 = mild penalty for
                               # detections the value map cannot corroborate at all.
 
 
 def compute_w_s(s: Optional[float], cfg: SPenaltyConfig) -> Tuple[float, Optional[float]]:
-    """Map a semantic-field value S to a penalty weight w_S; returns (w_S, S).
+    """
+    Map a semantic-field value S to a penalty weight w_S
 
-    S=None/<=0 (no coverage) -> (cfg.uncovered_w, None): the historical A1 default is
-    1.0 = free pass; a value <1.0 additionally discounts detections in never-scored
-    areas (the value map cannot corroborate them, which is not positive evidence)."""
+    returns (w_S, S)
+    """
     if not cfg.enable:
         return 1.0, None
     if s is None or s <= 0.0:
@@ -38,16 +37,20 @@ def amplified_confidence(conf: float, s: Optional[float], cfg: SPenaltyConfig) -
 
 
 def query_semantic_at(x: float, y: float, radius_m: Optional[float] = None) -> Optional[float]:
-    """Default semantic-field query hook; returns None = no coverage.
+    """
+    Default semantic-field query hook; returns None = no coverage.
 
-    Policy subclasses override the instance-level hook to query the 2.5D value map."""
+    Policy subclasses override the instance-level hook to query the 2.5D value map.
+    """
     return None
 
 
 def near_surface_point(box_corners: np.ndarray, camera_pos: np.ndarray) -> Optional[np.ndarray]:
-    """Mean of the 4 bbox corners nearest to the camera (near-face center).
+    """
+    Mean of the 4 bbox corners nearest to the camera (near-face center).
 
-    Returns None if the box is malformed."""
+    Returns None if the box is malformed.
+    """
     corners = np.asarray(box_corners, dtype=np.float64)
     if corners.ndim != 2 or corners.shape[0] < 4 or corners.shape[1] < 2:
         return None
@@ -76,18 +79,20 @@ def apply_s_penalty(
     conflict_gate: bool = True,
     conflict_conf_hi: float = 0.80,
 ) -> List[Tuple[float, np.ndarray, Optional[np.ndarray], List[str]]]:
-    """S-penalty + admission gate for filtered detections.
+    """
+    S-penalty + admission gate for filtered detections.
 
     Returns [(conf_amp, centroid, near_surface, active_classes)].
 
-    If ``out_log`` is given, one dict per detection is appended for
+    If ``out_log`` is given, one dict per detection is appended for 
     detection-level diagnostics: {conf, conf_amp, centroid, s, admitted}.
 
-    ``per_det_meta`` is copied item-by-item into ``meta_out`` 
-    for each ADMITTED detection.
+    ``per_det_meta`` is copied item-by-item into ``meta_out`` for each ADMITTED detection.
 
-    冲突门：``conflict_gate=True`` 时，对“conf ≥ conflict_conf_hi ∧ 0 < S < cfg.thresh”
-    的组合在写入口定向拒绝（即便 conf·w_S 已达准入线）。
+    Conflict gate: with ``conflict_gate=True``, 
+    detections satisfying "conf ≥ conflict_conf_hi ∧ 0 < S < cfg.thresh" 
+    are rejected outright at the write entry 
+    (even if conf·w_S already reaches the admission line).
     """
     import torch  # local import keeps the module torch-free at import time
 
@@ -114,11 +119,14 @@ def apply_s_penalty(
         w_s, _ = compute_w_s(s, cfg)
         conf_amp = conf_f * w_s
         admitted = conf_amp >= sigma_tar
-        # 冲突门：对“conf ≥ conf_hi ∧ 0 < S < thresh”的组合定向拒绝 —— “高 conf
-        # 补偿低 S”的放行通道不再进入写入/锁定链。
+        reject_reason = None if admitted else (
+            "uncovered" if (s is None or float(s) <= 0.0) else "low_conf"
+        )
+        # Conflict gate
         if admitted and conflict_gate and cfg.enable and s is not None and float(s) > 0.0:
             if float(conf_f) >= float(conflict_conf_hi) and float(s) < float(cfg.thresh):
                 admitted = False
+                reject_reason = "conflict"
         if out_log is not None:
             out_log.append(
                 {
@@ -127,6 +135,7 @@ def apply_s_penalty(
                     "centroid": centroid_np,
                     "s": s,
                     "admitted": bool(admitted),
+                    "reject": reject_reason,
                 }
             )
         if not admitted:

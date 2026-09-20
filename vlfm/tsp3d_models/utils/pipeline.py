@@ -146,8 +146,9 @@ class TSP3DInputPreprocessor:
         camera_height: float,
     ) -> np.ndarray:
         if self._fusion_style == "none":
-            # Single-view: raw current frame, only converted to the camera-canonical
-            # frame of the query pose. No fusion, no crop, no sampling.
+            # Single-view: raw current frame, 
+            # only converted to the camera-canonical frame of the query pose. 
+            # No fusion, no crop, no sampling.
             if self._last_frame is None or len(self._last_frame) == 0:
                 return np.empty((0, 6), dtype=np.float32)
             pts = _to_camera_canonical(self._last_frame, robot_xyz, robot_yaw)

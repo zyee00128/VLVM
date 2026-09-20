@@ -131,6 +131,36 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
     print(f"precision: {tp / max(1, total) * 100:.2f}%")
     print(f"episodes with >=1 true-positive detection: {eps_with_tp}/{len(stats)}")
 
+    # Per-target-class breakdown (episode_records carry `target_object`).
+    by_cls: Dict[str, Dict[str, int]] = {}
+    for rec in episode_records:
+        s = rec.get("detect_stats")
+        if not s:
+            continue
+        cls = str(rec.get("target_object") or "?")
+        d = by_cls.setdefault(cls, {"n": 0, "total": 0, "tp": 0, "fp": 0, "adm": 0})
+        d["n"] += 1
+        d["total"] += int(s["total"])
+        d["tp"] += int(s["tp"])
+        d["fp"] += int(s["fp"])
+        d["adm"] += sum(1 for a in s.get("admitted", []) if a)
+    if by_cls:
+        print("  per-class detection-level (class | eps | det | tp (prec) | fp | admitted)")
+        for cls, d in sorted(by_cls.items(), key=lambda kv: -kv[1]["total"]):
+            prec = d["tp"] / max(1, d["total"]) * 100.0
+            print(
+                f"    {cls:<20} {d['n']:>4} | {d['total']:>5} | {d['tp']:>4} "
+                f"({prec:5.1f}%) | {d['fp']:>4} | {d['adm']:>4}"
+            )
+
+    # Gate rejection reasons (S-based admission + conflict gate).
+    rej: Dict[str, int] = {}
+    for s in stats:
+        for k, v in (s.get("rejects") or {}).items():
+            rej[str(k)] = rej.get(str(k), 0) + int(v)
+    if rej:
+        print("  gate rejects: " + "  ".join(f"{k}={v}" for k, v in sorted(rej.items())))
+
     def _dist(name: str, arr) -> None:
         if not arr:
             return
@@ -214,15 +244,16 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
 
 
 def _print_memory_metrics(episode_records: List[Dict[str, Any]]) -> None:
-    """Per-entry tp / fp of the memorized candidates.
+    """
+    Per-entry tp / fp of the memorized candidates.
 
     Splits by proposer tag (`tsp3d` / `gd` / `both`) and reports the suspicious subset
     (deletion-budget / lock-right : lock-wrong inputs).
 
-    The `gd_conf` column is the mean raw GD sigmoid over the entries of
-    that tag that actually carry a GD score (a `tsp3d`-only entry has none), and the
-    `gd-conf separability` line compares the tp group with the fp group — that gap is
-    the judgement gate of the confidence direction.
+    The `gd_conf` column is the mean raw GD sigmoid over the entries of 
+    that tag that actually carry a GD score (a `tsp3d`-only entry has none), 
+    and the `gd-conf separability` line compares the tp group with the fp group 
+    — that gap is the judgement gate of the confidence direction.
     """
     stats = [r["mem_stats"] for r in episode_records if r.get("mem_stats")]
     if not stats:
@@ -280,11 +311,12 @@ def _print_memory_metrics(episode_records: List[Dict[str, Any]]) -> None:
 
 
 def _print_eval_breakdown(episode_records: List[Dict[str, Any]]) -> None:
-    """Print Oracle Success Rate + per-target + per-scene metric breakdowns.
+    """
+    Print Oracle Success Rate + per-target + per-scene metric breakdowns.
 
     Args:
-        episode_records: One dict per finished episode with keys: scene_id,
-            target_object, success, oracle_success, spl, soft_spl, steps_count.
+        episode_records: One dict per finished episode with keys: 
+            scene_id, target_object, success, oracle_success, spl, soft_spl, steps_count.
     """
     n = len(episode_records)
     if n == 0:
@@ -358,7 +390,8 @@ class VLVMTrainer(PPOTrainer):
         writer: TensorboardWriter,
         checkpoint_index: int = 0,
     ) -> None:
-        r"""Evaluates a single checkpoint.
+        r"""
+        Evaluates a single checkpoint.
 
         Args:
             checkpoint_path: path of checkpoint
@@ -371,12 +404,13 @@ class VLVMTrainer(PPOTrainer):
         if self._is_distributed:
             raise RuntimeError("Evaluation does not support distributed mode")
 
-        # Some configurations require not to load the checkpoint, like when using
-        # a hierarchical policy
+        # Some configurations require not to load the checkpoint, 
+        # like when using a hierarchical policy
         if self.config.habitat_baselines.eval.should_load_ckpt:
-            # PyTorch >= 2.6 defaults `torch.load(weights_only=True)`; habitat's checkpoint
-            # loader does not pass `weights_only`, and the eval checkpoint embeds an
-            # `omegaconf.DictConfig` (the saved config), which the safe unpickler rejects.
+            # PyTorch >= 2.6 defaults `torch.load(weights_only=True)`; 
+            # habitat's checkpoint loader does not pass `weights_only`, 
+            # and the eval checkpoint embeds an `omegaconf.DictConfig` (the saved config), 
+            # which the safe unpickler rejects.
             # The checkpoint is a trusted local artifact -> load in legacy mode;
             # `TypeError` covers torch < 1.13 where the kwarg does not exist yet.
             try:
@@ -519,9 +553,8 @@ class VLVMTrainer(PPOTrainer):
             t1 = time.perf_counter()
             policy_latency = t1 - t0
 
-            # NB: Move actions to CPU.  If CUDA tensors are
-            # sent in to env.step(), that will create CUDA contexts
-            # in the subprocesses.
+            # NB: Move actions to CPU.  If CUDA tensors are sent in to env.step(), 
+            # that will create CUDA contexts in the subprocesses.
             if is_continuous_action_space(self._env_spec.action_space):
                 # Clipping actions to the specified limits
                 step_data = [
@@ -656,8 +689,8 @@ class VLVMTrainer(PPOTrainer):
                         detect_stats = None
 
                     # Per-entry tp / fp of the final memory (episode-end snapshot).
-                    # Read straight from the policy: it only clears its memory on the next
-                    # `act()`, so the finished episode's entries are still live here.
+                    # Read straight from the policy: it only clears its memory on the next `act()`, 
+                    # so the finished episode's entries are still live here.
                     mem_stats = None
                     try:
                         from vlfm.utils.episode_stats_logger import aggregate_memory_stats
@@ -715,8 +748,8 @@ class VLVMTrainer(PPOTrainer):
                             current_episodes_info[i].episode_id,
                         )
 
-            # When pausing and removing environments (Pause Vectorized Env), keep
-            # the per-env timing containers in sync
+            # When pausing and removing environments (Pause Vectorized Env), 
+            # keep the per-env timing containers in sync
             if len(envs_to_pause) > 0:
                 env_step_counts = [val for idx, val in enumerate(env_step_counts) if idx not in envs_to_pause]
                 env_policy_times = [val for idx, val in enumerate(env_policy_times) if idx not in envs_to_pause]
@@ -745,8 +778,7 @@ class VLVMTrainer(PPOTrainer):
         pbar.close()
 
         if "ZSOS_DONE_PATH" in os.environ:
-            # Create an empty file at ZSOS_DONE_PATH to signal that the
-            # evaluation is done
+            # Create an empty file at ZSOS_DONE_PATH to signal that the evaluation is done
             done_path = os.environ["ZSOS_DONE_PATH"]
             with open(done_path, "w") as f:
                 f.write("")

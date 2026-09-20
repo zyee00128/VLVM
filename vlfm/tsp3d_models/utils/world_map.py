@@ -22,10 +22,12 @@ def _angle_diff(a: float, b: float) -> float:
 
 
 class WorldLocalMap:
-    """Incremental world-frame occupancy of fused points.
+    """
+    Incremental world-frame occupancy of fused points.
 
-    Dedup happens at merge time via flat keys; voxels are removed by a
-    fixed number of recent frames (``max_frames``) and a radius slide-out.
+    Dedup happens at merge time via flat keys; 
+    voxels are removed by a fixed number of 
+    recent frames (``max_frames``) and a radius slide-out.
     """
 
     def __init__(
@@ -50,14 +52,6 @@ class WorldLocalMap:
         )
         self.near_refresh_value = bool(near_refresh_value)
 
-        # B2 (stricter gating) and B3 (keyframe sampling) are KEPT as reference only.
-        # To re-enable, uncomment the gating blocks below and wire params through
-        # pipeline/policy (disp/yaw thresholds in meters/degrees).
-        # self._b2_min_view_disp = None
-        # self._b2_min_view_yaw = None
-        # self._kf_disp_step = None
-        # self._kf_yaw_step = None
-
         self._keys: np.ndarray = np.empty(0, dtype=np.int64)   # sorted flat keys
         self._points: np.ndarray = np.empty((0, 6), dtype=np.float32)  # (x,y,z,r,g,b)
         self._frame_keys: deque = deque()  # per-frame new keys, for frame-window slide-out
@@ -78,7 +72,8 @@ class WorldLocalMap:
         self._last_pose = None
 
     def _view_gate(self, robot_pose: np.ndarray) -> bool:
-        """True = skip this frame (not enough new view information).
+        """
+        True = skip this frame (not enough new view information).
         """
         if self._last_pose is None:
             return False
@@ -86,19 +81,13 @@ class WorldLocalMap:
         yaw_chg = _angle_diff(float(robot_pose[2]), float(self._last_pose[2]))
         if disp < self.min_view_disp and yaw_chg < self.min_view_yaw:
             return True
-        # # B2 stricter gating (higher thresholds)
-        # if self._b2_min_view_disp is not None:
-        #     if disp < self._b2_min_view_disp and yaw_chg < self._b2_min_view_yaw:
-        #         return True
-        # # B3 keyframe sampling (fixed step)
-        # if self._kf_disp_step is not None:
-        #     if disp < self._kf_disp_step and yaw_chg < self._kf_yaw_step:
-        #         return True
         return False
 
     def _slide_radius(self, center_xy: np.ndarray) -> None:
-        """Drop voxels beyond radius (skipped if radius is None); if still above
-        the hard max_voxels cap, keep the nearest voxels by distance."""
+        """
+        Drop voxels beyond radius (skipped if radius is None); 
+        if still above the hard max_voxels cap, keep the nearest voxels by distance.
+        """
         if self._keys.shape[0] == 0:
             return
         if self.radius is not None:
@@ -112,6 +101,11 @@ class WorldLocalMap:
             keep = np.argsort(dist)[: self.max_voxels]
             self._keys = self._keys[keep]
             self._points = self._points[keep]
+            # `_keys` must stay sorted: the near-field refresh path indexes it with `np.searchsorted`. 
+            # `keep` is distance-ordered, so re-sort after the crop.
+            order = np.argsort(self._keys, kind="stable")
+            self._keys = self._keys[order]
+            self._points = self._points[order]
 
     def update(
         self,

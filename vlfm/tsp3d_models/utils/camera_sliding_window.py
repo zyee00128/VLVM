@@ -26,14 +26,6 @@ class TemporalPcdWindow:
         self._min_view_yaw = float(min_view_yaw)
         self._last_pose: Optional[np.ndarray] = None
 
-        # B2 (stricter gating) and B3 (keyframe sampling) are KEPT as reference only.
-        # To re-enable, uncomment the gating blocks below and wire params through
-        # pipeline/policy (disp/yaw thresholds in meters/degrees).
-        # self._b2_min_view_disp = None
-        # self._b2_min_view_yaw = None
-        # self._kf_disp_step = None
-        # self._kf_yaw_step = None
-
     @property
     def num_frames(self) -> int:
         return len(self._window)
@@ -43,9 +35,8 @@ class TemporalPcdWindow:
         self._last_pose = None
 
     def _view_gate(self, robot_pose: np.ndarray) -> bool:
-        """True = skip this frame (not enough new view information).
-
-        B1 (base) gate is enabled; B2/B3 blocks below are kept commented.
+        """
+        True = skip this frame (not enough new view information).
         """
         if self._last_pose is None:
             return False
@@ -53,14 +44,6 @@ class TemporalPcdWindow:
         yaw_chg = _angle_diff(float(robot_pose[2]), float(self._last_pose[2]))
         if disp < self._min_view_disp and yaw_chg < self._min_view_yaw:
             return True
-        # # B2 stricter gating (higher thresholds)
-        # if self._b2_min_view_disp is not None:
-        #     if disp < self._b2_min_view_disp and yaw_chg < self._b2_min_view_yaw:
-        #         return True
-        # # B3 keyframe sampling (fixed step)
-        # if self._kf_disp_step is not None:
-        #     if disp < self._kf_disp_step and yaw_chg < self._kf_yaw_step:
-        #         return True
         return False
 
     def update(

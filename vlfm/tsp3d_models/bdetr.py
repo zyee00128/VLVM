@@ -10,8 +10,7 @@ from .multilevel_head import TSPHead
 from mmdet3d.structures import bbox3d2result
 import time
 
-# 仓库根由本文件位置推导：vlfm/tsp3d_models/bdetr.py -> parents[2] = 仓库根。
-# 语言塔/配置目录默认 <repo>/data/tsp3d_models（可被 TSP3D_DATA_PATH 覆盖）。
+
 _DEFAULT_DATA_PATH = os.environ.get(
     "TSP3D_DATA_PATH", str(Path(__file__).resolve().parents[2] / "data" / "tsp3d_models")
 )

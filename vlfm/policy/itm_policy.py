@@ -25,10 +25,11 @@ PROMPT_SEPARATOR = "|"
 
 class _ExploredAreaAdapter:
     """
-    Thin adapter exposing the 3D->2D explored projection (passable band) of the
-    reconstructed 3D obstacle map to the 2D `ValueMap` (which expects an object
-    with an `explored_area` attribute). The projection itself lives in the
-    value-field policy (`BaseITMPolicy._get_explored_2d`).
+    Thin adapter exposing the 3D->2D explored projection (passable band)
+    of the reconstructed 3D obstacle map to the 2D `ValueMap` 
+    (which expects an object with an `explored_area` attribute). 
+    The projection itself lives in the value-field policy 
+    (`BaseITMPolicy._get_explored_2d`).
     """
 
     def __init__(self, policy: "BaseITMPolicy", z_min: float, z_max: float) -> None:
@@ -103,8 +104,8 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         self, arr_2d: np.ndarray, x: float, y: float, radius_m: Optional[float] = None
     ) -> float:
         """
-        Queries a 2D map with a disk of radius radius_m (default query_radius_m) centered
-        at world (x, y). Max-pooling.
+        Queries a 2D map with a disk of radius radius_m 
+        (default query_radius_m) centered at world (x, y). Max-pooling.
         """
         ret = self._obstacle_map3d._xy_to_px(np.array([[x, y]]))[0]
         row, col = int(ret[1]), int(ret[0])
@@ -128,7 +129,8 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         return max(0, cz0), min(om._height_size, cz1)
 
     def _get_explored_2d(self, z_min: float, z_max: float) -> np.ndarray:
-        """2D projection of the 3D explored mask over [z_min, z_max] (for the 2D ValueMap).
+        """
+        2D projection of the 3D explored mask over [z_min, z_max] (for the 2D ValueMap).
         Obstacle voxels are excluded so only passable explored cells are considered free.
         """
         om = self._obstacle_map3d
@@ -149,8 +151,10 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         return np.minimum(free.sum(axis=2).astype(np.float32) / n, 1.0)
 
     def _compute_h1(self) -> Union[np.ndarray, None]:
-        """H1 = fraction of (non-occupied & explored) layers within the passable band,
-        computed directly on the reconstructed 3D obstacle map."""
+        """
+        H1 = fraction of (non-occupied & explored) layers within the passable band,
+        computed directly on the reconstructed 3D obstacle map.
+        """
         return self._free_layers_2d(self._h_z_min, self._h_z_max)
 
 
@@ -260,7 +264,8 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
 
         os.environ["DEBUG_INFO"] = ""
         # If there is a last point pursued, then we consider sticking to pursuing it
-        # if it is still in the list of frontiers and its current value is not much worse than self._last_value.
+        # if it is still in the list of frontiers and 
+        # its current value is not much worse than self._last_value.
         if not np.array_equal(self._last_frontier, np.zeros(2)):
             curr_index = None
 
@@ -329,7 +334,8 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
 
 class ITMPolicyV1(BaseITMPolicy):
     """
-    Route 1 (region style): fills the 2D ValueMap with the VLFM visible cone (S)
+    Route 1 (region style): 
+    fills the 2D ValueMap with the VLFM visible cone (S)
     + vertical passability bonus (H1).
     """
 
@@ -382,17 +388,19 @@ class ITMPolicyV1(BaseITMPolicy):
         return best if best > 0.0 else 0.0
 
     def _query_semantic_at(self, x: float, y: float, radius_m: Optional[float] = None) -> Union[float, None]:
-        """Semantic field S at world (x, y) for detection cross-validation (3.2 S-penalty)."""
+        """Semantic field S at world (x, y) for detection cross-validation (S-penalty)."""
         return self._query_2d_value(x, y, radius_m)
 
 
 class ITMPolicyV2(BaseITMPolicy):
     """
-    Route 2 (surface style): lands scores from 3D surface points 
-    into 2D (x, y) buckets (S: confidence-gated max, consistent with VLFM) + height-axis semantic value (H1).
+    Route 2 (surface style): 
+    lands scores from 3D surface points 
+    into 2D (x, y) buckets (S: confidence-gated max, consistent with VLFM) 
+    + height-axis semantic value (H1).
     """
 
-    _min_valid_conf: float = 1e-4   # Per-point confidence floor (same as itm3d min_valid_conf)
+    _min_valid_conf: float = 1e-4   # Per-point confidence floor
 
     def __init__(
         self,
@@ -436,7 +444,9 @@ class ITMPolicyV2(BaseITMPolicy):
         return values
 
     def _query_semantic_at(self, x: float, y: float, radius_m: Optional[float] = None) -> Union[float, None]:
-        """Semantic field S (surface-bucket max) at world (x, y) for detection cross-validation (3.2 S-penalty)."""
+        """
+        Semantic field S (surface-bucket max) at world (x, y) for detection cross-validation (S-penalty).
+        """
         return self._query_2d_map_radius(self._surface_max_map, x, y, radius_m)
 
     def _project_value_to_surface(
@@ -448,19 +458,21 @@ class ITMPolicyV2(BaseITMPolicy):
         fov: float,
     ) -> None:
         """
-        Lands cosine scores into 2D (x, y) buckets under confidence gating (surface
-        points within the fixed height band).
+        Lands cosine scores into 2D (x, y) buckets under confidence gating
+        (surface points within the fixed height band).
 
-        - S (`_surface_max_map`): per-bucket semantic value score; a bucket is
-          overwritten only when the current observation's confidence is higher
-          (VLFM `use_max_confidence=True` fusion).
+        - S (`_surface_max_map`): per-bucket semantic value score; 
+            a bucket is overwritten only 
+            when the current observation's confidence is higher
+            (VLFM `use_max_confidence=True` fusion).
         - Confidence (`_surface_conf_map`): per-point angular distance confidence
-          C_3D = c_angular * c_distance (VLFM cos^2 angular term + itm3d distance term).
+            C_3D = c_angular * c_distance 
+            (VLFM cos^2 angular term + itm3d distance term).
         """
         if pcd is None or len(pcd) == 0:
             return
         om = self._obstacle_map3d
-        step = 8 ** 2  # Downsampling stride (same as itm3d downsampling_step)
+        step = 8 ** 2  # Downsampling stride
         pts_w = pcd[::step, :3]
         if len(pts_w) == 0:
             return
@@ -470,7 +482,7 @@ class ITMPolicyV2(BaseITMPolicy):
             return
         score = float(np.clip(np.mean(scores), 0.0, 1.0))  # Single-frame semantic value (mean over channels)
 
-        # Per-point confidence (VLFM angular confidence; distance term follows itm3d)
+        # Per-point confidence (VLFM angular confidence; distance term)
         try:
             tf_episodic_to_camera = np.linalg.inv(tf_camera_to_episodic)
         except np.linalg.LinAlgError:
@@ -478,7 +490,7 @@ class ITMPolicyV2(BaseITMPolicy):
         R_T = tf_episodic_to_camera[:3, :3].T
         t = tf_episodic_to_camera[:3, 3]
         pts_c = pts_w @ R_T + t
-        # Camera base frame is [forward, left, up] (see _project_rgbd_to_3d_point_cloud)
+        # Camera base frame is [forward, left, up]
         forward = pts_c[:, 0]
         left = pts_c[:, 1]
         up = pts_c[:, 2]
@@ -513,8 +525,9 @@ class ITMPolicyV2(BaseITMPolicy):
         if len(b_rows) == 0:
             return
 
-        # Confidence-gated fusion: overwrite S and confidence only when this frame's
-        # confidence is higher (VLFM `use_max_confidence=True` path).
+        # Confidence-gated fusion: overwrite S and confidence 
+        # only when this frame's confidence is higher 
+        # (VLFM `use_max_confidence=True` path).
         improve = frame_conf[b_rows, b_cols] > self._surface_conf_map[b_rows, b_cols]
         if improve.any():
             idx_r, idx_c = b_rows[improve], b_cols[improve]

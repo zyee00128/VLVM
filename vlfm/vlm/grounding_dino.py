@@ -1,13 +1,11 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
 from typing import Optional
-
 import numpy as np
 import torch
 import torchvision.transforms.functional as F
 
 from vlfm.vlm.detections import ObjectDetections
-
 from .server_wrapper import ServerMixin, host_model, send_request, str_to_image
 
 try:
@@ -37,17 +35,17 @@ class GroundingDINO:
 
     def predict(self, image: np.ndarray, caption: Optional[str] = None) -> ObjectDetections:
         """
-        This function makes predictions on an input image tensor or numpy array using a
-        pretrained model.
+        This function makes predictions on an input image tensor
+        or numpy array using a pretrained model.
 
         Arguments:
             image (np.ndarray): An image in the form of a numpy array.
-            caption (Optional[str]): A string containing the possible classes
-                separated by periods. If not provided, the default classes will be used.
+            caption (Optional[str]): A string containing the possible classes separated by periods. 
+                                     If not provided, the default classes will be used.
 
         Returns:
-            ObjectDetections: An instance of the ObjectDetections class containing the
-                object detections.
+            ObjectDetections: An instance of the ObjectDetections class 
+                              containing the object detections.
         """
         # Convert image to tensor and normalize from 0-255 to 0-1
         image_tensor = F.to_tensor(image)

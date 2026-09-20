@@ -9,8 +9,7 @@
 #
 # 设计 = 五模块大档（默认队列，各撤销一个模块）：
 #   no_memlife  memory-life：可疑标志链 + 近场滞回回退 + 锁保持（含身份豁免）
-#               —— EMA 跨帧合并不消融；"可疑标志链"的行为出口（可疑条目
-#                  2 帧滞回预算）随 enable_fb=False 一并失效
+#               —— EMA 跨帧合并不消融；"可疑标志链"的行为出口（可疑条目 2 帧滞回预算）随 enable_fb=False 一并失效
 #   no_spen     S-penalty：软 gate + 近表面点（S 查询 / 导航终点）+ 冲突门
 #   no_occ      occ geometry：occ 几何门
 #   no_wfusion  world fusion：整条融合链（增量地图 / 去重 / 近场刷新 / D3）

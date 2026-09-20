@@ -115,6 +115,7 @@ fi
 # 子集调试（可选）：只跑指定场景 = 追加 content_scenes 覆盖（Hydra 列表语法，场景间不加空格）：
 #   SCENES="[5cdEh9F2hJL]" bash scripts/my_eval.sh                              # 单场景
 #   SCENES="[TEEsavR23oF,mv2HUxq3B53,wcojb4TFT35]" bash scripts/my_eval.sh      # 三场景
+#   SCENES:"[zt1RVoi7PcG,wcojb4TFT35,TEEsavR23oF]" bash scripts/my_eval.sh
 # 也可手动在 args 数组内追加：args+=("habitat.dataset.content_scenes=[<scene>]")
 SCENES="${SCENES:-}"
 if [ -n "$SCENES" ]; then

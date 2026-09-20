@@ -36,7 +36,8 @@ def distance_adaptive_sample(
     mid_voxel: float = 0.02,
     far_voxel: float = 0.05,
 ) -> np.ndarray:
-    """Distance-adaptive sampling (dense near, sparse far) via multi-band voxelization.
+    """
+    Distance-adaptive sampling (dense near, sparse far) via multi-band voxelization.
 
     Points are split by 3D distance to the camera into near / mid / far bands,
     each voxelized at its own resolution, then concatenated:
@@ -91,7 +92,8 @@ def cap_point_count(
     max_points: int,
     style: str = "random",
 ) -> np.ndarray:
-    """Unified point cap shared by both fusion routes (D1).
+    """
+    Unified point cap shared by both fusion routes.
 
     Args:
         pcd: camera-canonical cloud (N, 6).

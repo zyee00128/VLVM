@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
@@ -142,7 +142,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             ema_weight_old: float = 0.8,
             s_penalty_use_surface: bool = True,
             goal_use_surface: bool = True,
-            # new GD auxiliary mechanism: independent proposer + frame-level vote
+            # GD auxiliary mechanism: independent proposer + frame-level vote
             gdp_enable: bool = True,
             gdp_every_n: int = 5,
             gdp_box_thr: float = 0.4,
@@ -152,6 +152,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             gdp_merge_dist: float = 0.5,
             gdp_merge_iau: float = 0.3,
             gdp_port: int = 12181,
+            gdp_vocab: Optional[List[str]] = None,
             lock_min_obs: int = 2,
             lock_exempt: bool = True,
             lock_exempt_identity: bool = True,
@@ -294,11 +295,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
             gdp_merge_dist=gdp_merge_dist,
             gdp_merge_iau=gdp_merge_iau,
             gdp_port=gdp_port,
+            gdp_vocab=gdp_vocab,
             gd_skip_classes=gd_skip_classes,
             lock_min_obs=lock_min_obs,
         )
-        # 通用前置量测器
-        self._stats = VlvmStatsLogger(self, enabled=enable_stats)
 
         # 3D visual grounding and vision-language evaluation clients
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
@@ -308,6 +308,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         self._det_seed = int(det_seed)
         self._rng_step = 0            # monotonic numpy-RNG seed counter (never reset)
+        # General-purpose pre-flight stats logger
+        self._stats = VlvmStatsLogger(self, enabled=enable_stats)
 
     def _reset(self) -> None:
         """Reset memories, step counters, pointnav model, and 3D occupancy map."""
@@ -568,7 +570,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         sx_conflict_gate: bool = True,
     ) -> None:
         """
-        S-penalty: c' = c * w_S(semantic field), plus the surface-point goal option.
+        S-penalty: c' = c * w_S (semantic field), plus the surface-point goal option.
         """
         self._s_penalty_cfg = SPenaltyConfig(
             enable=enable_s_penalty,
@@ -611,12 +613,22 @@ class TSP3DObjectNavPolicy(BasePolicy):
         gdp_merge_dist: float,
         gdp_merge_iau: float,
         gdp_port: int,
+        gdp_vocab: Optional[List[str]] = None,
         gd_skip_classes: str = "",
         lock_min_obs: int = 2,
     ) -> None:
         """
-        GD 辅助机制：独立每帧提议源 + 帧级两票（`both` / `gd`）。
+        GD auxiliary mechanism: an independent per-frame proposer + frame-level two-vote (`both` / `gd`).
+
+        `gdp_vocab` = dataset class list driving both the GD caption and the alias
+        map (HM3D 6 classes / MP3D 21 classes, injected by `from_config`); empty or
+        `None` falls back to `DEFAULT_VOCAB` (HM3D). A string may hold several
+        entries separated by `;` (single entries keep their `|` alias packs).
         """
+        if isinstance(gdp_vocab, str):
+            _vocab = [c.strip() for c in gdp_vocab.split(";") if c.strip()] or None
+        else:
+            _vocab = [str(c) for c in gdp_vocab] if gdp_vocab else None
         self._gd_proposer = GdProposer(GdProposalConfig(
             enabled=bool(gdp_enable),
             every_n=max(1, int(gdp_every_n)),
@@ -627,17 +639,17 @@ class TSP3DObjectNavPolicy(BasePolicy):
             merge_dist=float(gdp_merge_dist),
             merge_iau=float(gdp_merge_iau),
             weak_guard=bool(gdp_weak_guard),
-        ))
+        ), vocab=_vocab)
         self._gd_weak_guard = bool(gdp_weak_guard)
         # Vote accounting of the GD source.
         self._gd_stats = {
             "both": 0, "gd": 0, "gd_rejected": 0, "both_cleared": 0, "tsp3d_new": 0,
         }
-        # GD 类别白名单
+        # GD class whitelist
         self._gd_skip_classes = {
             c.strip() for c in str(gd_skip_classes).split("|") if c.strip()
         }
-        # GD 弱证不锁门槛
+        # Min observations for a `gd` single vote to lock
         self._lock_min_obs = max(int(lock_min_obs), 1)
 
 
@@ -698,7 +710,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         prog = self._gd_proposer
         if prog is None or not prog.cfg.enabled or not self._done_initializing:
             return
-        # 类别白名单：列出的目标类完全跳过 GD 源。
+        # Class whitelist: listed target classes skip the GD source entirely.
         if self._gd_skip_classes and any(c.strip() in self._gd_skip_classes for c in target_classes):
             return
         if not should_run(self._num_steps, prog.cfg.every_n):
@@ -743,7 +755,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         for proposal, vote, matched_idx in attach_votes(proposals, candidates, prog.cfg):
             if vote == BOTH and matched_idx is not None:
                 conf_amp, centroid_np, _surf, classes = pending[matched_idx]
-                # `both` 沿用 TSP3D 的 c'（GD 分数不改变置信度尺度）。
+                # `both` keeps the TSP3D c' (GD scores never change the confidence scale).
                 conf_use = float(np.clip(float(conf_amp), 0.0, 1.0))
                 res: Dict[str, Any] = {}
                 for cls in classes:
@@ -767,14 +779,17 @@ class TSP3DObjectNavPolicy(BasePolicy):
                       f"robot={np.round(np.asarray(robot_xyz, dtype=np.float64)[:2], 2)} "
                       f"yaw={float(robot_yaw):.2f}) -> normal path")
                 continue
+
             if not admit_as_suspicious(vote):
                 continue
+
             cls = proposal.canon if proposal.canon in target_classes else target_classes[0]
             if not self._gd_geom_admit(proposal, cls, pcd_world, robot_xyz):
                 self._gd_stats["gd_rejected"] += 1
                 print(f"[GD2] gd -> REJECTED by geom gate '{cls}' at "
                       f"{np.round(np.asarray(proposal.centroid, dtype=np.float64)[:3], 2)}")
                 continue
+
             res = self._memory_manager.accumulate(
                 cls, np.asarray(proposal.centroid, dtype=np.float64),
                 confidence=self._sigma_tar,
@@ -946,7 +961,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         valid_goals: List[np.ndarray] = []
         valid_obs: List[int] = []
         valid_src: List[str] = []
-        # 各候选条目的原始 GD sigmoid（0.0 = 无 GD 票；量测用）。
+        # Raw GD sigmoid per candidate entry (0.0 = no GD vote).
         valid_gconf: List[float] = []
         target_classes = self._target_object.split("|")
         for cls in target_classes:
@@ -959,7 +974,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         v = verify_list[i]
                         obs = int(v[0]) if len(v) >= 1 else 1
 
-                    # 弱证不锁：`gd` 单票需 ≥ `lock_min_obs` 次观测才可驱动 explore -> navigate。
+                    # Weak-evidence guard: a `gd` single vote needs >= `lock_min_obs` observations to drive explore -> navigate.
                     st = self._memory_manager.state_of(centroid)
                     src = str(st.get("src") or "tsp3d")
                     if not is_lockable(src, obs, self._lock_min_obs, self._gd_weak_guard):
@@ -980,7 +995,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         centroids = np.array(valid_centroids)
         dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
         chosen_idx = int(np.argmin(dists_2d))
-
         chosen_2d = valid_goals[chosen_idx][:2].copy()
         if self._last_target_coord is None:
             self._last_target_coord = chosen_2d
@@ -1078,6 +1092,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             boxes_3d_global.append(box_np.tolist())
         logits = [det.get("confidence", 0.0) for det in valid_raw]
         phrases = [self._target_object for _ in valid_raw]
+
         detections = ObjectDetections(
             boxes=boxes_3d_global,
             logits=logits,
@@ -1141,7 +1156,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     print(f"[TSP3D] new entry '{cls}' at "
                           f"{np.round(np.asarray(centroid_np, dtype=np.float64)[:3], 2)} "
                           f"-> suspicious (single-side, c'={float(conf_amp):.2f})")
-        # New GD auxiliary mechanism: same-frame second proposer + two-vote
+        # GD auxiliary mechanism: same-frame second proposer + two-vote
         self._gd_apply(
             image_rgb, tf_camera_to_episodic, max_depth, fx, fy,
             target_classes, robot_xyz, robot_yaw, pcd_world, pending,
@@ -1151,9 +1166,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
         camera_pos = tf_camera_to_episodic[:3, 3]
         camera_yaw = extract_yaw(tf_camera_to_episodic)
         cone_fov = get_fov(self._fx, self._depth_image_shape[1])
-        # `lock_exempt`：navigate 模式下 nav goal 条目豁免 near_miss 预算。
+        # `lock_exempt`: in navigate mode the nav-goal entry is exempt from the near_miss budget.
         _nav_goal = self._last_target_coord if int(self._lock_step) >= 0 else None
-        # `lock_exempt_identity`：用被 pursue 条目质心替代 nav goal 做 0.5 m 匹配。
+        # `lock_exempt_identity`: match on the pursued entry's centroid instead of the nav goal (0.5 m).
         _exempt_ref = _nav_goal
         if self._lock_exempt_identity:
             _pxy_ref = (self._stats.last_meta or {}).get("xy")
@@ -1338,10 +1353,10 @@ class VLVMConfig:
     pointnav_stop_radius: float = 0.30  # Distance (m) at which the agent stops near the goal; larger = stops farther from the target.
     # Phase 6b: Anti-hallucination fallback
     enable_fb: bool = True              # Delete confirmed-false centroids near the FOV cone -> fallback to explore.
-    fb_near_radius: float = 2.5         # Near-field confirmation cone radius (m); VLFM uses max_depth*0.5 (2.5m @ max_depth=5). 有意失效（实现内固定）。
+    fb_near_radius: float = 2.5         # Near-field confirmation cone radius (m); fixed internally at max_depth*0.5 (= 2.5 @ max_depth 5.0). Kept for reference only.
     fb_hysteresis: int = 5              # Trusted centroid: consecutive near-field frames without a fresh merge before deletion.
     fb_suspicious_hysteresis: int = 2   # Suspicious centroid (far/low-conf): fewer frames before deletion.
-    fb_suspicious_conf: float = 0.75    # Trust boundary。GD 启用时**不作用**：新条目恒被 `new_suspicious=_gd_on` 标可疑、合并写不重算该标志，仅 `both` 合并可清除；现值仅留档（GD-off 工况才生效
+    fb_suspicious_conf: float = 0.75    # Trust boundary. No effect while GD is on: new entries are always suspicious (merge writes do not recompute the flag); only `both` clears it. Kept for reference (GD-off only).
 
     # Phase 3a: 3D Mapping & Occupancy Grid
     om_style: str = "obstacle"
@@ -1420,7 +1435,7 @@ class VLVMConfig:
     s_penalty_floor: float = 0.3            # Lower bound of the dynamic penalty weight w_S = max(floor, S/thresh) when S < thresh (non-zero -> keep recall; S->0 -> floor).
     s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection point.
     s_penalty_uncovered_w: float = 1.0      # weight when S=None/<=0 (no coverage): 1.0 = free pass (A1), <1.0 = mild penalty on unverifiable detections.
-    sx_conflict_gate: bool = True        # 冲突门：conf≥0.80 ∧ 0<S<thresh 的检测写入口定向拒绝
+    sx_conflict_gate: bool = True        # Conflict gate: reject detections with conf>=0.80 ∧ 0<S<thresh at the write entry.
     # Phase 7b: geometric admission module (occupancy-consistency gate)
     enable_occ_consistency: bool = True     # box must have occupied-voxel support in the 3D grid
     occ_min_voxels: int = 8                 # occ gate: min occupied voxels supporting the box
@@ -1441,12 +1456,13 @@ class VLVMConfig:
     gdp_merge_dist: float = 0.5          # frame-level "same object" XY distance (m)
     gdp_merge_iau: float = 0.3           # frame-level "same object" AABB IaU
     gdp_port: int = 12181                # Grounding-DINO server port
+    gdp_vocab: List[str] = field(default_factory=list)  # GD caption/alias class list; empty = auto (dataset list injected by from_config)
     lock_min_obs: int = 2                # a `gd` single-vote entry needs >= this many observations to be lockable
-    lock_exempt: bool = True             # 锁保持：navigate 锁定期间 nav goal 条目豁免近场 near_miss 预算
-    lock_exempt_identity: bool = True    # 豁免匹配基准：True = 被追踪条目质心（身份）；False = nav goal 近表面点
+    lock_exempt: bool = True             # Lock hold: while locked in navigate, the nav-goal entry is exempt from the near-field near_miss budget.
+    lock_exempt_identity: bool = True    # Exemption reference: True = pursued entry centroid (identity); False = nav-goal near-surface point.
     gd_skip_classes: str = ""            # object goals that skip the GD source (e.g. "couch")
 
-    enable_stats: bool = True     # 通用前置量测开关（[NAV]/[STOP] 打印与逐集摘要；零行为）
+    enable_stats: bool = True     # Pre-flight stats logger ([NAV]/[STOP] prints + per-episode summary; zero behavior).
 
 
 cs = ConfigStore.instance()

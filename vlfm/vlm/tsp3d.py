@@ -16,13 +16,14 @@ from vlfm.tsp3d_models.bdetr import BeaUTyDETR
 
 PROMPT_SEPARATOR = "|"
 
-# 仓库根由本文件位置推导：vlfm/vlm/tsp3d.py -> parents[2] = 仓库根。
 # 权重/配置目录默认 <repo>/data/tsp3d_models（可被 TSP3D_DATA_PATH / TSP3D_CHECKPOINT 覆盖）。
 TSP3D_DATA_DIR = str(Path(__file__).resolve().parents[2] / "data" / "tsp3d_models")
 
 
 def _default_checkpoint(data_dir: str) -> str:
-    """默认权重路径：按候选名探测（各机在位的档名不同），都无则回退旧默认名。"""
+    """
+    默认权重路径：按候选名探测，都无则回退旧默认名。
+    """
     for name in ("tsp3d_scanrefer.pth", "ckpt_sr3d.pth", "ckpt_nr3d.pth"):
         candidate = os.path.join(data_dir, name)
         if os.path.exists(candidate):
@@ -45,7 +46,7 @@ class TSP3D:
         weights_path: Optional[str] = None,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     ):
-        # 权重：显式传入 > TSP3D_CHECKPOINT > 按候选名探测 data_path 目录。
+        # 权重显式传入 > TSP3D_CHECKPOINT > 按候选名探测 data_path 目录。
         if weights_path is None:
             weights_path = os.environ.get("TSP3D_CHECKPOINT") or _default_checkpoint(data_path)
         self.device = device
@@ -58,8 +59,9 @@ class TSP3D:
                     data_path=data_path)
         if os.path.exists(weights_path):
             try:
-                # torch >= 2.6 的 torch.load 默认 weights_only=True；本 checkpoint 含 config
-                # 元数据（argparse.Namespace），必须显式关闭。torch < 1.13 无该参数 ⇒ 回退。
+                # torch >= 2.6 的 torch.load 默认 weights_only=True；
+                # 本 checkpoint 含 config 元数据（argparse.Namespace），必须显式关闭。
+                # torch < 1.13 无该参数 ⇒ 回退。
                 checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
             except TypeError:
                 checkpoint = torch.load(weights_path, map_location=device)
@@ -71,6 +73,7 @@ class TSP3D:
                 state_dict = checkpoint['state_dict']
             else:
                 state_dict = checkpoint
+            
             # Strip 'module.' prefix (from DataParallel/DDP wrapper)
             new_sd = {}
             for k, v in state_dict.items():

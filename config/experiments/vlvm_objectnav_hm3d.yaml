@@ -77,10 +77,10 @@ habitat_baselines:
       pointnav_stop_radius: 0.90
       # Anti-hallucination fallback
       enable_fb: True
-      fb_near_radius: 2.5              # 有意失效：实现内固定 = max_depth×0.5（对齐 VLFM）；本键仅留档
+      fb_near_radius: 2.5              # Intentionally inert: fixed internally at max_depth*0.5 (VLFM-aligned); kept for reference only.
       fb_hysteresis: 5
       fb_suspicious_hysteresis: 2
-      fb_suspicious_conf: 0.75         # GD 启用时不作用：新条目恒被标可疑、合并写不重算（仅 `both` 合并可清除）
+      fb_suspicious_conf: 0.75         # No effect while GD is on: new entries are always suspicious; merge writes do not recompute (only `both` clears it).
       # obstacle map
       om_style: "probabilistic" # probabilistic / obstacle
       voxel_size: 0.05
@@ -151,7 +151,8 @@ habitat_baselines:
       s_penalty_thresh: 0.15
       s_penalty_floor: 0.3
       s_penalty_radius_m: 0.5
-      s_penalty_uncovered_w: 1.0         # 无覆盖（S≤0/None）权重：1.0=免罚；<1.0=轻微惩罚
+      s_penalty_uncovered_w: 1.0         # Weight for no coverage (S<=0/None): 1.0 = free pass; <1.0 = mild penalty.
+      sx_conflict_gate: True
       # geometric admission module (occupancy-consistency gate)
       enable_occ_consistency: True
       occ_min_voxels: 8
@@ -159,6 +160,8 @@ habitat_baselines:
       # target-memory lifecycle
       merge_dist_thresh: 0.5
       ema_weight_old: 0.8
+      lock_exempt: True
+      lock_exempt_identity: True 
       # near-surface point
       s_penalty_use_surface: True
       goal_use_surface: True
@@ -172,12 +175,11 @@ habitat_baselines:
       gdp_merge_dist: 0.5
       gdp_merge_iau: 0.3
       gdp_every_n: 5
+      gdp_vocab: []                 # GD caption/alias class list; empty = auto by dataset (HM3D 6 / MP3D 21).
       lock_min_obs: 2
-      lock_exempt: True
-      lock_exempt_identity: True   # True = 按条目身份豁免（质心匹配）；False = nav goal 近表面点
-      gd_skip_classes: ""           # GD 类别白名单（这些目标类不跑 GD）
-      sx_conflict_gate: True        # 冲突门：conf>=0.80 且 0<S<0.15 的检测写入口定向拒绝
-      enable_stats: True            # 通用前置量测开关（[NAV]/[STOP] 打印与逐集摘要；零行为）
+      gd_skip_classes: ""           # GD class whitelist (these target classes skip the GD source).
+      
+      enable_stats: True            # Pre-flight stats logger ([NAV]/[STOP] prints + per-episode summary; zero behavior).
 
     ppo:
       clip_param: 0.2

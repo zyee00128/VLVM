@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from typing import TYPE_CHECKING, Dict, Tuple, Union
-
 import numpy as np
 
 from vlfm.utils.geometry_utils import closest_point_within_threshold
@@ -32,7 +30,9 @@ def _act_panoramic(
     fy: float,
     goal_3d: Union[None, np.ndarray],
 ) -> Tuple[ObjectDetections, str, "Tensor"]:
-    """Panoramic route under a unified per-step decision (scan is an independent behavior, not a sub-state of explore).
+    """
+    Panoramic route under a unified per-step decision 
+    (scan is an independent behavior, not a sub-state of explore).
 
     Each step follows the priority below:
       1. scan in progress   -> accumulate frame + wide-turn (no TSP3D);
@@ -137,7 +137,8 @@ def _act_panoramic(
 
 
 def _allow_scan(self: "TSP3DObjectNavPolicy", robot_xyz: np.ndarray) -> bool:
-    """Scan-novelty gate: the robot must be >= panoramic_min_move 
+    """
+    Scan-novelty gate: the robot must be >= panoramic_min_move 
     from the last scan / init pose before another scan is allowed.
 
     - panoramic route: delegated to the PanoramicFusion module.
@@ -158,7 +159,8 @@ def _build_scan_cloud(
     camera_height: float,
 ) -> np.ndarray:
     """
-    Stitch the buffered scan slices into ONE camera-canonical 360° cloud, INDEPENDENT of the WorldLocalMap.
+    Stitch the buffered scan slices into ONE camera-canonical 360° cloud, 
+    INDEPENDENT of the WorldLocalMap.
     Returns an empty cloud when no slices are buffered.
     """
     frames = [
@@ -211,8 +213,10 @@ def _start_scan_step(
     min_depth: float,
     max_depth: float,
 ) -> Tuple[str, "Tensor"]:
-    """Begin an independent 360° scan with the current frame as the first slice
-    (slices are buffered on the policy and never fed into the WorldLocalMap)."""
+    """
+    Begin an independent 360° scan with the current frame as the first slice
+    (slices are buffered on the policy and never fed into the WorldLocalMap).
+    """
     self._scan_pcd_frames = [pcd]
     self._scan_value_views.append(
         (rgb, depth, tf, min_depth, max_depth, float(self._camera_fov))
@@ -237,7 +241,8 @@ def _act_world_scan(
     fy: float,
     goal_3d: Union[None, np.ndarray],
 ) -> Tuple[ObjectDetections, str, "Tensor"]:
-    """world+scan mechanism: world temporal fusion + sparse spatial scans.
+    """
+    world temporal fusion + sparse spatial scans.
 
     Active when ``fusion_style="world"`` and ``enable_scan=True``.
       - travel / init / navigate keep the pure world behaviour;
@@ -245,7 +250,8 @@ def _act_world_scan(
         buffered in ``self._scan_pcd_frames`` and never fed into the map;
       - scans fire on frontier arrival or after a long no-lock explore stretch;
       - scan steps update the obstacle map and record the value view only
-        (no semantic-field update / no TSP3D query / fallback frozen)."""
+        (no semantic-field update / no TSP3D query / fallback frozen).
+    """
     pp = self._preprocessor
     self._obstacle_map3d.update_map(
         pcd=pcd, tf_camera_to_episodic=tf, depth=depth,
@@ -331,9 +337,11 @@ def _after_scan_action(
     robot_xyz: np.ndarray,
     robot_yaw: float,
 ) -> "Tensor":
-    """Direction right after a finished 360° scan, decided S-penalty style.
+    """
+    Direction right after a finished 360° scan, decided S-penalty style.
 
-    Move toward the candidate with the HIGHEST c' so every advance direction best matches the target. 
+    Move toward the candidate with the HIGHEST c' 
+    so every advance direction best matches the target. 
     With no admitted candidate, fall back to the semantic value field.
     """
     pending = getattr(self, "_last_pending", None) or []
@@ -350,7 +358,8 @@ def _after_scan_action(
 
 
 def _at_new_frontier(self: "TSP3DObjectNavPolicy", robot_xyz: np.ndarray) -> bool:
-    """True when the robot has REACHED a NEW frontier point (scan trigger).
+    """
+    True when the robot has REACHED a NEW frontier point (scan trigger).
     
     ``panoramic_min_move`` still guards against re-scanning the same spot.
     - frontier tracking (main path): a scan fires when the frontier cluster

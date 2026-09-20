@@ -89,12 +89,12 @@ def was_target_seen(infos: Dict[str, Any]) -> bool:
 
 
 def compute_oracle_success(infos: Dict[str, Any]) -> int:
-    """Oracle Success Rate for a single episode.
+    """
+    Oracle Success Rate for a single episode.
 
-    Oracle = 1 if the target bbox was ever covered by the explored (fog-of-war)
-    area during the episode. fog_of_war is cumulative, so the final frame's state
-    is equivalent to "ever seen". Ground-truth signal, detector-agnostic (same
-    signal used by ``determine_failure_cause`` for ``false_negative``).
+    Oracle = 1 if the target bbox was ever covered by the explored (fog-of-war) area during the episode. 
+    fog_of_war is cumulative, so the final frame's state is equivalent to "ever seen". 
+    Ground-truth signal, detector-agnostic (same signal used by ``determine_failure_cause`` for ``false_negative``).
     """
     try:
         return int(was_target_seen(infos))
@@ -142,8 +142,8 @@ def remove_numpy_arrays(d: Any) -> Dict:
         if isinstance(value, dict):
             new_dict[key] = remove_numpy_arrays(value)
         elif isinstance(value, np.ndarray):
-            # Serialize small coordinate/feature arrays to lists to prevent
-            # 3D motion metrics from being lost in the logs
+            # Serialize small coordinate/feature arrays to lists 
+            # to prevent 3D motion metrics from being lost in the logs
             if value.size <= 10:
                 new_dict[key] = value.tolist()
         else:
@@ -155,11 +155,12 @@ def remove_numpy_arrays(d: Any) -> Dict:
 def _point_in_target_bbox(
     infos: Dict[str, Any], point_episodic_xy, dilated_mask=None
 ) -> bool:
-    """Whether a world (episodic) point falls inside the dilated target bbox mask.
+    """
+    Whether a world (episodic) point falls inside the dilated target bbox mask.
 
-    Uses the final-frame top_down_map's ``target_bboxes_mask`` (static GT), the
-    same coordinate transform as ``was_false_positive``. ``dilated_mask`` may be
-    precomputed to avoid re-dilating per call.
+    Uses the final-frame top_down_map's ``target_bboxes_mask`` (static GT), 
+    the same coordinate transform as ``was_false_positive``. 
+    ``dilated_mask`` may be precomputed to avoid re-dilating per call.
     """
     try:
         if dilated_mask is None:
@@ -192,20 +193,21 @@ def _point_in_target_bbox(
 def aggregate_memory_stats(
     infos: Dict[str, Any], entries: Any = None
 ) -> Dict[str, Any]:
-    """Per-entry tp / fp labels of the episode-end memory.
+    """
+    Per-entry tp / fp labels of the episode-end memory.
 
-    Entries are read from the stats logger snapshot (`policy._stats.memory_entries_snapshot()`,
-    read by the trainer right after the episode ends) or, as a fallback, from
-    ``infos["memory_entries"]``. Every entry is labelled against the static GT target bbox
-    with the same transform as ``was_false_positive``; results are split by proposer tag
-    (`src`) and by the suspicious subset, which is what the "deleted tp share" and
-    "lock-right : lock-wrong" judgements need.
+    Entries are read from the stats logger snapshot (`policy._stats.memory_entries_snapshot()`) or, 
+    as a fallback, from ``infos["memory_entries"]``. 
+    Every entry is labelled against the static GT target bbox 
+    with the same transform as ``was_false_positive``; 
+    results are split by proposer tag (`src`) and by the suspicious subset, 
+    which is what the "deleted tp share" and "lock-right : lock-wrong" judgements need.
 
     `gd_conf_*` slots carry the same splits for the raw GD sigmoid.
-    Only entries with `gd_conf > 0` (entries that ever carried a GD vote) enter those
-    means — a `tsp3d`-only entry writes no GD score and would otherwise dilute the
-    average with zeros. `gd_conf_tp` vs `gd_conf_fp` is the separability read-out the
-    confidence direction needs (a flat pair = GD score cannot rank tp over fp).
+    Only entries with `gd_conf > 0` (entries that ever carried a GD vote) enter those means 
+    — a `tsp3d`-only entry writes no GD score and would otherwise dilute the average with zeros. 
+    `gd_conf_tp` vs `gd_conf_fp` is the separability read-out the confidence direction needs 
+    (a flat pair = GD score cannot rank tp over fp).
     """
     if entries is None:
         entries = infos.get("memory_entries")
@@ -271,13 +273,14 @@ def aggregate_detect_stats(
 ) -> Dict[str, Any]:
     """Detection-level statistics for one episode (TSP3D detections vs GT target bbox).
 
-    ``detect_logs`` entries: {conf, conf_amp, centroid, s, admitted} (from apply_s_penalty(..., out_log=...)``).
+    ``detect_logs`` entries: {conf, conf_amp, centroid, s, admitted} 
+    (from apply_s_penalty(..., out_log=...)``).
 
     Returns a dict with counts and per-detection score arrays.
     """
     total = len(detect_logs)
     if total == 0:
-        return {"total": 0, "tp": 0, "fp": 0, "scores": [], "conf_amps": [], "tp_flags": [], "admitted": [], "s_vals": []}
+        return {"total": 0, "tp": 0, "fp": 0, "scores": [], "conf_amps": [], "tp_flags": [], "admitted": [], "s_vals": [], "rejects": {}}
 
     try:
         dilated_mask = cv2.dilate(
@@ -290,6 +293,11 @@ def aggregate_detect_stats(
     for det in detect_logs:
         tp_flags.append(_point_in_target_bbox(infos, det["centroid"][:2], dilated_mask))
     tp = int(sum(tp_flags))
+    rejects: Dict[str, int] = {}
+    for det in detect_logs:
+        reason = det.get("reject")
+        if reason:
+            rejects[str(reason)] = rejects.get(str(reason), 0) + 1
     return {
         "total": total,
         "tp": tp,
@@ -298,6 +306,6 @@ def aggregate_detect_stats(
         "conf_amps": [float(d.get("conf_amp", d["conf"])) for d in detect_logs],
         "tp_flags": tp_flags,
         "admitted": [bool(d.get("admitted", False)) for d in detect_logs],
-        # 09-17 量测补强：S（语义场值，检测框近表面点；None/≤0 = 无覆盖 = 免罚）。
         "s_vals": [d.get("s", None) for d in detect_logs],
+        "rejects": rejects,
     }

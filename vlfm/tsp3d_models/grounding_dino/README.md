@@ -1,8 +1,6 @@
-# `grounding_dino` — GD proposal source (Stage2 §3.6)
+# `grounding_dino` — GD proposal source
 
-GD as a **second, independent proposer**. The mechanism is self-contained here and
-**not wired into the policy yet**; nothing in this package imports the policy, and
-nothing writes memory or picks actions.
+GD as a **second, independent proposer**.
 
 ## Why this shape (measured)
 
@@ -55,19 +53,19 @@ hysteresis / soft-only free-space erasure.
 | `proposer.py` | `GdProposer` — frame -> `List[GdProposal]` + counters |
 | `provenance.py` | vote merge + admission / lock rules (pure functions) |
 
-## VLFM mapping (照搬 / 适配 / 新增)
+## VLFM mapping (ported / adapted / new)
 
 | VLFM | Here | Class |
 | :--- | :--- | :--- |
-| `GroundingDINOClient.predict(rgb, caption)` + `filter_by_class` | `client.GdDetector` + `vocab.match_phrase` | 照搬 + 适配（严格单类） |
-| `coco_threshold 0.8 / non_coco_threshold 0.4` | `box_thr = 0.4` (single GD detector -> the non-COCO value; 0.8 belongs to the YOLO COCO detector) | 适配 |
-| `MobileSAM.segment_bbox` -> mask | in-box rectangle (`region.rect_mask`) | 适配（角色替代） |
-| `_extract_object_cloud`: erode -> holes to far -> backproject -> random 5000 -> DBSCAN largest cluster | `region.region_points_world` | **照搬** |
-| `too_offset` -> random `range_id` | `region.too_offset_rect` -> `GdProposal.suspect` (caller writes it as suspicious) | 适配 |
-| `update_explored` (near re-look deletes flagged ids) | existing suspicious near-field hysteresis / soft-only free-space erasure | 适配 |
-| `dist < 1.0 m` reject | `min_dist` gate on the closest cluster point to the camera | **照搬** |
-| no cross-frame dedup (point concat + closest point) | `provenance.attach_votes` (frame) + existing EMA memory merge (cross-frame) | **新增** |
-| value map untouched by GD boxes; no visualisation / VQA / dual-detector retry | same (value map is frozen by the project rules) | 一致 |
+| `GroundingDINOClient.predict(rgb, caption)` + `filter_by_class` | `client.GdDetector` + `vocab.match_phrase` | Ported + adapted (strict single class) |
+| `coco_threshold 0.8 / non_coco_threshold 0.4` | `box_thr = 0.4` (single GD detector -> the non-COCO value; 0.8 belongs to the YOLO COCO detector) | Adapted |
+| `MobileSAM.segment_bbox` -> mask | in-box rectangle (`region.rect_mask`) | Adapted (role replacement) |
+| `_extract_object_cloud`: erode -> holes to far -> backproject -> random 5000 -> DBSCAN largest cluster | `region.region_points_world` | **Ported** |
+| `too_offset` -> random `range_id` | `region.too_offset_rect` -> `GdProposal.suspect` (caller writes it as suspicious) | Adapted |
+| `update_explored` (near re-look deletes flagged ids) | existing suspicious near-field hysteresis / soft-only free-space erasure | Adapted |
+| `dist < 1.0 m` reject | `min_dist` gate on the closest cluster point to the camera | **Ported** |
+| no cross-frame dedup (point concat + closest point) | `provenance.attach_votes` (frame) + existing EMA memory merge (cross-frame) | **New** |
+| value map untouched by GD boxes; no visualisation / VQA / dual-detector retry | same (value map is frozen by the project rules) | Same |
 
 ## Usage (policy wiring comes later)
 

@@ -11,8 +11,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .types import MatchResult
 
-# VLVM's HM3D ObjectNav classes (VLFM's caption uses the longer MP3D list; the list
-# is injectable through `build_alias_map` / `build_caption`).
+# Fallback class list (HM3D ObjectNav). The policy injects the dataset-specific
+# list at construction time (`from_config`): HM3D = 6 classes, MP3D = 21 classes;
+# entries may be alias packs ("table|dining table|desk") handled by `build_alias_map`.
 DEFAULT_VOCAB: List[str] = ["chair", "bed", "potted plant", "toilet", "tv", "couch"]
 
 DEFAULT_ALIASES: Dict[str, str] = {
@@ -139,13 +140,21 @@ def build_caption(target_classes: Sequence[str], style: str = "vocab",
                   vocab: Optional[Sequence[str]] = None) -> str:
     """caption string for the GD server.
 
-    `"vocab"` = the whole class list (VLFM's caption style, needed so that other
-    classes can also be recognised); `"target"` = only the target classes.
+    `"vocab"` = the whole class list 
+    (VLFM's caption style, needed so that other classes can also be recognised); 
+    `"target"` = only the target classes.
+
+    Entries may be alias packs (`"table|dining table|desk"`): 
+    only the canonical (first) part is written into the caption, so the prompt stays clean.
     """
-    if style == "target":
-        tokens = [normalize_phrase(c) for c in target_classes]
-    else:
-        tokens = [normalize_phrase(c) for c in (vocab if vocab is not None else DEFAULT_VOCAB)]
+    raw = list(target_classes) if style == "target" else list(
+        vocab if vocab is not None else DEFAULT_VOCAB
+    )
+    tokens: List[str] = []
+    for c in raw:
+        canon = normalize_phrase(str(c).split("|")[0])
+        if canon and canon not in tokens:
+            tokens.append(canon)
     return (" . ".join(tokens) + " .") if tokens else "object ."
 
 

@@ -39,7 +39,8 @@ class MemoryManagerConfig:
     fb_hysteresis: int = 5                # trusted target: consecutive near-field miss frames before deletion
     fb_suspicious_hysteresis: int = 2     # suspicious target: consecutive near-field miss frames before deletion
     fb_suspicious_conf: float = 0.75      # trusted/suspicious confidence boundary.
-                                          # ⚠️ GD 启用时不作用：新条目恒被标可疑、合并写不重算（仅 `both` 清除）——现值仅留档。
+    # No effect when GD is enabled: new entries are always marked suspicious 
+    # and merge writes do not recompute the flag (cleared only by a `both` vote).
 
 
 class TargetMemoryManager:
@@ -88,12 +89,14 @@ class TargetMemoryManager:
     ) -> Dict[str, Any]:
         """
         In-place write / EMA-merge of one admitted detection.
-        Merges within merge_dist_thresh of a same-class record (EMA centroid, num_obs+1,
-        max confidence kept, near-miss reset); otherwise registers a new candidate.
+        Merges within merge_dist_thresh of a same-class record 
+        (EMA centroid, num_obs+1, max confidence kept, near-miss reset); 
+        otherwise registers a new candidate.
 
-        `src` is the proposer tag of this write: "tsp3d" (default) / "gd" (GD-only
-        single vote) / "both". Two different tags on the same entry make it "both"
-        (cross-frame vote merge); it never changes the confidence scale.
+        `src` is the proposer tag of this write: 
+        "tsp3d" (default) / "gd" (GD-only single vote) / "both". 
+        Two different tags on the same entry make it "both" (cross-frame vote merge); 
+        it never changes the confidence scale.
 
         Vote policy:
           * `both` always follows the normal path — a merged `both` entry has its
@@ -101,16 +104,9 @@ class TargetMemoryManager:
           * single-side evidence may be marked suspicious: `new_suspicious` marks a
             newly created entry, `suspicious_override=True` forces the flag on.
 
-        Measurement-only `gd_conf`: the RAW GD sigmoid score of
-        this write (0.0 = the write carries no GD score, i.e. a pure `tsp3d`
-        write). Unlike `confidence` — which for a `gd` entry is the constant
-        `sigma_tar` and for a `both` entry is the TSP3D `c'` — `gd_conf` keeps the
-        GD side's own score so that later measurement can test whether the GD
-        score separates tp from fp entries. It is stored as the running MAX over
-        all writes, i.e. the strongest GD evidence ever seen on that entry.
-
-        Returns a small record of the write: `{merged, src, num_obs, suspicious,
-        suspicion_cleared, gd_conf}` (for caller-side logging / accounting).
+        Returns a small record of the write: 
+        `{merged, src, num_obs, suspicious, suspicion_cleared, gd_conf}` 
+        (for caller-side logging / accounting).
         """
         r_xyz = np.zeros(3) if robot_xyz is None else np.asarray(robot_xyz, dtype=np.float64)
         r_xy = r_xyz[:2]
@@ -118,8 +114,6 @@ class TargetMemoryManager:
         s_np = np.asarray(near_surface, dtype=np.float64) if near_surface is not None else c_np
 
         # Suspicious flag: low confidence or beyond the trustworthy range.
-        # ⚠️ GD 启用时本子句不参与决策：两处写入口恒推 True（TSP3D `new_suspicious=_gd_on`、
-        # GD `suspicious_override=True`），合并写不重算 —— 仅 GD-off 工况按 `fb_suspicious_conf` 分档。
         if c_np.shape[0] >= 3:
             detect_dist = float(np.linalg.norm(c_np - r_xyz))
         else:
@@ -204,12 +198,14 @@ class TargetMemoryManager:
                     **_m_a(state)}
 
     def state_of(self, centroid: np.ndarray, tol: float = 0.3) -> Dict[str, Any]:
-        """Lifecycle / vote state dict of the entry nearest to ``centroid``.
+        """
+        Lifecycle / vote state dict of the entry nearest to ``centroid``.
 
         Holds `suspicious`, `near_miss`, `src` and the raw GD score (`gd_conf`);
-        an empty dict when no entry is within ``tol``. Returns a *shallow copy* with
-        `num_obs` merged in from the verify state, so callers can read the live
-        observation count without mutating the stored state.
+        an empty dict when no entry is within ``tol``. 
+
+        Returns a *shallow copy* with `num_obs` merged in from the verify state, 
+        so callers can read the live observation count without mutating the stored state.
         """
         c = np.asarray(centroid, dtype=np.float64).reshape(-1)
         if c.size < 2:
@@ -244,12 +240,12 @@ class TargetMemoryManager:
         reason: str,
         near_miss: int,
     ) -> Dict[str, Any]:
-        """One deletion record.
+        """
+        One deletion record.
 
-        Carries what the episode logger needs to label the deleted entry tp / fp and to
-        split it by proposer tag: `src` / `num_obs` / `conf` / `gd_conf` /
-        `near_miss` (`conf` = the entry's stored `c'`, `gd_conf` = its strongest raw GD
-        sigmoid).
+        Carries what the episode logger needs to label the deleted entry tp / fp 
+        and to split it by proposer tag: `src` / `num_obs` / `conf` / `gd_conf` / `near_miss`
+        (`conf` = the entry's stored `c'`, `gd_conf` = its strongest raw GD sigmoid).
         """
         try:
             conf = float(v_state[3]) if len(v_state) > 3 else 0.0
@@ -292,11 +288,13 @@ class TargetMemoryManager:
         nav_goal_xy: Optional[np.ndarray] = None,
         exempt_nav_goal: bool = False,
     ) -> List[Dict[str, Any]]:
-        """One-step lifecycle over all memory records.
+        """
+        One-step lifecycle over all memory records.
 
         Native near-field hysteresis fallback with the near-field exemption:
-        with `exempt_nav_goal=True` and a `nav_goal_xy`, the entry within 0.5 m of
-        the current navigation goal is exempt from the near-field `near_miss` budget
+        with `exempt_nav_goal=True` and a `nav_goal_xy`, 
+        the entry within 0.5 m of the current navigation goal is exempt 
+        from the near-field `near_miss` budget
         — otherwise a blocked stop (no new writes) would delete the entry.
 
         Returns per-deletion logs with `reason` in {"hysteresis_exceeded"}.
