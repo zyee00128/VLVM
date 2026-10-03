@@ -1,0 +1,32 @@
+# 数据与权重
+data/
+ft_datasets/
+
+# 模型代码
+GroundingDINO/
+# 微调代码
+ft_pipeline/
+
+# 实验日志 / TensorBoard
+iteration/
+lockfiles/
+outputs/
+outputs_Stage1/
+outputs_Stage2
+tb/
+
+# Python 缓存与构建产物 / 其他
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+*.pt
+*.pth
+*.log
+.DS_Store
+
+framework.pptx
+push_token.txt
+chatrules.md

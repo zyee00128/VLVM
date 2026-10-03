@@ -1,0 +1,196 @@
+# @package _global_
+
+defaults:
+  - /habitat_baselines: habitat_baselines_rl_config_base
+  - /benchmark/nav/objectnav: objectnav_hm3d
+  - /habitat/task/lab_sensors:
+      - base_explorer
+      - compass_sensor
+      - gps_sensor
+      - heading_sensor
+      - frontier_sensor
+  - /habitat/task/measurements:
+      - frontier_exploration_map
+      - traveled_stairs
+      - cumulative_elevation_change
+  - /habitat_baselines/rl/policy: vlvm_policy
+  - _self_
+
+habitat:
+  environment:
+    iterator_options:
+      max_scene_repeat_steps: 50000
+  task:
+    success_reward: 2.5
+    slack_reward: -1e-3
+    
+    actions:
+      # Scan-only wide-turn action (VLVM panoramic): appended at the END of the
+      # discrete task-action space (id 6, after look_down), so stop/move_forward/
+      # turn_left/turn_right keep ids 0-3. Per-step rotation = turns x 30°, with
+      # turns auto-derived by run.py from rl.policy.panoramic_turn_steps
+      # (angle = 360/turn_steps, TURN_LEFT_WIDE_TURNS = angle/30).
+      # Do NOT export it manually.
+      turn_left_wide:
+        type: TurnLeftWideAction
+    
+    lab_sensors:
+      base_explorer:
+        turn_angle: 30
+    measurements:
+      traveled_stairs:
+        type: "TraveledStairs"
+      cumulative_elevation_change:
+        type: "CumulativeElevationChange"
+
+habitat_baselines:
+  evaluate: True
+  eval_ckpt_path_dir: data/dummy_policy.pth
+  num_environments: 1
+  load_resume_state_config: False
+
+  torch_gpu_id: 0
+  tensorboard_dir: "tb"
+  video_dir: "video_dir"
+  test_episode_count: -1
+  checkpoint_folder: "data/new_checkpoints"
+  trainer_name: "vlvm" 
+  log_interval: 10
+  force_torch_single_threaded: True
+
+  eval:
+    split: "val"
+
+  rl:
+    policy:
+      name: "HabitatITMPolicyV1" 
+
+      pointnav_policy_path: "data/pointnav_weights.pth"
+      depth_image_shape: [224, 224]
+      fov_angle: 79.0
+      camera_height: 0.88
+      text_prompt: "Seems like there is a target_object ahead."
+      visualize: False
+      init_turn_steps: 12
+      min_depth: 0.5
+      max_depth: 5.0
+      pointnav_stop_radius: 0.90
+      # Anti-hallucination fallback
+      enable_fb: True
+      fb_near_radius: 2.5              # Intentionally inert: fixed internally at max_depth*0.5 (VLFM-aligned); kept for reference only.
+      fb_hysteresis: 5
+      fb_suspicious_hysteresis: 2
+      fb_suspicious_conf: 0.75         # No effect while GD is on: new entries are always suspicious; merge writes do not recompute (only `both` clears it).
+      # obstacle map
+      om_style: "probabilistic" # probabilistic / obstacle
+      voxel_size: 0.05
+      min_obstacle_height: 0.15
+      max_obstacle_height: 1.50
+      hole_area_thresh: 100000
+      log_odds_occ: 2.0
+      log_odds_free: -2.0
+      occ_threshold: 0.0
+      free_threshold: 0.0
+      obstacle_map_area_threshold: 1.5
+      ## Dilation / structuring element 
+      agent_radius: 0.18
+      agent_height: 0.88
+      nav_slice_height: 0.30
+      # value map
+      vm_style: "region"  # "region" / "surface"
+      h_lam: 0.3
+      h_norm_max: 1.0
+      h_z_min: 0.15
+      h_z_max: 0.88
+      query_radius_m: 0.5
+      query_z_min: 0.15
+      query_z_max: 1.50
+      # TSP3D query
+      sigma_tar: 0.70
+      sigma_sce: 0.15
+      tau: 0.15
+      near_field_dist: 1.0
+      near_field_sigma_scale: 0.8
+      # TSP3D Input Processing
+      use_vlfm_nlp: False
+      fusion_style: world   # Fusion route: "camera" / "world" / "panoramic (scan)" / "none"
+      enable_scan: False    # world + scan
+      frontier_trigger: True
+      scan_min_gap: 90 
+      scan_opportunistic_after: 60
+      pcd_window_size: 8
+      fuse_voxel_size: 0.02
+      fuse_max_points: 200000
+      cam_radius: null
+      cam_min_view_disp: 0.15
+      cam_min_view_yaw: 15.0
+      wm_max_frames: 8
+      wm_voxel_size: 0.02
+      wm_max_voxels: 400000
+      wm_radius: 6.0
+      wm_min_view_disp: 0.15
+      wm_min_view_yaw: 15.0
+      wm_near_refresh_radius: 3.0
+      wm_near_refresh_value: True
+      panoramic_turn_steps: 6
+      panoramic_voxel_size: 0.02
+      panoramic_max_points: 200000
+      panoramic_radius: 6.0
+      panoramic_min_move: 2.0
+      panoramic_arrive_dist: 1.0
+      cap_style: random # point cap - "random" (baseline) / "near_first"
+      det_seed: 0 # per-step numpy reseed base (same config -> bit-stable double-run)
+      distance_sample: True
+      near_dist: 1.5
+      mid_dist: 3.0
+      near_voxel: 0.01
+      mid_voxel: 0.02
+      far_voxel: 0.05
+      # S-penalty
+      enable_s_penalty: True
+      s_penalty_thresh: 0.15
+      s_penalty_floor: 0.3
+      s_penalty_radius_m: 0.5
+      s_penalty_uncovered_w: 1.0         # Weight for no coverage (S<=0/None): 1.0 = free pass; <1.0 = mild penalty.
+      sx_conflict_gate: True
+      # geometric admission module (occupancy-consistency gate)
+      enable_occ_consistency: True
+      occ_min_voxels: 8
+      occ_min_ratio: 0.001
+      # target-memory lifecycle
+      merge_dist_thresh: 0.5
+      ema_weight_old: 0.8
+      lock_exempt: True
+      lock_exempt_identity: True 
+      # near-surface point
+      s_penalty_use_surface: True
+      goal_use_surface: True
+      # new GD auxiliary mechanism: independent proposer + vote
+      gdp_enable: True
+      gdp_port: 12181
+      gdp_caption_style: vocab
+      gdp_box_thr: 0.4
+      gdp_max_boxes: 1
+      gdp_weak_guard: True
+      gdp_merge_dist: 0.5
+      gdp_merge_iau: 0.3
+      gdp_every_n: 5
+      gdp_vocab: []                 # GD caption/alias class list; empty = auto by dataset (HM3D 6 / MP3D 21).
+      lock_min_obs: 2
+      gd_skip_classes: ""           # GD class whitelist (these target classes skip the GD source).
+      
+      enable_stats: True            # Pre-flight stats logger ([NAV]/[STOP] prints + per-episode summary; zero behavior).
+
+    ppo:
+      clip_param: 0.2
+      ppo_epoch: 4
+      num_mini_batch: 2
+      value_loss_coef: 0.5
+      entropy_coef: 0.01
+      lr: 2.5e-4
+      eps: 1e-5
+      max_grad_norm: 0.2
+      num_steps: 64
+      use_gae: True
+      gamma: 0.99
+      tau: 0.95
