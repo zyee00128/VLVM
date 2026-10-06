@@ -1,5 +1,19 @@
+import torch
 import torch.nn as nn
 from copy import deepcopy
+
+
+def _none_if_empty(mask):
+    """
+    `nn.MultiheadAttention` 只要收到非 None 的 mask（哪怕全 False）就会强制走慢路径；
+    `need_weights` 默认 True 还会额外物化 [B×H, L, L] 的注意力权重（大视图下单个矩阵可达 GB 级）。
+    两者都只影响显存/速度，不影响数值输出。
+    """
+    if mask is None or not torch.is_tensor(mask):
+        return mask
+    if mask.dtype == torch.bool and not bool(mask.any()):
+        return None
+    return mask
 
 def _get_clones(module, N):
     return nn.ModuleList([deepcopy(module) for _ in range(N)])
@@ -77,7 +91,8 @@ class CrossAttentionLayer(nn.Module):
             key=kv.transpose(0, 1),
             value=vv.transpose(0, 1),
             attn_mask=None,
-            key_padding_mask=vis_key_padding_mask  # (B, V)
+            key_padding_mask=_none_if_empty(vis_key_padding_mask),  # (B, V)
+            need_weights=False,
         )[0].transpose(0, 1)
         text_feats = text_feats + self.dropout_lv(text_feats2)
         text_feats = self.norm_lv(text_feats)
@@ -89,7 +104,8 @@ class CrossAttentionLayer(nn.Module):
             key=kt.transpose(0, 1),
             value=vt.transpose(0, 1),
             attn_mask=None,
-            key_padding_mask=text_key_padding_mask  # (B, L)
+            key_padding_mask=_none_if_empty(text_key_padding_mask),  # (B, L)
+            need_weights=False,
         )[0].transpose(0, 1)
         vis_feats = vis_feats + self.dropout_vl(vis_feats2)
         vis_feats = self.norm_vl(vis_feats)
@@ -101,7 +117,8 @@ class CrossAttentionLayer(nn.Module):
                 key=detected_feats.transpose(0, 1),
                 value=detected_feats.transpose(0, 1),
                 attn_mask=None,
-                key_padding_mask=detected_mask
+                key_padding_mask=_none_if_empty(detected_mask),
+                need_weights=False,
             )[0].transpose(0, 1)
             vis_feats = vis_feats + self.dropout_d(vis_feats2)
             vis_feats = self.norm_d(vis_feats)
@@ -135,8 +152,9 @@ class TransformerEncoderLayerNoFFN(nn.Module):
         """
         src2 = self.self_attn(
             src, src, src,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask
+            attn_mask=_none_if_empty(src_mask),
+            key_padding_mask=_none_if_empty(src_key_padding_mask),
+            need_weights=False,
         )[0]
         src = src + self.dropout1(src2)
         src = self.norm1(src)
@@ -165,8 +183,9 @@ class PosTransformerEncoderLayerNoFFN(TransformerEncoderLayerNoFFN):
         """
         src2 = self.self_attn(
             src + pos, src + pos, src,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask
+            attn_mask=_none_if_empty(src_mask),
+            key_padding_mask=_none_if_empty(src_key_padding_mask),
+            need_weights=False,
         )[0]
         src = src + self.dropout1(src2)
         src = self.norm1(src)

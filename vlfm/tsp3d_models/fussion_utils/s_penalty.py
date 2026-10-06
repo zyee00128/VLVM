@@ -15,27 +15,6 @@ class SPenaltyConfig:
                               # detections the value map cannot corroborate at all.
 
 
-def compute_w_s(s: Optional[float], cfg: SPenaltyConfig) -> Tuple[float, Optional[float]]:
-    """
-    Map a semantic-field value S to a penalty weight w_S
-
-    returns (w_S, S)
-    """
-    if not cfg.enable:
-        return 1.0, None
-    if s is None or s <= 0.0:
-        return float(cfg.uncovered_w), None
-    if s >= cfg.thresh:
-        return 1.0, s
-    return max(cfg.floor, s / max(cfg.thresh, 1e-6)), s
-
-
-def amplified_confidence(conf: float, s: Optional[float], cfg: SPenaltyConfig) -> float:
-    """c' = conf * w_S(S): amplified confidence after the S-penalty."""
-    w_s, _ = compute_w_s(s, cfg)
-    return conf * w_s
-
-
 def query_semantic_at(x: float, y: float, radius_m: Optional[float] = None) -> Optional[float]:
     """
     Default semantic-field query hook; returns None = no coverage.
@@ -61,6 +40,22 @@ def near_surface_point(box_corners: np.ndarray, camera_pos: np.ndarray) -> Optio
         dists = np.linalg.norm(corners[:, :2] - camera[:2], axis=1)
     idx = np.argsort(dists)[:4]
     return corners[idx].mean(axis=0)
+
+
+def compute_w_s(s: Optional[float], cfg: SPenaltyConfig) -> Tuple[float, Optional[float]]:
+    """
+    Map a semantic-field value S to a penalty weight w_S
+
+    returns (w_S, S)
+    """
+    if not cfg.enable:
+        return 1.0, None
+    
+    if s is None or s <= 0.0:
+        return float(cfg.uncovered_w), None
+    if s >= cfg.thresh:
+        return 1.0, s
+    return max(cfg.floor, s / max(cfg.thresh, 1e-6)), s
 
 
 def apply_s_penalty(

@@ -146,3 +146,8 @@ if __name__ == "__main__":
     cv2.imshow("Text Image", result_image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+    result_image = generate_text_image(width, text)
+
+    cv2.imshow("Text Image", result_image)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()

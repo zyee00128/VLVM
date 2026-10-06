@@ -8,35 +8,33 @@ pred = {
   "boxes":          (K, 6)      # 交付框 canonical (x, y, z, l, w, h)，l/w/h = Δx/Δy/Δz
   "scores":         (K,)        # 交付置信度 s_k（sigmoid 后概率）
   "p_exist":        scalar | None   # 门控概率 P_exist（I_Gate 开时必需）
-  # ---- M2+ 解耦分支（可选）----
-  "prop_boxes":     (K1, 6) | None, "prop_obj_logits": (K1,) | None        # Stage 1 纯几何提议
-  "match_logits":   (K,) | None, "refine_boxes": (K, 6) | None             # Stage 2 实体精炼
-  "tgp_logits":     (V,) | None, "tgp_cluster_id": (V,) | None,            # 实体级 TGP（逐体素）
-  "tgp_voxel_xyz":  (V, 3) | None   # 体素坐标（canonical 系 = coordinates × voxel_size）
 }
 ```
 模型输出框与数据层 GT、在线消费口径一致：**轴对齐 6 元组 (x, y, z, l, w, h)**（§9 定稿；
-若模型侧内部回归序不同，由模型侧转齐后给出）。K/ K1 槽位数 = 最终输出候选数
-（M0/M1 档 K=1；M2+ 档 = Stage 1 提议数）。
+若模型侧内部回归序不同，由模型侧转齐后给出）。K = 最终输出候选数（单候选路径 K=1）。
+
+S1/S2 解耦分支的 pred 扩展键（`prop_boxes` / `prop_obj_logits` / `match_logits` /
+`refine_boxes` / `tgp_logits` / `tgp_cluster_id` / `tgp_voxel_xyz`）随该分支一并移出，
+见 `ft_s12/losses_s12.py`。
 
 目标契约（`data_loader` 输出）
 ------------------------------
 ```
 target = {"query", "label": 0|1, "weight": float,
           "gt": None | (6,) f32,               # 正样本 canonical (x, y, z, l, w, h)
-          "entities": None | (M, 6) f32,       # L_s1：视锥内可见实体（None = 实例表缺失）
+          "entities": None | (M, 6) f32,       # L_s1 标签面（S1/S2 已归档，暂不消费）
           "teacher": None | {"valid", "y", "s_max", "reason"}}  # L_gate_dist
 ```
 
-损失总表（§8）
---------------
+损失总表
+--------
 * `L_base`（恒定）= `cls_base`（ASL, γ+=1.0 / γ−=4.0，输入 = P_exist.detach()×s_k 的门控乘子）
   + [正样本] l1_base + giou3d_base + `bg`（负视锥二次压制 Σs_k²/K）；
 * `L_gate`（I_Gate）= 加权 Focal（α = n_neg/(n_pos+n_neg)，γ=2）；
-* `L_s1`（I_Prop）= obj Focal(α=0.5, γ=2，目标 = 视锥内可见实体匈牙利匹配) + [有实体] box1 + giou1；
-* `L_s2`（I_Refine）= match Focal(α=0.25, γ=2) + [正样本] box2 + giou2 + [I_TGP] tgp BCE（簇级等权，
-  体素级几何掩码 box_margin=0.05；无目标视图掩码全 0）；
 * `L_gate_dist`（I_Distill）= 软-BCE（α=0.75），教师 Ŷ 严 detach；仅质检层通过样本参与。
+
+`L_s1`（I_Prop）与 `L_s2`（I_Refine，含 I_TGP）随 S1/S2 解耦分支一并移出，
+见 `ft_s12/losses_s12.py`；接回步骤见 `ft_s12/__init__.py`。
 
 归约：各分项 = 批内加权均值（Σ w·ℓ / Σ w，w = record.weight）；空批 / 零正样本 / 全零权重
 均有守卫，缺失分支返回 0 标量并跳过。
@@ -50,7 +48,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 _HERE = Path(__file__).resolve().parent
@@ -137,18 +134,6 @@ def l1_box(pred6: torch.Tensor, gt6: torch.Tensor) -> torch.Tensor:
     return dc + dd
 
 
-def build_tgp_mask(voxel_xyz: torch.Tensor, gt_cxyzwh: Optional[torch.Tensor],
-                   margin: float = 0.05) -> torch.Tensor:
-    """体素级几何掩码（§8 · 4）：体素 ∈ 目标 GT AABB（含 margin）⇒ 1；无目标 ⇒ 全 0。"""
-    v = voxel_xyz
-    if gt_cxyzwh is None:
-        return v.new_zeros((v.shape[0],))
-    lo = gt_cxyzwh[:3] - gt_cxyzwh[3:] / 2.0 - float(margin)
-    hi = gt_cxyzwh[:3] + gt_cxyzwh[3:] / 2.0 + float(margin)
-    inside = ((v >= lo[None, :]) & (v <= hi[None, :])).all(dim=-1)
-    return inside.to(v.dtype)
-
-
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
@@ -160,9 +145,6 @@ class LossConfig:
 
     # ---- 开关（base 恒定生效，不参与消融）----
     gate: bool = False           # I_Gate：L_gate
-    prop: bool = False           # I_Prop：L_s1（Stage 1 纯几何提议）
-    refine: bool = False         # I_Refine：L_s2（实体精炼/匹配）
-    tgp: bool = True             # I_TGP：L_s2 内的 TGP 剪枝项（仅 M3+ 开）
     distill: bool = False        # I_Distill：L_gate_dist
     # ---- base（§8 · 1）----
     lam_l1: float = 1.0
@@ -173,22 +155,12 @@ class LossConfig:
     # ---- gate（§8 · 2）----
     gate_alpha: float = 0.75     # 设计配比 1:3；生成后按 stats.json 实测复核
     gate_gamma: float = 2.0
-    # ---- s1（§8 · 3）----
-    s1_alpha: float = 0.5
-    s1_gamma: float = 2.0
-    lam_box1: float = 1.0
-    lam_giou1: float = 1.0
-    # ---- s2（§8 · 4）----
-    s2_alpha: float = 0.25
-    s2_gamma: float = 2.0
-    lam_box2: float = 1.0
-    lam_giou2: float = 1.0
-    lam_tgp: float = 1.0
     # ---- distill（§8 · 5）----
     distill_alpha: float = 0.75
     # ---- misc ----
-    box_margin: float = 0.05     # TGP 掩码含边（与数据层 target_pts 同一判定）
     eps: float = 1e-6
+    # S1/S2（I_Prop / I_Refine / I_TGP）开关与系数已随解耦分支移出，
+    # 见 `ft_s12/losses_s12.S12LossConfig`；接回时把那些字段并回本类。
 
 
 # ---------------------------------------------------------------------------
@@ -256,50 +228,6 @@ def compute_record_losses(pred: Dict[str, Any], target: Dict[str, Any],
         y_ex = torch.as_tensor(float(label), device=device)
         out["gate"] = soft_focal(p_exist, y_ex, cfg.gate_alpha, cfg.gate_gamma, cfg.eps)
 
-    # ---- L_s1（纯几何提议：obj Focal + 匹配实体的 box/giou）----
-    if cfg.prop and pred.get("prop_boxes") is not None and pred.get("prop_obj_logits") is not None:
-        prop_boxes = pred["prop_boxes"]
-        p_obj = torch.sigmoid(pred["prop_obj_logits"])
-        ents_np = target.get("entities")
-        if ents_np is not None:
-            ents = _as_tensor(ents_np, device).reshape(-1, 6)
-            k1 = prop_boxes.shape[0]
-            y_obj = torch.zeros(k1, device=device)
-            if ents.shape[0] > 0 and k1 > 0:
-                with torch.no_grad():
-                    iou = iou3d_matrix(prop_boxes.detach(), ents)
-                    cost = (1.0 - iou).cpu().numpy()
-                rows, cols = hungarian_match(cost)
-                if rows.size:
-                    y_obj[torch.as_tensor(rows, device=device, dtype=torch.long)] = 1.0
-                    out["s1_box"] = cfg.lam_box1 * l1_box(prop_boxes[rows], ents[cols]).mean()
-                    out["s1_giou"] = cfg.lam_giou1 * (1.0 - giou3d_aligned(prop_boxes[rows], ents[cols])).mean()
-            out["s1_obj"] = soft_focal(p_obj, y_obj, cfg.s1_alpha, cfg.s1_gamma, cfg.eps).mean()
-
-    # ---- L_s2（实体精炼与匹配）----
-    if cfg.refine and pred.get("match_logits") is not None:
-        k = boxes.shape[0]
-        y_m = torch.zeros(k, device=device)
-        if k_star is not None:
-            y_m[k_star] = 1.0
-        p_match = torch.sigmoid(pred["match_logits"])
-        out["s2_match"] = soft_focal(p_match, y_m, cfg.s2_alpha, cfg.s2_gamma, cfg.eps).mean()
-
-        if k_star is not None and gt_np is not None and pred.get("refine_boxes") is not None:
-            gt_t = _as_tensor(gt_np, device)
-            rb = pred["refine_boxes"][k_star]
-            out["s2_box"] = cfg.lam_box2 * l1_box(rb, gt_t)
-            out["s2_giou"] = cfg.lam_giou2 * (1.0 - giou3d_aligned(rb.reshape(1, 6), gt_t.reshape(1, 6))[0])
-
-        # ---- L_tgp_s2（BCE；簇级等权；体素级几何掩码）----
-        if (cfg.tgp and pred.get("tgp_logits") is not None
-                and pred.get("tgp_cluster_id") is not None and pred.get("tgp_voxel_xyz") is not None):
-            tgp_loss = tgp_cluster_bce(
-                pred["tgp_logits"], pred["tgp_cluster_id"], pred["tgp_voxel_xyz"],
-                _as_tensor(gt_np, device) if gt_np is not None else None, cfg.box_margin)
-            if tgp_loss is not None:
-                out["tgp"] = cfg.lam_tgp * tgp_loss
-
     # ---- L_gate_dist（软-BCE；教师质检层通过样本才参与）----
     teacher = target.get("teacher")
     if cfg.distill and has_gate and isinstance(teacher, dict) and bool(teacher.get("valid")):
@@ -307,25 +235,6 @@ def compute_record_losses(pred: Dict[str, Any], target: Dict[str, Any],
         out["gate_dist"] = soft_bce_alpha(p_exist, y_soft, cfg.distill_alpha, cfg.eps)
 
     return out
-
-
-def tgp_cluster_bce(logits: torch.Tensor, cluster_id: torch.Tensor,
-                    voxel_xyz: torch.Tensor, gt: Optional[torch.Tensor],
-                    margin: float) -> Optional[torch.Tensor]:
-    """簇级等权 TGP BCE：先簇内平均、再跨簇平均（§8 · 4）。"""
-    if logits.numel() == 0 or cluster_id.numel() == 0:
-        return None
-    kmax = int(cluster_id.max().item()) + 1
-    parts: List[torch.Tensor] = []
-    for k in range(kmax):
-        m = cluster_id == k
-        if not bool(m.any()):
-            continue
-        mask = build_tgp_mask(voxel_xyz[m], gt, margin)
-        parts.append(F.binary_cross_entropy_with_logits(logits[m].float(), mask.float()))
-    if not parts:
-        return None
-    return torch.stack(parts).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -391,11 +300,6 @@ def _self_test() -> None:
               "entities": np.zeros((0, 6), dtype=np.float32), "teacher": None}
     parts = compute_record_losses(pred, target, LossConfig())
     print("base parts:", {k: round(float(v), 4) for k, v in parts.items()})
-
-    # TGP 掩码
-    vox = torch.tensor([[0.0, 0, 0], [2.0, 2, 2], [0.4, 0, 0]])
-    gt = torch.tensor([0.0, 0, 0, 1.0, 1.0, 1.0])
-    print("tgp mask:", build_tgp_mask(vox, gt, 0.05).tolist())  # [1, 0, 1]
 
     # 空批守卫
     empty = compute_record_losses({"boxes": torch.zeros((0, 6)), "scores": torch.zeros((0,))},

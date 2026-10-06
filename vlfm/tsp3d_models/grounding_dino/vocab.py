@@ -7,7 +7,7 @@ which is *not* the target. `match_phrase` implements the strict single-class rul
 one named class is required, otherwise the phrase can never be a target match.
 """
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 from .types import MatchResult
 
@@ -156,9 +156,3 @@ def build_caption(target_classes: Sequence[str], style: str = "vocab",
         if canon and canon not in tokens:
             tokens.append(canon)
     return (" . ".join(tokens) + " .") if tokens else "object ."
-
-
-def canonical_pairs(class_names: Sequence[str]) -> List[Tuple[str, str]]:
-    """Debug helper: (alias, canonical) pairs of a class list."""
-    alias = build_alias_map(class_names)
-    return sorted(alias.items())

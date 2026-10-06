@@ -7,7 +7,7 @@
 #
 # 双机分工：
 #   A 机：base → gate                MACHINE=a bash scripts/ft_eval.sh
-#   B 机：base → s1 → s2 → distill   MACHINE=b bash scripts/ft_eval.sh
+#   B 机：base → distill             MACHINE=b bash scripts/ft_eval.sh
 #
 # 场景集（HM3D val；依据 Results/Results_final.md 全量 20 场景实验的失败结构挑选，
 # 覆盖 高/中/低 三档难度 × fp 主导 / nv 主导 / 转换损失 三类失效模式 + 历史对比场景）：
@@ -113,11 +113,11 @@ if [ -n "${ARMS:-}" ]; then
 else
     case "${MACHINE:-}" in
         a|A|1) QUEUE="base gate" ;;
-        b|B|2) QUEUE="base s1 s2 distill" ;;
+        b|B|2) QUEUE="base distill" ;;
         *)
             echo ""
             echo "用法: MACHINE=a|b bash scripts/ft_eval.sh"
-            echo "      A 机: base→gate ；B 机: base→s1→s2→distill（ARMS=\"...\" 覆盖）"
+            echo "      A 机: base→gate ；B 机: base→distill（ARMS=\"...\" 覆盖）"
             echo ""
             exit 1 ;;
     esac

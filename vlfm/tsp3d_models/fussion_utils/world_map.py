@@ -57,14 +57,6 @@ class WorldLocalMap:
         self._frame_keys: deque = deque()  # per-frame new keys, for frame-window slide-out
         self._last_pose: Optional[np.ndarray] = None  # [x, y, yaw]
 
-    @property
-    def num_voxels(self) -> int:
-        return int(self._keys.shape[0])
-
-    @property
-    def is_empty(self) -> bool:
-        return self._keys.shape[0] == 0
-
     def reset(self) -> None:
         self._keys = np.empty(0, dtype=np.int64)
         self._points = np.empty((0, 6), dtype=np.float32)

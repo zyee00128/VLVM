@@ -1,12 +1,3 @@
-"""Small, dependency-light building blocks used by the Stage-3 TSP3D head.
-
-The fine-tuning code lives outside the online package, so these modules keep
-the model-side contract deliberately simple: sparse visual features and text
-tokens in, logits/boxes/diagnostics out.  They are also useful when loading an
-old TSP3D checkpoint because every new layer is optional and independently
-initialised.
-"""
-
 from __future__ import annotations
 
 from typing import Optional
@@ -15,11 +6,21 @@ import torch
 from torch import nn
 
 
-def masked_mean(x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Mean-pool ``x`` over its sequence dimension.
+def _none_if_empty(mask):
+    """全 False 布尔 mask 不含信息：改传 None 以启用高效注意力。"""
+    if mask is None or not torch.is_tensor(mask):
+        return mask
+    if mask.dtype == torch.bool and not bool(mask.any()):
+        return None
+    return mask
 
-    ``padding_mask`` follows ``MultiheadAttention`` semantics (``True`` means
-    padding).  An all-padding row is handled safely and returns zeros.
+
+def masked_mean(x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Mean-pool ``x`` over its sequence dimension.
+
+    ``padding_mask`` follows ``MultiheadAttention`` semantics (``True`` means padding). 
+    An all-padding row is handled safely and returns zeros.
     """
     if x.ndim != 3:
         raise ValueError(f"expected [B,L,C], got {tuple(x.shape)}")
@@ -30,31 +31,21 @@ def masked_mean(x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) ->
     return (x * keep).sum(dim=1) / denom
 
 
-def _none_if_empty(mask):
-    """全 False 布尔 mask 不含信息：改传 None 以启用高效注意力（与 trans_modules 同口径）。"""
-    if mask is None or not torch.is_tensor(mask):
-        return mask
-    if mask.dtype == torch.bool and not bool(mask.any()):
-        return None
-    return mask
-
-
 class PresenceGate(nn.Module):
-    """Global scene/text existence gate.
+    """
+    Global scene/text existence gate.
 
-    The sparse tensor is pooled per batch item using its batch column.  Text
-    tokens are mean pooled after masking and projected into the same feature
-    space.  The output is a logit; callers should use ``sigmoid`` for a
-    probability and can choose their own post-training threshold.
+    The sparse tensor is pooled per batch item using its batch column.  
+    Text tokens are mean pooled after masking and projected into the same feature space.  
+    The output is a logit; callers should use ``sigmoid`` for a probability and 
+    can choose their own post-training threshold.
     """
 
     def __init__(self, visual_dim: int = 128, text_dim: int = 128, hidden_dim: int = 128):
         super().__init__()
         self.visual = nn.Sequential(nn.Linear(visual_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU())
         self.text = nn.Sequential(nn.Linear(text_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU())
-        # A single pooled visual token queries the text sequence.  This keeps
-        # the gate inexpensive while making the text interaction explicit
-        # (and mask-aware) instead of relying only on concatenated averages.
+        # A single pooled visual token queries the text sequence.
         self.cross_attn = nn.MultiheadAttention(
             hidden_dim, num_heads=max(1, min(8, hidden_dim // 16)),
             batch_first=True, dropout=0.0)
@@ -84,8 +75,8 @@ class PresenceGate(nn.Module):
         query = visual_h.unsqueeze(1)
         attn_mask = text_padding_mask
         if attn_mask is not None and bool(attn_mask.all(dim=1).any()):
-            # MultiheadAttention produces NaNs for an all-masked row; retain a
-            # harmless zeroed token as the fallback key/value instead.
+            # MultiheadAttention produces NaNs for an all-masked row; 
+            # retain a harmless zeroed token as the fallback key/value instead.
             attn_mask = attn_mask.clone()
             empty_rows = attn_mask.all(dim=1)
             attn_mask[empty_rows, 0] = False
@@ -101,14 +92,6 @@ def center_dim_to_corners(boxes: torch.Tensor) -> torch.Tensor:
         return boxes.reshape(-1, 6)
     half = boxes[..., 3:6].clamp_min(1e-4) / 2.0
     return torch.cat([boxes[..., :3] - half, boxes[..., :3] + half], dim=-1)
-
-
-def corners_to_center_dim(boxes: torch.Tensor) -> torch.Tensor:
-    """Convert ``(x1,y1,z1,x2,y2,z2)`` boxes to center/dim format."""
-    if boxes.numel() == 0:
-        return boxes.reshape(-1, 6)
-    lo, hi = boxes[..., :3], boxes[..., 3:6]
-    return torch.cat([(lo + hi) / 2.0, (hi - lo).clamp_min(1e-4)], dim=-1)
 
 
 def focal_binary_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 0.25,

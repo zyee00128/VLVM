@@ -84,7 +84,8 @@ def build_model(data_path: Optional[str] = None, d_model: int = 128, voxel_size:
                 ft_config: Optional[Dict[str, Any]] = None):
     """装配 `BeaUTyDETR`（延迟 import vlfm 模型定义；训练侧单向依赖，不回写推理包）。
 
-    `ft_config` 透传模型侧微调开关（`enable_gate` / `enable_prop` / `enable_refine`；
+    `ft_config` 透传模型侧微调开关（`enable_gate`；`prop/refine` 对应开关已随
+    S1/S2 解耦分支移出模型，传入的 `enable_prop` / `enable_refine` 键会被忽略；
     由训练循环按损失开关推导，见 `pipeline.py`）。
     """
     from vlfm.tsp3d_models.bdetr import BeaUTyDETR

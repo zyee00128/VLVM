@@ -8,7 +8,7 @@
 1. **直接契约**（`StubModel` / 独立实现的模型）：`model.forward_train(inputs)` 直接
    返回 `losses.py` 头部契约的扁平 pred（键 `boxes` / `scores` / `p_exist` / …）。
 2. **`BeaUTyDETR` 结构化输出**：`model(inputs)`（训练模式；`inputs["return_outputs"]=True`）
-   返回的 losses dict 中带 `ft_outputs`（= `TSPHead._ft_forward` 的逐样本列表结构，
+   返回的 losses dict 中带 `ft_outputs`（= `TSPHead._base_ft_forward` 的逐样本列表结构，
    另附 `gate_logits` / `gate_prob` / `final_scores`）。本模块把该结构索引到单 record
    （训练 B=1），并映射为契约 pred：
 

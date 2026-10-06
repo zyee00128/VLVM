@@ -84,8 +84,9 @@ def send_request(url: str, **kwargs: Any) -> dict:
             break
         except Exception as e:
             if attempt == 9:
-                print(e)
-                exit()
+                raise RuntimeError(
+                    f"Request to {url} failed after {attempt + 1} attempts"
+                ) from e
             else:
                 print(f"Error: {e}. Retrying in 20-30 seconds...")
                 time.sleep(20 + random.random() * 10)

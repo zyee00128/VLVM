@@ -1,21 +1,22 @@
 #!/bin/bash
 # ==============================================================================
-# TSP3D 微调跑批 · 五档损失消融权重生成（base / gate / s1 / s2 / distill）
+# TSP3D 微调跑批 · 三档损失消融权重生成（base / gate / distill）
 # ------------------------------------------------------------------------------
 # 档位 = base + 单损失开关（单变量消融；模型开关由 pipeline 按损失自动推导）：
 #   base     base（含 L_bg）                        --losses ""（默认即 base）
 #   gate     base + L_gate                          --losses gate
-#   s1       base + L_s1                            --losses s1
-#   s2       base + L_s2（含 TGP 子项）              --losses s2,tgp
 #   distill  base + L_gate_dist（门控仅蒸馏监督）     --losses distill
 #
+# s1 / s2 档位随 S1/S2 解耦分支移出（见 ft_tsp3d/ft_s12/ 与 vlfm/tsp3d_models/ft_s12/），
+# 接回后在此恢复 flags_of / 队列 / 前置检查。
+#
 # 双机分工（权重生成分两部分；每部分 base 单独跑一次，其他消融分开跑）：
-#   A 机：base → gate → s1        MACHINE=a bash scripts/ft_tsp3d.sh
-#   B 机：base → s2 → distill     MACHINE=b bash scripts/ft_tsp3d.sh
+#   A 机：base → gate            MACHINE=a bash scripts/ft_tsp3d.sh
+#   B 机：base → distill         MACHINE=b bash scripts/ft_tsp3d.sh
 #
 # 常用覆盖：
-#   TASK=s2  bash scripts/ft_tsp3d.sh                 # 只跑单档
-#   TASKS="gate s1" bash scripts/ft_tsp3d.sh          # 自定队列
+#   TASK=distill bash scripts/ft_tsp3d.sh             # 只跑单档
+#   TASKS="gate distill" bash scripts/ft_tsp3d.sh     # 自定队列
 #   HEAD=2  MACHINE=a bash scripts/ft_tsp3d.sh        # 只跑队列前 2 档（先跑前几档、看输出再续）
 #   LIMIT=2 SCENES=00006-HkseAnWCgqk EPOCHS=1 VAL_EVERY=0 TASK=base \
 #       WEIGHT_DIR=/tmp/ft_smoke_w LOG_DIR=/tmp/ft_smoke_l bash scripts/ft_tsp3d.sh   # 冒烟（临时目录）
@@ -27,10 +28,7 @@
 #         <档>_<GPU>_gate_val.npz、<档>_<GPU>_train.done
 #
 # 前置：
-#   * s1 档需要全量实例表（local_view/instances/train/，L_s1 标签面）：python ft_tsp3d/export_instances.py
-#     （缺失时脚本会硬报错退出，防止 L_s1 静默跳过导致白跑；s2 档不需要实例表）
 #   * distill 档需要全量 GD 侧车（local_view/gd/，默认已含全量；缺失硬报错）
-#   * 架构档 M0–M4（架构消融）直接调 pipeline：python ft_tsp3d/pipeline.py --ablation M3 ...
 # ==============================================================================
 set -o pipefail
 
@@ -70,8 +68,6 @@ flags_of() {
     case "$1" in
         base)    echo "" ;;
         gate)    echo "gate" ;;
-        s1)      echo "s1" ;;
-        s2)      echo "s2,tgp" ;;   # L_s2 含 TGP 子项（§8·4）
         distill) echo "distill" ;;
         *)       echo "__UNKNOWN__" ;;
     esac
@@ -82,7 +78,7 @@ run_arm() {
     local losses
     losses="$(flags_of "$key")"
     if [ "$losses" = "__UNKNOWN__" ]; then
-        echo ">>> 未知档位: $key（可选 base / gate / s1 / s2 / distill）"
+        echo ">>> 未知档位: $key（可选 base / gate / distill）"
         return 1
     fi
     local tag="${key}_${GPU_TAG}"
@@ -117,10 +113,10 @@ elif [ -n "${TASKS:-}" ]; then
     QUEUE="$TASKS"
 else
     case "${MACHINE:-}" in
-        a|A|1) QUEUE="base gate s1" ;;
-        b|B|2) QUEUE="base s2 distill" ;;
+        a|A|1) QUEUE="base gate" ;;
+        b|B|2) QUEUE="base distill" ;;
         *)     echo ""
-               echo "用法：MACHINE=a|b bash scripts/ft_tsp3d.sh   （A: base→gate→s1；B: base→s2→distill）"
+               echo "用法：MACHINE=a|b bash scripts/ft_tsp3d.sh   （A: base→gate；B: base→distill）"
                echo "      TASK=<档> | TASKS=\"<档 档…>\" bash scripts/ft_tsp3d.sh"
                echo ""
                exit 1 ;;
@@ -132,31 +128,19 @@ if [ -n "${HEAD:-}" ]; then
     QUEUE="$(echo $QUEUE | cut -d' ' -f1-"$HEAD")"
 fi
 
-# ---- 前置检查（全量跑：s1 缺实例表 / distill 缺侧车 → 硬报错，防白跑；SCENES 冒烟过滤时跳过） ----
-NEED_INST=0; NEED_GD=0
+# ---- 前置检查（全量跑：distill 缺侧车 → 硬报错，防白跑；SCENES 冒烟过滤时跳过） ----
+NEED_GD=0
 for k in $QUEUE; do
-    case "$k" in s1) NEED_INST=1 ;; distill) NEED_GD=1 ;; esac
+    case "$k" in distill) NEED_GD=1 ;; esac
 done
 if [ -z "${SCENES:-}" ]; then
     N_MAIN=$(ls "$DATA_DIR"/train/*.npz 2>/dev/null | wc -l)
-    if [ "$NEED_INST" = 1 ]; then
-        N_INST=$(ls "$DATA_DIR"/instances/train/*.json 2>/dev/null | wc -l)
-        if [ "$N_INST" -lt "$N_MAIN" ]; then
-            echo "[error] s1 档需要全量实例表：instances/train = $N_INST/$N_MAIN —— 先跑："
-            echo "        $PY ft_tsp3d/export_instances.py   （缺失时 L_s1 会静默跳过 = 白跑）"
-            exit 1
-        fi
-    fi
     if [ "$NEED_GD" = 1 ]; then
         N_GD=$(ls "$DATA_DIR"/gd/train/*.npz 2>/dev/null | wc -l)
         if [ "$N_GD" -lt "$N_MAIN" ]; then
             echo "[error] distill 档需要全量 GD 侧车：gd/train = $N_GD/$N_MAIN —— 先补侧车后再跑"
             exit 1
         fi
-    fi
-else
-    if [ "$NEED_INST" = 1 ] && [ ! -d "$DATA_DIR/instances/train" ]; then
-        echo "[warn] 冒烟模式：实例表目录缺失（$DATA_DIR/instances/train），s1 项将被跳过"
     fi
 fi
 

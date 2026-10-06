@@ -69,16 +69,6 @@ class TSPBackbone(nn.Module):
                 self, f'layer{i + 1}',
                 self._make_layer(block, n_channels, stage_blocks[i], stride=2))
 
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, ME.MinkowskiConvolution):
-                ME.utils.kaiming_normal_(
-                    m.kernel, mode='fan_out', nonlinearity='relu')
-
-            if isinstance(m, ME.MinkowskiBatchNorm):
-                nn.init.constant_(m.bn.weight, 1)
-                nn.init.constant_(m.bn.bias, 0)
-
     def _make_layer(self, block, planes, blocks, stride):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
@@ -122,5 +112,4 @@ class TSPBackbone(nn.Module):
             x = getattr(self, f'layer{i + 1}')(x)
             outs.append(x)
         return outs
-
 

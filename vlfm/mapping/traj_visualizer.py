@@ -112,3 +112,6 @@ class TrajectoryVisualizer:
         # px = pt * self._pixels_per_meter + self._origin_in_img
         px = px.astype(np.int32)
         return px
+   # px = pt * self._pixels_per_meter + self._origin_in_img
+        px = px.astype(np.int32)
+        return px

@@ -5,10 +5,9 @@
 ----------------------------------------------------------------------
 * **路径 A（直接契约）**：`model.forward_train(inputs) -> pred_dict`（独立实现模型 /
   `StubModel`）。`inputs = {"point_clouds": [Tensor(N,6)], "text": [str]}`，B=1 单样本调用。
-  `pred_dict` 键：
-    `boxes` (K,6) / `scores` (K,) 必填；`p_exist`（I_Gate 开时）；`prop_boxes` /
-    `prop_obj_logits`（I_Prop）；`match_logits` / `refine_boxes` / `tgp_logits` /
-    `tgp_cluster_id` / `tgp_voxel_xyz`（I_Refine / I_TGP）。
+  `pred_dict` 键：`boxes` (K,6) / `scores` (K,) 必填；`p_exist`（I_Gate 开时）。
+  S1/S2 解耦分支的扩展键（`prop_boxes` / `match_logits` / `tgp_*` 等）随该分支移出，
+  见 `ft_s12/`。
 * **路径 B（`BeaUTyDETR` 结构化输出）**：训练循环调 `model(inputs)`（训练模式；自动附加
   `inputs["return_outputs"]=True`）→ 取返回的 `losses["ft_outputs"]` →
   `model_bridge.adapt_ft_outputs` 映射到同一契约（模型侧自带五项损失为保底，训练不使用）。
@@ -34,10 +33,10 @@
 python ft_tsp3d/pipeline.py --dry-run --epochs 2 --stub-steps 8
 
 # 正式：权重/日志分流 + 档位命名（--weight-dir / --log-dir / --tag）
-python ft_tsp3d/pipeline.py --ablation M3 \
+python ft_tsp3d/pipeline.py --losses gate \
     --ckpt data/tsp3d_models/tsp3d_scanrefer.pth \
     --out-dir ft_tsp3d/ft_log --weight-dir data/tsp3d_ft --log-dir ft_tsp3d/ft_log \
-    --tag m3 --dump-gate ft_tsp3d/ft_log/m3_gate_val.npz
+    --tag gate --dump-gate ft_tsp3d/ft_log/gate_gate_val.npz
 ```
 """
 from __future__ import annotations
@@ -70,17 +69,8 @@ from losses import (  # noqa: E402
     total_of,
 )
 
-# 全量损失上的逐模块消融：与 scripts/ft_tsp3d.sh 的「base + 单项损失」相反。
-# M0 全开；M1-M4 每档仅移除一个损失模块。依赖关系由模型装配层处理：例如
-# M2 只移除 L_s1，Stage 2 仍会保留其所需的 proposal 前向分支。
-ABLATIONS: Dict[str, Dict[str, bool]] = {
-    "M0": {"gate": True,  "prop": True,  "refine": True,  "tgp": True,  "distill": True},
-    "M1": {"gate": False, "prop": True,  "refine": True,  "tgp": True,  "distill": True},
-    "M2": {"gate": True,  "prop": False, "refine": True,  "tgp": True,  "distill": True},
-    "M3": {"gate": True,  "prop": True,  "refine": False, "tgp": False, "distill": True},
-    "M4": {"gate": True,  "prop": True,  "refine": True,  "tgp": True,  "distill": False},
-}
-
+# 全量损失上的逐模块消融（M0–M4）与 S1/S2 损失/开关装配已随解耦分支移出，
+# 见 `ft_s12/`（该目录不被本管道导入）。
 ETA_MIN = 1e-6
 WARMUP_START = 1e-6
 
@@ -184,46 +174,31 @@ def run_view(
     return agg, len(sample["records"])
 
 
-def _model_loss_flags(model: nn.Module, loss_cfg: LossConfig) -> Tuple[bool, bool, bool]:
-    """(enable_gate, enable_prop, enable_refine)：优先读模型头实际开关，回退损失推导。"""
+def _gate_switch(model: nn.Module, loss_cfg: LossConfig) -> bool:
+    """门控输出是否可用：优先读模型头实际开关，回退损失推导。
+
+    流式反传用它预判 `gate` / `gate_dist` 分项是否存在。S1/S2（含 prop/refine 位
+    与分项键预测）随解耦分支移出，见 `ft_s12/ablation.py`。
+    """
     inner = getattr(model, "head", model)
     gate = getattr(inner, "enable_gate", None)
-    prop = getattr(inner, "enable_prop", None)
-    refine = getattr(inner, "enable_refine", None)
-    return (
-        bool(loss_cfg.gate or loss_cfg.distill) if gate is None else bool(gate),
-        bool(loss_cfg.prop or loss_cfg.refine) if prop is None else bool(prop),
-        bool(loss_cfg.refine) if refine is None else bool(refine),
-    )
+    return bool(loss_cfg.gate or loss_cfg.distill) if gate is None else bool(gate)
 
 
-def _predicted_loss_keys(rec: Dict[str, Any], cfg: LossConfig,
-                         flags: Tuple[bool, bool, bool]) -> set:
+def _predicted_loss_keys(rec: Dict[str, Any], cfg: LossConfig, has_gate: bool) -> set:
     """预测单 record 的损失分项键集合（镜像 `losses.compute_record_losses` 的门控）。
 
     仅用于流式反传预计算归一化系数 W_k；每条 record 反传前会与实际键严格校验
     （不一致会立即报错，不会静默改变训练语义）。
     """
-    gate_f, prop_f, refine_f = flags
     keys = {"cls_base"}
     if int(rec.get("label", 0)) == 0:
         keys.add("bg")
     if rec.get("gt") is not None:
         keys |= {"l1_base", "giou_base"}
-    if cfg.gate and gate_f:
+    if cfg.gate and has_gate:
         keys.add("gate")
-    ents = rec.get("entities")
-    if cfg.prop and prop_f and ents is not None:
-        keys.add("s1_obj")
-        if len(ents) > 0:
-            keys |= {"s1_box", "s1_giou"}
-    if cfg.refine and refine_f:
-        keys.add("s2_match")
-        if rec.get("gt") is not None:
-            keys |= {"s2_box", "s2_giou"}
-        if cfg.tgp:
-            keys.add("tgp")
-    if cfg.distill and gate_f:
+    if cfg.distill and has_gate:
         teacher = rec.get("teacher")
         if isinstance(teacher, dict) and bool(teacher.get("valid")):
             keys.add("gate_dist")
@@ -247,8 +222,8 @@ def run_view_streamed(
     返回 (加权平均后的分项标量字典, record 数, 非有限分项 record 数)。
     """
     records = sample["records"]
-    flags = _model_loss_flags(model, loss_cfg)
-    pred_keys = [_predicted_loss_keys(rec, loss_cfg, flags) for rec in records]
+    has_gate = _gate_switch(model, loss_cfg)
+    pred_keys = [_predicted_loss_keys(rec, loss_cfg, has_gate) for rec in records]
     w_sum: Dict[str, float] = {}
     for keys, rec in zip(pred_keys, records):
         w = float(rec.get("weight", 1.0))
@@ -315,8 +290,8 @@ def save_ckpt(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer,
         "optimizer": optimizer.state_dict(),
         "epoch": epoch, "global_step": global_step,
         "args": vars(args),
-        # 在线构造模型必须先知道哪些可选分支实际启用；不能再根据
-        # state_dict 中始终存在的 proposal/refine 参数猜测模式。
+        # 在线构造模型必须先知道门控头等可选分支是否实际启用，不能仅凭
+        # state_dict 键名反推。
         "ft_config": ft_config,
     }, str(path))
 
@@ -375,22 +350,20 @@ def make_fake_view(seed: int = 0, n_pts: int = 256) -> Dict[str, Any]:
 
 
 def build_loss_cfg(args: argparse.Namespace) -> LossConfig:
-    if args.ablation:
-        flags = dict(ABLATIONS[args.ablation])
-    else:
-        flags = {"gate": False, "prop": False, "refine": False, "tgp": False, "distill": False}
+    """`--losses` → `LossConfig`（base 恒定生效）。
+
+    可选开关：`gate` / `distill`；`s1` / `s2` / `tgp` 档位随 S1/S2 解耦分支移出
+    （见 `ft_s12/`），此处不再接受。
+    """
+    flags = {"gate": False, "distill": False}
     if args.losses:
         want = {s.strip() for s in args.losses.split(",") if s.strip()}
-        alias = {"s1": "prop", "s2": "refine", "gate": "gate", "distill": "distill",
-                 "tgp": "tgp", "base": ""}
-        flags = {k: False for k in flags}
+        alias = {"gate": "gate", "distill": "distill", "base": ""}
         for w in want:
             key = alias.get(w, w)
-            if key:
+            if key in flags:
                 flags[key] = True
-    cfg = LossConfig(**flags)
-    cfg.box_margin = float(args.box_margin)
-    return cfg
+    return LossConfig(**flags)
 
 
 def train(args: argparse.Namespace) -> None:
@@ -432,11 +405,10 @@ def train(args: argparse.Namespace) -> None:
         groups, _summary = split_param_groups(model, args.lr1, args.lr2, args.lr3, args.wd)
     else:
         # 模型开关 ← 损失开关（单变量一致性：损失需要哪条分支，模型开哪条）——
-        # gate/distill ⇒ 门控头；prop/refine ⇒ Stage1 提议 / Stage2 实体分支（refine 含 TGP）。
+        # S1/S2 的 enable_prop / enable_refine 已随解耦分支移出（见 `ft_s12/`），
+        # 此处只装配门控头。
         model = build_model(ft_config={
             "enable_gate": bool(loss_cfg.gate or loss_cfg.distill),
-            "enable_prop": bool(loss_cfg.prop or loss_cfg.refine),
-            "enable_refine": bool(loss_cfg.refine),
         })
         if args.ckpt:
             rep = load_pretrained(model, args.ckpt)
@@ -635,12 +607,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--lr3", type=float, default=1e-5)
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--clip", type=float, default=0.1)
-    # 损失 / 消融
-    ap.add_argument("--ablation", choices=sorted(ABLATIONS), default=None,
-                    help="M0–M4 损失留一消融预置：M0 全开；M1 缺 gate / M2 缺 s1 / "
-                         "M3 缺 s2+tgp / M4 缺 distill；与 --losses 同时给出时 --losses 优先")
-    ap.add_argument("--losses", default="", help="逗号分隔：s1,s2,tgp,gate,distill（默认仅 base）")
-    ap.add_argument("--box-margin", type=float, default=0.05)
+    # 损失（M0–M4 消融预置与 s1/s2/tgp 档位随 S1/S2 解耦分支移出，见 ft_s12/）
+    ap.add_argument("--losses", default="", help="逗号分隔：gate,distill（默认仅 base）")
     # 运行 / 产物落点（--weight-dir / --log-dir / --tag 可分流并按档位命名）
     ap.add_argument("--out-dir", default=str(_REPO / "ft_runs" / "default"))
     ap.add_argument("--weight-dir", default=None, help="权重目录（默认 = --out-dir）")

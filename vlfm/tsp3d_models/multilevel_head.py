@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import time
 import logging
@@ -7,12 +6,17 @@ from torch import nn
 import MinkowskiEngine as ME
 from mmdet3d.structures.bbox_3d import DepthInstance3DBoxes
 from .trans_modules import (BiEncoder, BiEncoderLayer, PositionEmbeddingLearned)
-
-
-def bias_init_with_prob(prior_prob):
-    """initialize conv/fc bias value according to giving probability."""
-    bias_init = float(-np.log((1 - prior_prob) / prior_prob))
-    return bias_init
+from .ft_utils import (
+    asymmetric_binary_loss,
+    batch_size_of,
+    box_giou,
+    box_iou,
+    center_dim_to_corners,
+    empty_prediction,
+    focal_binary_loss,
+    item_at,
+    to_box_tensor,
+)
 
 
 class MinkowskiFeatureFusionBlock(nn.Module):
@@ -58,12 +62,20 @@ class TSPHead(nn.Module):
                 test_cfg=None, 
                 in_channels=(128, 128, 128), out_channels=128,
                 n_reg_outs=6,  # Regression parameters: [dx_offset, dy_offset, dz_offset, log(w), log(h), log(l)]
-                n_classes=1):
+                n_classes=1,
+                num_proposals=8,
+                gate_threshold=0.30,
+                text_dim=128):
         super(TSPHead, self).__init__()
         self.voxel_size = voxel_size
         self.volume_threshold = volume_threshold
         self.prune_threshold = prune_threshold
         self.com_threshold = com_threshold
+
+        self.num_proposals = max(1, int(num_proposals))
+        self.gate_threshold = float(gate_threshold)
+        self.text_dim = int(text_dim)
+        
         self.test_cfg = test_cfg \
         if test_cfg is not None \
         else dict(nms_pre=1, iou_thr=.5, score_thr=.01) # Parse inference NMS settings
@@ -141,18 +153,6 @@ class TSPHead(nn.Module):
         self.pruning = ME.MinkowskiPruning()
         self.com_cls = nn.Conv1d(128, 1, kernel_size=1, bias=True)
 
-        # for i in range(len(in_channels)):
-        #     if i > 0:
-        #         self.__setattr__(
-        #             f'up_block_{i}',
-        #             self.make_up_block(in_channels[i], in_channels[i - 1], generative=True))
-        #     self.__setattr__(
-        #         f'lateral_block_{i}',
-        #         self.make_block(in_channels[i], in_channels[i]))
-        #     if i == 0:
-        #         self.__setattr__(
-        #             f'out_block_{i}',
-        #             self.make_block(in_channels[i], out_channels))
         # Dynamically assemble multi-scale feature pyramid layers
         for i in range(len(in_channels)):
             # Build the upsampling path
@@ -170,7 +170,322 @@ class TSPHead(nn.Module):
                     self, f'out_block_{i}',
                     self.make_block(in_channels[i], out_channels))
                 
-        self.fuse = MinkowskiFeatureFusionBlock(128, 128, 128)
+        self.fuse = MinkowskiFeatureFusionBlock(out_channels, self.text_dim, out_channels)
+        self._last_ft_outputs = None
+
+
+    @staticmethod
+    def _soft_reweight_sparse(x, logits, keep_complement=False):
+        """Apply a differentiable counterpart of a binary sparse keep mask."""
+        if logits is None:
+            return x
+        
+        weights = logits.reshape(-1).sigmoid()
+        if keep_complement:
+            weights = 1.0 - weights
+        return ME.SparseTensor(
+            features=x.F * weights.unsqueeze(-1),
+            coordinate_map_key=x.coordinate_map_key,
+            coordinate_manager=x.coordinate_manager,
+        )
+
+    @staticmethod
+    def _lateral_features_at(source, target):
+        """
+        Align an integer-grid lateral skip to ``target`` coordinates.
+
+        Both tensors are sparse feature-pyramid levels on the same integer lattice.  
+        Using ``features_at_coordinates`` here unnecessarily invokes MinkowskiEngine's continuous interpolation kernel, 
+        which can return an ``(N_target, N_source)`` tensor for tiny maps instead of ``(N_target, C)``. 
+        A kernel-size-one coordinate map is the native and exact operation: 
+        matched coordinates copy their source feature and generatively created target coordinates receive zero.
+
+        Structural mismatches are model errors and must not be hidden by a zero-feature fallback.
+        """
+        source_channels = int(source.F.shape[1])
+        target_channels = int(target.F.shape[1])
+        if source_channels != target_channels:
+            raise RuntimeError(
+                "lateral feature channel mismatch: "
+                f"source={source_channels}, target={target_channels}"
+            )
+
+        source_stride = tuple(int(v) for v in source.tensor_stride)
+        target_stride = tuple(int(v) for v in target.tensor_stride)
+        if source_stride != target_stride:
+            raise RuntimeError(
+                "lateral tensor-stride mismatch: "
+                f"source={source_stride}, target={target_stride}"
+            )
+
+        source_manager = source.coordinate_manager
+        target_manager = target.coordinate_manager
+        if source_manager._manager is not target_manager._manager:
+            raise RuntimeError(
+                "lateral tensors must share the same coordinate manager"
+            )
+
+        aligned = target.F.new_zeros((len(target), target_channels))
+        kernel_map = source_manager.kernel_map(
+            source.coordinate_map_key,
+            target.coordinate_map_key,
+            kernel_size=1,
+            region_type=ME.RegionType.HYPER_CUBE,
+        )
+        for in_idx, out_idx in kernel_map.values():
+            in_idx = in_idx.to(device=source.F.device, dtype=torch.long)
+            out_idx = out_idx.to(device=target.F.device, dtype=torch.long)
+            aligned = aligned.index_copy(0, out_idx, source.F[in_idx])
+        return aligned
+
+    def _base_ft_forward(self, backbone_feats, text_feats, text_padding_mask):
+        """
+        Train the legacy head through the same feature pyramid used at inference.
+
+        Inference physically removes voxels with threshold masks.
+        Training keeps the identical multi-scale/attention/completion topology 
+        but replaces the two binary decisions with sigmoid feature weights, 
+        preserving gradients for ``keep_conv`` and ``com_cls``.
+        """
+        inputs = backbone_feats[1:]
+        x = inputs[-1]
+        prune_logits = None
+
+        for i in range(len(inputs) - 1, -1, -1):
+            if i in (1, 0):
+                # _prune_inference keeps 1-sigmoid(prune_logits).
+                x = self._soft_reweight_sparse(x, prune_logits, keep_complement=True)
+                x = getattr(self, f"up_block_{i + 1}")(x)
+                skip_features = self._lateral_features_at(inputs[i], x)
+                skip = ME.SparseTensor(
+                    features=skip_features,
+                    coordinate_map_key=x.coordinate_map_key,
+                    coordinate_manager=x.coordinate_manager,
+                )
+                x = x + skip
+
+            if i == 0:
+                # sigmoid scores softly weight candidates rather than thresholding them out of the graph.
+                sampled_features, sampled_coords = [], []
+                for permutation in inputs[0].decomposition_permutations:
+                    if len(permutation) > self.num_samples_com:
+                        choice = torch.randperm(len(permutation), device=permutation.device)
+                        choice = torch.sort(choice[:self.num_samples_com]).values
+                        sampled_features.append(inputs[0].F[permutation][choice])
+                        sampled_coords.append(inputs[0].C[permutation][choice])
+                    else:
+                        n_pad = self.num_samples_com - len(permutation)
+                        sampled_features.append(torch.cat((
+                            inputs[0].F[permutation],
+                            inputs[0].F.new_zeros((n_pad, inputs[0].F.shape[1])),
+                        ), dim=0))
+                        sampled_coords.append(torch.cat((
+                            inputs[0].C[permutation],
+                            inputs[0].C.new_full((n_pad, inputs[0].C.shape[1]), -1),
+                        ), dim=0))
+                sampled_features = torch.stack(sampled_features)
+                sampled_coords = torch.stack(sampled_coords)
+                sampled_features, text_feats = self.com_trans(
+                    vis_feats=sampled_features.contiguous(),
+                    pos_feats=self.pos_embed(
+                        sampled_coords[:, :, 1:] * self.voxel_size
+                    ).transpose(1, 2).contiguous(),
+                    padding_mask=sampled_coords[:, :, 0] == -1,
+                    text_feats=text_feats,
+                    text_padding_mask=text_padding_mask,
+                )
+                completion_logits = self.com_cls(
+                    sampled_features.transpose(1, 2).contiguous()
+                ).transpose(1, 2).contiguous()
+                valid = sampled_coords[:, :, 0] != -1
+                candidate_features = sampled_features[valid]
+                candidate_coords = sampled_coords[valid]
+                completion_logits = completion_logits[valid].reshape(-1)
+                candidate_features = (
+                    candidate_features * completion_logits.sigmoid().unsqueeze(-1)
+                )
+                # Soft training keeps the full coordinate map, so most completion candidates already exist in the reconstructed trunk.
+                # Fuse their weighted features at existing positions instead of dropping the entire completion branch 
+                # as the collision-avoiding hard inference path must do.
+                completion = ME.SparseTensor(
+                    features=candidate_features,
+                    coordinates=candidate_coords,
+                    coordinate_manager=x.coordinate_manager,
+                    tensor_stride=x.tensor_stride,
+                    device=x.device,
+                )
+                existing_completion = completion.features_at_coordinates(x.C.float())
+                if existing_completion.shape == x.F.shape:
+                    x = ME.SparseTensor(
+                        features=x.F + existing_completion,
+                        coordinate_map_key=x.coordinate_map_key,
+                        coordinate_manager=x.coordinate_manager,
+                    )
+                duplicate = (
+                    candidate_coords.unsqueeze(1) == x.C.unsqueeze(0)
+                ).all(dim=-1).any(dim=1)
+                candidate_features = candidate_features[~duplicate]
+                candidate_coords = candidate_coords[~duplicate]
+                if len(candidate_features):
+                    trunk_features = x.features_at_coordinates(candidate_coords.float())
+                    if trunk_features.shape == candidate_features.transpose(0, 1).shape:
+                        trunk_features = trunk_features.transpose(0, 1).contiguous()
+                    if trunk_features.shape == candidate_features.shape:
+                        completion_features = trunk_features + candidate_features
+                        x = ME.SparseTensor(
+                            features=torch.cat((x.F, completion_features), dim=0),
+                            coordinates=torch.cat((x.C, candidate_coords), dim=0),
+                            coordinate_manager=x.coordinate_manager,
+                            tensor_stride=x.tensor_stride,
+                            device=x.device,
+                        )
+
+            if i > 0:
+                sampled_coords, sampled_features = [], []
+                max_len_x = max(
+                    len(permutation) for permutation in x.decomposition_permutations)
+                for permutation in x.decomposition_permutations:
+                    padding_size = max_len_x - len(permutation)
+                    padded_features = x.F[permutation]
+                    padded_coords = x.C[permutation]
+                    if padding_size:
+                        padded_features = torch.cat(
+                            [padded_features,
+                             x.F.new_zeros((padding_size, x.F.shape[1]))], dim=0)
+                        padded_coords = torch.cat(
+                            [padded_coords,
+                             x.C.new_full((padding_size, x.C.shape[1]), -1)], dim=0)
+                    sampled_features.append(padded_features)
+                    sampled_coords.append(padded_coords)
+                sampled_features = torch.stack(sampled_features)
+                sampled_coords = torch.stack(sampled_coords)
+                sampled_features, text_feats = self.keep_trans[i - 1](
+                    vis_feats=sampled_features.contiguous(),
+                    pos_feats=self.pos_embed(
+                        sampled_coords[:, :, 1:] * self.voxel_size
+                    ).transpose(1, 2).contiguous(),
+                    padding_mask=sampled_coords[:, :, 0] == -1,
+                    text_feats=text_feats,
+                    text_padding_mask=text_padding_mask,
+                )
+                valid = sampled_coords[:, :, 0] != -1
+                x = ME.SparseTensor(
+                    features=sampled_features[valid],
+                    coordinates=sampled_coords[valid],
+                    coordinate_manager=x.coordinate_manager,
+                    tensor_stride=x.tensor_stride,
+                    device=x.device,
+                )
+                prune_logits = self.keep_conv[i - 1](x).F
+
+            x = getattr(self, f"lateral_block_{i}")(x)
+            if i == 0:
+                visual = getattr(self, f"out_block_{i}")(x)
+
+        text_ctx = text_feats[:, 0]
+        fused = self.fuse(visual, text_ctx)
+        bbox_preds, cls_preds, points = self._forward_single(fused)
+        batch_size = batch_size_of(visual)
+        out = {
+            "final_logits": [], "final_boxes": [], "text_context": text_ctx,
+        }
+        for bi in range(batch_size):
+            logits = cls_preds[bi].reshape(-1)
+            boxes = self._bbox_pred_to_bbox(points[bi], bbox_preds[bi])
+            if logits.numel():
+                chosen = int(logits.argmax().item())
+                logits = logits[chosen:chosen + 1]
+                boxes = boxes[chosen:chosen + 1]
+            else:
+                logits = visual.F.new_empty((0,))
+                boxes = visual.F.new_empty((0, 6))
+            out["final_logits"].append(logits)
+            out["final_boxes"].append(boxes)
+        return out
+
+    def _ft_losses(self, pred, gt_bboxes=None, gt_labels=None,
+                       gt_all_bbox_new=None, auxi_bbox=None,
+                       gate_logits=None, gate_targets=None,
+                       teacher_targets=None):
+        """
+        Compute safe model-side losses for callers without a separate loss module.
+
+        Covers the base / gate / distill arms.
+
+        External fine-tuning pipelines may ignore these values and consume the structured prediction dictionary; 
+        the implementation nevertheless keeps the legacy ``BeaUTyDETR(...).train()`` path functional.
+        """
+        device = pred["text_context"].device
+        dtype = pred["text_context"].dtype
+        bsz = len(pred["final_boxes"])
+
+        base_terms, gate_terms, dist_terms = [], [], []
+        for bi in range(bsz):
+            boxes = pred["final_boxes"][bi]
+            logits = pred["final_logits"][bi]
+            all_arg = item_at(gt_all_bbox_new, bi, bsz)
+            if all_arg is None:
+                all_arg = item_at(auxi_bbox, bi, bsz)
+            box_arg = item_at(gt_bboxes, bi, bsz)
+            target_all = to_box_tensor(all_arg, device, dtype) if all_arg is not None else torch.empty((0, 6), device=device, dtype=dtype)
+            target = to_box_tensor(box_arg, device, dtype) if box_arg is not None else torch.empty((0, 6), device=device, dtype=dtype)
+            if target.numel() == 0 and target_all.numel():
+                target = target_all[:1]
+            label_arg = item_at(gt_labels, bi, bsz)
+            exists = bool(len(target))
+
+            if label_arg is not None:
+                lt = torch.as_tensor(label_arg, device=device)
+                # Class id 0 is a valid positive category, so box presence is the primary existence signal; 
+                # a nonzero label can still supervise positive samples when a caller omits the box.
+                exists = exists or bool((lt != 0).any().item())
+            target_flag = torch.tensor(float(exists), device=device, dtype=dtype)
+            if gate_logits is not None:
+                gtarget = target_flag if gate_targets is None else torch.as_tensor(item_at(gate_targets, bi, bsz), device=device, dtype=dtype).reshape(-1)[0]
+                gate_terms.append(focal_binary_loss(gate_logits[bi].reshape(1), gtarget.reshape(1), alpha=0.75, gamma=2.0))
+            if logits.numel():
+                if len(target):
+                    target_corners = center_dim_to_corners(target)
+                    pred_corners = center_dim_to_corners(boxes)
+                    iou = box_iou(pred_corners, target_corners)
+                    best_iou, best = iou.max(dim=1)
+                    cls_target = (best_iou >= 0.10).to(dtype)
+                    if cls_target.sum() == 0:
+                        cls_target[logits.argmax()] = 1.0
+                    chosen = int(cls_target.argmax().item())
+                    base_terms.append(asymmetric_binary_loss(logits, cls_target))
+                    base_terms.append(nn.functional.smooth_l1_loss(boxes[chosen], target[best[chosen]], reduction="mean"))
+                    base_terms.append(1.0 - box_giou(
+                        center_dim_to_corners(boxes[chosen:chosen + 1]),
+                        target_corners[best[chosen]:best[chosen] + 1]).mean())
+                else:
+                    base_terms.append(asymmetric_binary_loss(logits, torch.zeros_like(logits)))
+                    base_terms.append((torch.sigmoid(logits) ** 2).mean())
+            if teacher_targets is not None and gate_logits is not None:
+                teacher = torch.as_tensor(item_at(teacher_targets, bi, bsz), device=device, dtype=dtype).reshape(-1)[0]
+                dist_terms.append(nn.functional.binary_cross_entropy_with_logits(gate_logits[bi].reshape(1), teacher.detach().reshape(1)))
+
+        def mean_or_zero(values):
+            return torch.stack(values).mean() if values else pred["text_context"].sum() * 0.0
+
+        return {
+            "base_loss": mean_or_zero(base_terms),
+            "gate_loss": mean_or_zero(gate_terms),
+            "distill_loss": mean_or_zero(dist_terms),
+        }
+
+    def forward_train(self, x, text_feats, text_attention_mask,
+                      gt_bboxes=None, gt_labels=None, gt_all_bbox_new=None,
+                      auxi_bbox=None, img_metas=None, gate_logits=None,
+                      gate_targets=None, teacher_targets=None, **kwargs):
+        """
+        base / gate / distill 训练前向：legacy 头 + 模型侧保底损失。
+        """
+        pred = self._base_ft_forward(x, text_feats, text_attention_mask)
+        self._last_ft_outputs = pred
+        return self._ft_losses(pred, gt_bboxes, gt_labels, gt_all_bbox_new,
+                               auxi_bbox, gate_logits, gate_targets, teacher_targets)
+
 
     def _prune_inference(self, x, scores, layer_id, prune_threshold=None):
         """
@@ -199,7 +514,6 @@ class TSPHead(nn.Module):
                 mask = score > threshold
                 mask = mask.reshape([len(score)])
                 prune_mask[permutation[mask]] = True
-        
         # Call the MinkowskiEngine backend physical level 
         # to remove the voxels designated for pruning from the hash map entirely
         if prune_mask.sum() != 0:
@@ -249,7 +563,7 @@ class TSPHead(nn.Module):
 
     def _get_bboxes_single(self, bbox_preds, cls_preds, points, img_meta):
         """ 
-        Merge predicted features and apply score coarse filtering, transformation, 
+        Merge predicted features and apply score coarse filtering, transformation,
         and NMS to generate final single-batch 3D boundaries
         """
         scores = torch.cat(cls_preds).sigmoid()
@@ -305,7 +619,8 @@ class TSPHead(nn.Module):
                     text_attention_mask, 
                     img_metas=None, 
                     pc=None, gt_bboxes=None,
-                    sigma_sce=None, tau=None):
+                    sigma_sce=None, tau=None, gate_logits=None,
+                    gate_threshold=None):
         """ 
         Pure inference forward pass main loop: 
         Implement multi-layer transposed convolution geometric upsampling, dynamic scene pruning, 
@@ -342,8 +657,7 @@ class TSPHead(nn.Module):
                     diag["prune_layer1_after"] = len(x)
                     # x = self.__getattr__(f'up_block_{i + 1}')(x)
                     x = getattr(self, f'up_block_{i + 1}')(x)
-                    coords = x.coordinates.float()
-                    x_level_features = inputs[i].features_at_coordinates(coords)
+                    x_level_features = self._lateral_features_at(inputs[i], x)
                     x_level = ME.SparseTensor(features=x_level_features,
                                               coordinate_map_key=x.coordinate_map_key,
                                               coordinate_manager=x.coordinate_manager)
@@ -366,8 +680,7 @@ class TSPHead(nn.Module):
                     diag["prune_layer0_after"] = len(x)
                     # x = self.__getattr__(f'up_block_{i + 1}')(x)
                     x = getattr(self, f'up_block_{i + 1}')(x)
-                    coords = x.coordinates.float()
-                    x_level_features = inputs[i].features_at_coordinates(coords)
+                    x_level_features = self._lateral_features_at(inputs[i], x)
                     x_level = ME.SparseTensor(features=x_level_features,
                                               coordinate_map_key=x.coordinate_map_key,
                                               coordinate_manager=x.coordinate_manager)
@@ -534,6 +847,24 @@ class TSPHead(nn.Module):
         diag["out_voxels"] = len(out)
         bbox_pred, cls_pred, point = self._forward_single(out)
         results = self._get_bboxes([bbox_pred], [cls_pred], [point], img_metas)
+
+        # Retain the legacy TSP3D head but make the existence decision a true output short-circuit.
+        # The gate is applied after the legacy computation for compatibility 
+        # with the legacy single-candidate decoding path.
+        if gate_logits is not None:
+            threshold = self.gate_threshold if gate_threshold is None else float(gate_threshold)
+            gate_prob = torch.sigmoid(gate_logits)
+            diag["gate"] = [float(v.detach().cpu()) for v in gate_prob]
+            for bi, gp in enumerate(gate_prob):
+                if float(gp.detach()) <= threshold:
+                    results[bi] = empty_prediction(
+                        inputs[0].F.device, inputs[0].F.dtype,
+                        img_metas[bi]["box_type_3d"])
+                else:
+                    # Keep the legacy M1 head intact, but settle confidence with the same P_exist * s_k contract as Stage 3.
+                    bboxes, scores, labels = results[bi]
+                    results[bi] = (bboxes, scores * gp.detach(), labels)
+
         if len(results) > 0:
             _, res_scores, _ = results[0]
             diag["n_boxes"] = int(res_scores.shape[0])
@@ -544,6 +875,9 @@ class TSPHead(nn.Module):
 
     def forward(self, x, text_feats, text_attention_mask, 
                 img_metas=None, pc=None, gt_bboxes=None,
-                sigma_sce=None, tau=None):
+                sigma_sce=None, tau=None, gate_logits=None,
+                gate_threshold=None):
         """ Module inference entry wrapper """
-        return self.forward_test(x, text_feats, text_attention_mask, img_metas, pc, gt_bboxes, sigma_sce, tau)
+        return self.forward_test(x, text_feats, text_attention_mask, img_metas, pc, gt_bboxes,
+                                 sigma_sce, tau, gate_logits=gate_logits,
+                                 gate_threshold=gate_threshold)

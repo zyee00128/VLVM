@@ -5,5 +5,6 @@
 # All Rights Reserved
 # ------------------------------------------------------------------------
 from .bdetr import BeaUTyDETR
+from .ft_utils import PresenceGate
 # from .ap_helper import APCalculator, parse_predictions, parse_groundtruths
 # from .losses import HungarianMatcher, SetCriterion, compute_hungarian_loss

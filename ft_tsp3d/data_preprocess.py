@@ -70,7 +70,7 @@ from vlfm.tsp3d_models.grounding_dino.vocab import (  # noqa: E402
     normalize_phrase,
     singularize,
 )
-from vlfm.tsp3d_models.utils.pipeline import TSP3DInputPreprocessor  # noqa: E402
+from vlfm.tsp3d_models.fussion_utils.pipeline import TSP3DInputPreprocessor  # noqa: E402
 
 # episodic 变换：p_e = (x, -z, y)（habitat y-up → VLVM z-up）
 _M_EP = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])

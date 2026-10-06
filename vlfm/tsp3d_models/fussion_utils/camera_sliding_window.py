@@ -26,10 +26,6 @@ class TemporalPcdWindow:
         self._min_view_yaw = float(min_view_yaw)
         self._last_pose: Optional[np.ndarray] = None
 
-    @property
-    def num_frames(self) -> int:
-        return len(self._window)
-
     def reset(self) -> None:
         self._window.clear()
         self._last_pose = None

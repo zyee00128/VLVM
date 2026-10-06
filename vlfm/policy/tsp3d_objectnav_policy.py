@@ -19,21 +19,22 @@ from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
 from vlfm.utils.geometry_utils import rho_theta, extract_yaw, get_fov
 from vlfm.mapping.obstacle_map import ObstacleMap3D, ProbabilisticGrid
 
-from vlfm.tsp3d_models.utils.pipeline import TSP3DInputPreprocessor
-from vlfm.tsp3d_models.utils.scan_behavior import (
+from vlfm.tsp3d_models.fussion_utils.pipeline import TSP3DInputPreprocessor
+from vlfm.tsp3d_models.fussion_utils.scan_behavior import (
     _act_panoramic,
     _act_world_scan,
 )
-from vlfm.tsp3d_models.utils.s_penalty import (
+from vlfm.tsp3d_models.fussion_utils.s_penalty import (
     SPenaltyConfig, 
     apply_s_penalty, 
     query_semantic_at,
 )
-from vlfm.tsp3d_models.utils.target_memory_manager import MemoryManagerConfig, TargetMemoryManager
+from vlfm.tsp3d_models.fussion_utils.target_memory_manager import MemoryManagerConfig, TargetMemoryManager
 from vlfm.utils.vlvm_stats_logger import VlvmStatsLogger
-from vlfm.tsp3d_models.utils.target_geometric_gating import (
+from vlfm.tsp3d_models.fussion_utils.target_geometric_gating import (
     TargetGeometricGatingEngine,
     BoxOccupancyConfig,
+    apply_geom_gate,
 )
 from vlfm.tsp3d_models.grounding_dino import (
     BOTH,
@@ -918,40 +919,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
             rgb, depth, fx, fy, tf, min_depth, max_depth
         )
 
-    def _geom_gate(
-        self,
-        detections: ObjectDetections,
-        pcd_world: np.ndarray,
-        robot_xyz: Optional[np.ndarray] = None,
-    ) -> ObjectDetections:
-        """Geometric admission on the current candidates.
-
-        REJECTED (empty-air) detections are dropped before the S-penalty gate.
-        """
-        engine = self._geom_gate_engine
-        n = detections.num_detections
-        if n == 0:
-            return detections
-        boxes_np = detections.boxes.detach().cpu().numpy()
-        logits_np = detections.logits.detach().cpu().numpy()
-        keep = np.ones(n, dtype=bool)
-        for i in range(n):
-            status, _cluster, _diag = engine.process_detection(
-                target_class=detections.phrases[i],
-                box_corners=boxes_np[i],
-                current_frame_pcd=pcd_world,
-                obstacle_map_3d=self._obstacle_map3d,
-                confidence=float(logits_np[i]),
-                step=self._num_steps,
-                robot_xyz=robot_xyz,
-            )
-            drop = status == "REJECTED"
-            keep[i] = not drop
-        if not keep.all():
-            detections.filter_by_mask(keep)
-        return detections
-
-
     def _get_target_object_location(self, position: np.ndarray) -> Union[None, np.ndarray]:
         """
         Navigation goal among the memorized target candidates.
@@ -1103,13 +1070,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             fy=fy,
             tf_camera_to_episodic=tf_camera_to_episodic
         )
-        logits_arr = np.asarray(logits, dtype=np.float64)
-        keep = logits_arr >= self._sigma_tar
-        if len(keep):
-            if not bool(keep.all()):
-                detections.filter_by_mask(keep)
-        else:
-            detections.filter_by_conf(self._sigma_tar)
+        detections.filter_by_conf(self._sigma_tar)
         detections.filter_by_class(target_classes, use_vlfm_nlp=self._nlp_mode)
         # Skip memory accumulation during initialization turning (repeated surfaces pollute memory).
         if not self._done_initializing:
@@ -1117,7 +1078,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         # REJECTED (empty-air) -> dropped before S-penalty
         if self._geom_gate_engine.enabled:
-            detections = self._geom_gate(detections, pcd_world, robot_xyz=robot_xyz)
+            detections = apply_geom_gate(
+                detections, pcd_world,
+                engine=self._geom_gate_engine,
+                obstacle_map_3d=self._obstacle_map3d,
+                step=self._num_steps,
+                robot_xyz=robot_xyz,
+            )
         # S-penalty gate cross-validation -> write passed detections to memory.
         admitted_meta: List[Any] = []
         pending = apply_s_penalty(

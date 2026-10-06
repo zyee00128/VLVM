@@ -16,52 +16,6 @@ def decompose_box_8corners(corners: np.ndarray) -> Tuple[np.ndarray, np.ndarray,
     half_extents = np.max(projections, axis=0)
     return center, axes, half_extents
 
-def points_in_box_3d(points: np.ndarray, box_corners: np.ndarray, margin: float = 0.02) -> np.ndarray:
-    """Vectorized membership test of points inside a 3D OBB (with margin, m)."""
-    if len(points) == 0:
-        return np.zeros(0, dtype=bool)
-
-    pts_xyz = points[:, :3]
-    center, axes, half_extents = decompose_box_8corners(box_corners)
-
-    rel_pts = pts_xyz - center  # (N, 3)
-    proj = np.abs(rel_pts @ axes.T)  # (N, 3)
-
-    in_box_mask = np.all(proj <= (half_extents + margin), axis=1)
-    return in_box_mask
-
-def voxel_downsample(points: np.ndarray, voxel_size: float = 0.02) -> np.ndarray:
-    """Fast voxel-grid downsample."""
-    if len(points) == 0:
-        return points
-    coords = np.floor(points[:, :3] / voxel_size).astype(np.int32)
-    _, unique_indices = np.unique(coords, axis=0, return_index=True)
-    return points[unique_indices]
-
-def count_box_occupancy(
-    box_corners: np.ndarray,
-    obstacle_map_3d: Any,
-) -> Tuple[int, int, int]:
-    """Count occupied / explored voxels and total cells in a box AABB."""
-    min_xyz = np.min(box_corners, axis=0)
-    max_xyz = np.max(box_corners, axis=0)
-    bbox_aabb = np.array([
-        [min_xyz[0], min_xyz[1], min_xyz[2]],
-        [max_xyz[0], max_xyz[1], max_xyz[2]],
-    ])
-    grid_idx = obstacle_map_3d._xyz_to_grid_index(bbox_aabb)
-    px_min = max(0, min(grid_idx[0, 0], grid_idx[1, 0]))
-    px_max = min(obstacle_map_3d.size - 1, max(grid_idx[0, 0], grid_idx[1, 0]))
-    py_min = max(0, min(grid_idx[0, 1], grid_idx[1, 1]))
-    py_max = min(obstacle_map_3d.size - 1, max(grid_idx[0, 1], grid_idx[1, 1]))
-    cz_min = max(0, min(grid_idx[0, 2], grid_idx[1, 2]))
-    cz_max = min(obstacle_map_3d._height_size - 1, max(grid_idx[0, 2], grid_idx[1, 2]))
-    if px_min > px_max or py_min > py_max or cz_min > cz_max:
-        return 0, 0, 0
-    occ_sub = obstacle_map_3d._map[py_min:py_max + 1, px_min:px_max + 1, cz_min:cz_max + 1]
-    exp_sub = obstacle_map_3d.explored_area[py_min:py_max + 1, px_min:px_max + 1, cz_min:cz_max + 1]
-    return int(np.sum(occ_sub)), int(np.sum(exp_sub)), int(occ_sub.size)
-
 # Box-occupancy consistency gate
 @dataclass
 class BoxOccupancyConfig:
@@ -207,3 +161,38 @@ class TargetGeometricGatingEngine:
             "is_suspicious": False,
             "diagnostics": diag_summary,
         }
+
+# Detection-level admission wrapper
+def apply_geom_gate(
+    detections,
+    pcd_world: np.ndarray,
+    engine: TargetGeometricGatingEngine,
+    obstacle_map_3d: Any,
+    step: int,
+    robot_xyz: Optional[np.ndarray] = None,
+):
+    """Geometric admission on the current candidates.
+
+    REJECTED (empty-air) detections are dropped before the S-penalty gate.
+    Returns the same container, filtered in place when anything is rejected.
+    """
+    n = detections.num_detections
+    if n == 0:
+        return detections
+    boxes_np = detections.boxes.detach().cpu().numpy()
+    logits_np = detections.logits.detach().cpu().numpy()
+    keep = np.ones(n, dtype=bool)
+    for i in range(n):
+        status, _cluster, _diag = engine.process_detection(
+            target_class=detections.phrases[i],
+            box_corners=boxes_np[i],
+            current_frame_pcd=pcd_world,
+            obstacle_map_3d=obstacle_map_3d,
+            confidence=float(logits_np[i]),
+            step=step,
+            robot_xyz=robot_xyz,
+        )
+        keep[i] = status != "REJECTED"
+    if not keep.all():
+        detections.filter_by_mask(keep)
+    return detections

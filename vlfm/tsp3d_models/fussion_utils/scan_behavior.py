@@ -4,7 +4,7 @@ import numpy as np
 
 from vlfm.utils.geometry_utils import closest_point_within_threshold
 from vlfm.vlm.detections import ObjectDetections
-from vlfm.tsp3d_models.utils.panoramic import (
+from vlfm.tsp3d_models.fussion_utils.panoramic import (
     _cap_point_count,
     _round_dedup,
     _to_camera_canonical,

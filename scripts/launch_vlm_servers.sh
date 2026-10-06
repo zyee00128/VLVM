@@ -9,8 +9,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export VLVM_PYTHON=${VLVM_PYTHON:-$(command -v python)}
 export TSP3D_DATA_PATH=${TSP3D_DATA_PATH:-${PROJECT_ROOT}/data/tsp3d_models}
 # 标准权重 = tsp3d_scanrefer.pth；
-# 对比实验：TSP3D_CHECKPOINT=<path> bash $0 手动覆盖
-# ckpt_sr3d.pth = ScanRefer 版对照    ckpt_nr3d.pth = NR3D 版对照
+# TSP3D_CHECKPOINT=<path> bash scripts/launch_vlm_servers.sh
 export TSP3D_CHECKPOINT=${TSP3D_CHECKPOINT:-${TSP3D_DATA_PATH}/tsp3d_scanrefer.pth}
 export TSP3D_PORT=${TSP3D_PORT:-12186}
 export BLIP2ITM_PORT=${BLIP2ITM_PORT:-12182}
@@ -87,5 +86,3 @@ echo "Run the following to monitor all the server commands:"
 echo "tmux attach-session -t ${session_name}"
 echo "To stop: tmux kill-session -t ${session_name}"
 echo "对比实验权重（手动指定覆盖标准 tsp3d_scanrefer.pth）:"
-echo "  TSP3D_CHECKPOINT=${TSP3D_DATA_PATH}/ckpt_sr3d.pth bash $0   # ScanRefer 版"
-echo "  TSP3D_CHECKPOINT=${TSP3D_DATA_PATH}/ckpt_nr3d.pth bash $0   # NR3D 版"

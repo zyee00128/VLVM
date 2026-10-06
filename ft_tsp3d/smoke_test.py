@@ -3,7 +3,6 @@
 
 覆盖（无需 GPU / 真实模型即可跑核心部分）：
   * 匹配器：唯一匹配 / 重复提议判负 / 1:1；
-  * TGP 体素掩码：几何包含 + margin；
   * 损失边界：空 K、全剪枝空返回、零权重、单正样本、负样本 bg 项；
   * 数值自检：ASL/Focal（`losses._self_test`）；
   * 调度器：warmup 起点 → 第 1 epoch 末 = 目标 LR → 末步 = eta_min；
@@ -11,6 +10,9 @@
   * GD 教师：深度支撑过滤 / 弃权规则（no_ok_frame、gd_miss_gt）/ 软目标；
   * 数据管道：读取真实 npz 校验 offsets/records/schema（数据存在时）；
   * 训练循环：`pipeline.run_stub_training`（stub 模型 + 合成数据，验证循环/调度/ckpt）。
+
+S1/S2 相关用例（L_s1 匹配 / TGP 掩码 / M0–M4 消融表 / 开关推导）随解耦分支移出，
+见 `ft_s12/smoke_test_s12.py`。
 
 需真实模型/数据（模型侧就绪后运行）：
   * `--overfit`：1–2 场景过拟合跑（调 `pipeline.train` 全链路）；
@@ -87,39 +89,6 @@ def test_matcher_unique() -> None:
     assert float(parts["l1_base"]) < 1e-5, f"l1 should match box-1, got {float(parts['l1_base'])}"
 
 
-def test_matcher_multi_entity() -> None:
-    pred = {"boxes": torch.tensor([[0.0, 0, 0, 1.0, 1.0, 1.0], [5.0, 5, 5, 1.0, 1.0, 1.0]]),
-            "scores": torch.tensor([0.8, 0.7]),
-            "prop_boxes": torch.tensor([[0.0, 0, 0, 1.0, 1.0, 1.0], [5.0, 5, 5, 1.0, 1.0, 1.0]]),
-            "prop_obj_logits": torch.tensor([3.0, -3.0])}
-    ents = np.array([[0.0, 0, 0, 1.0, 1.0, 1.0], [5.0, 5, 5, 1.0, 1.0, 1.0]], np.float32)
-    tgt = {"label": 0, "weight": 1.0, "gt": None, "entities": ents, "teacher": None}
-    parts = L.compute_record_losses(pred, tgt, L.LossConfig(prop=True))
-    assert "s1_obj" in parts and "s1_box" in parts, parts.keys()
-    assert float(parts["s1_box"]) < 1e-5
-    # 空白视锥：entities 为空数组（表存在）⇒ 全部 y_obj=0，仍计算 obj 项
-    tgt0 = dict(tgt, entities=np.zeros((0, 6), np.float32))
-    parts0 = L.compute_record_losses(pred, tgt0, L.LossConfig(prop=True))
-    assert "s1_obj" in parts0 and "s1_box" not in parts0
-
-
-def test_tgp_mask() -> None:
-    vox = torch.tensor([[0.0, 0, 0], [2.0, 2, 2], [0.4, 0, 0]])
-    gt = torch.tensor([0.0, 0, 0, 1.0, 1.0, 1.0])
-    m = L.build_tgp_mask(vox, gt, 0.05)
-    assert m.tolist() == [1.0, 0.0, 1.0], m.tolist()
-    # margin 边界：0.56 在 +0.05 之外
-    vox2 = torch.tensor([[0.56, 0, 0]])
-    assert float(L.build_tgp_mask(vox2, gt, 0.05)[0]) == 0.0
-    # 无目标 ⇒ 全 0
-    assert float(L.build_tgp_mask(vox, None, 0.05).sum()) == 0.0
-    # 簇级 BCE 不崩
-    logits = torch.tensor([2.0, -2.0, 1.0])
-    cid = torch.tensor([0, 0, 1])
-    v = L.tgp_cluster_bce(logits, cid, vox, None, 0.05)
-    assert v is not None and torch.isfinite(v)
-
-
 def test_loss_edge_cases() -> None:
     # 空 K（全剪枝空返回）
     empty = {"boxes": torch.zeros((0, 6)), "scores": torch.zeros((0,))}
@@ -164,20 +133,6 @@ def test_distill_only() -> None:
     assert "gate_dist" in parts and "gate" not in parts, parts.keys()
     parts["gate_dist"].backward()
     assert p_exist.grad is not None and abs(float(p_exist.grad)) > 0
-
-
-def test_arch_ablation_order() -> None:
-    """M0 全损失开启；M1-M4 各自移除一个模块，与 .sh 的单项增加相反。"""
-    assert P.ABLATIONS["M0"] == {
-        "gate": True, "prop": True, "refine": True, "tgp": True, "distill": True}
-    assert not P.ABLATIONS["M1"]["gate"]
-    assert not P.ABLATIONS["M2"]["prop"]
-    assert not P.ABLATIONS["M3"]["refine"] and not P.ABLATIONS["M3"]["tgp"]
-    assert not P.ABLATIONS["M4"]["distill"]
-    for key, removed in (("M1", {"gate"}), ("M2", {"prop"}),
-                         ("M3", {"refine", "tgp"}), ("M4", {"distill"})):
-        off = {name for name, enabled in P.ABLATIONS[key].items() if not enabled}
-        assert off == removed, (key, off)
 
 
 def test_loss_self_test() -> None:
@@ -296,8 +251,6 @@ def test_checkpoint_ft_config() -> None:
             self.weight = torch.nn.Parameter(torch.ones(()))
             self.ft_config = {
                 "enable_gate": True,
-                "enable_prop": False,
-                "enable_refine": False,
                 "num_proposals": 8,
                 "gate_threshold": 0.3,
             }
@@ -306,35 +259,31 @@ def test_checkpoint_ft_config() -> None:
     optimizer = torch.optim.AdamW(model.parameters())
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "ft_config.pth"
-        args = argparse.Namespace(losses="distill", ablation=None)
+        args = argparse.Namespace(losses="distill")
         P.save_ckpt(path, model, optimizer, 0, 1, args)
         # 复用生产加载器（内含 torch < 1.13 的 weights_only 回退），两代 torch 均可跑。
         checkpoint = _load_tsp3d_checkpoint(str(path), "cpu")
         actual = _checkpoint_ft_config(checkpoint, _checkpoint_state_dict(checkpoint))
         assert actual == model.ft_config
 
-    always_present = {
-        "head.proposal_obj.kernel": torch.zeros(1),
-        "head.entity_reg.weight": torch.zeros(1),
-    }
-    assert _checkpoint_ft_config({}, always_present) == {
-        "enable_gate": False, "enable_prop": False, "enable_refine": False}
-    assert _checkpoint_ft_config(
-        {"args": {"losses": "distill"}}, always_present
-    ) == {"enable_gate": True, "enable_prop": False, "enable_refine": False}
-    # 旧 ckpt（只存 args、无 ft_config）：按消融名 M0 应还原为全开
-    assert _checkpoint_ft_config(
-        {"args": {"ablation": "M0"}}, always_present
-    ) == {"enable_gate": True, "enable_prop": True, "enable_refine": True}
+    # 常驻推理模块键（bbox/cls conv）不参与模式猜测；只有门控头是条件实例化的。
+    always_present = {"head.cls_conv.kernel": torch.zeros(1)}
+    assert _checkpoint_ft_config({}, always_present) == {"enable_gate": False}
+    with_gate = {"presence_gate.fuse.4.weight": torch.zeros(1)}
+    assert _checkpoint_ft_config({}, with_gate) == {"enable_gate": True}
 
 
 def test_s2_proposal_gradient() -> None:
-    """S2 不启用 L_s1 时，最终 base loss仍须监督所选提议的 objectness。"""
-    from vlfm.tsp3d_models.multilevel_head import TSPHead
+    """S2 不启用 L_s1 时，最终 base loss仍须监督所选提议的 objectness。
+
+    该算子随 S1/S2 解耦分支移出模型（`ft_s12/s12_decoupled.py`），
+    此处直接验证归档实现仍满足同一梯度契约。
+    """
+    from vlfm.tsp3d_models.ft_s12.s12_decoupled import combine_candidate_logits
 
     proposal = torch.tensor([-1.0, 0.5], requires_grad=True)
     match = torch.tensor([0.2, -0.3], requires_grad=True)
-    final = TSPHead._combine_candidate_logits(proposal, match)
+    final = combine_candidate_logits(proposal, match)
     torch.nn.functional.binary_cross_entropy_with_logits(
         final, torch.tensor([1.0, 0.0])
     ).backward()
@@ -405,7 +354,7 @@ def test_attention_fastpath() -> None:
 def check_prune_gradients(model: torch.nn.Module, sample: Dict[str, Any],
                           loss_cfg: Optional[L.LossConfig] = None) -> Dict[str, Any]:
     """验收：可微软剪枝重建后 `keep_conv` / `com_cls` 确实收到梯度（§11.3 #1）。"""
-    cfg = loss_cfg or L.LossConfig(gate=False, prop=True, refine=True, tgp=True)
+    cfg = loss_cfg or L.LossConfig(gate=False)
     model.train()
     model.zero_grad(set_to_none=True)
     agg, _ = P.run_view(model, sample, cfg, torch.device("cpu"), training=True)
@@ -427,7 +376,7 @@ def overfit_run(args: argparse.Namespace) -> None:
     argv = ["--data-dir", args.data_dir, "--split", "train",
             "--scenes", args.scenes or "", "--limit-views", str(args.limit_views or 20),
             "--epochs", str(args.epochs or 2), "--out-dir", args.out_dir or "/tmp/ft_overfit",
-            "--losses", "s1,s2,gate,tgp"]
+            "--losses", "gate,distill"]
     if args.no_sidecar:
         argv.append("--no-sidecar")
     P.train(P.parse_args(argv))
@@ -439,11 +388,8 @@ def overfit_run(args: argparse.Namespace) -> None:
 
 OFFLINE_TESTS = [
     ("matcher_unique", test_matcher_unique),
-    ("matcher_multi_entity", test_matcher_multi_entity),
-    ("tgp_mask", test_tgp_mask),
     ("loss_edge_cases", test_loss_edge_cases),
     ("distill_only", test_distill_only),
-    ("arch_ablation_order", test_arch_ablation_order),
     ("loss_self_test", test_loss_self_test),
     ("scheduler", test_scheduler),
     ("geometry", test_geometry),

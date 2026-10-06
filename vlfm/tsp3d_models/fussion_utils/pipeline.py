@@ -110,14 +110,6 @@ class TSP3DInputPreprocessor:
         else:
             self._window.reset()
 
-    @property
-    def num_map_voxels(self) -> int:
-        if self._fusion_style in ("none", "panoramic"):
-            return 0
-        if self._fusion_style == "world":
-            return self._map.num_voxels
-        return self._window.num_frames
-
     def update(
         self,
         frame_pcd_world: np.ndarray,
