@@ -58,8 +58,8 @@ class PresenceGate(nn.Module):
         )
 
     @staticmethod
-    def _pool_sparse(x, batch_size: int) -> torch.Tensor:
-        feats = x.F
+    def _pool_sparse(x, batch_size: int, detach: bool = False) -> torch.Tensor:
+        feats = x.F.detach() if detach else x.F
         batch = x.C[:, 0].long()
         pooled = feats.new_zeros((batch_size, feats.shape[1]))
         counts = feats.new_zeros((batch_size, 1))
@@ -67,9 +67,12 @@ class PresenceGate(nn.Module):
         counts.index_add_(0, batch, feats.new_ones((feats.shape[0], 1)))
         return pooled / counts.clamp_min(1.0)
 
-    def forward(self, sparse_features, text_features, text_padding_mask=None) -> torch.Tensor:
+    def forward(self, sparse_features, text_features, text_padding_mask=None,
+                detach_inputs: bool = False) -> torch.Tensor:
         batch_size = int(text_features.shape[0])
-        visual = self._pool_sparse(sparse_features, batch_size)
+        visual = self._pool_sparse(sparse_features, batch_size, detach=detach_inputs)
+        if detach_inputs:
+            text_features = text_features.detach()
         visual_h = self.visual(visual)
         text_h = self.text(text_features)
         query = visual_h.unsqueeze(1)
@@ -109,18 +112,3 @@ def focal_binary_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float 
         return out
     return out.mean() if out.numel() else logits.sum() * 0.0
 
-
-def asymmetric_binary_loss(logits: torch.Tensor, targets: torch.Tensor,
-                           gamma_pos: float = 1.0, gamma_neg: float = 4.0,
-                           reduction: str = "mean") -> torch.Tensor:
-    """Minimal ASL implementation used by the final candidate confidence."""
-    targets = targets.to(dtype=logits.dtype)
-    p = torch.sigmoid(logits)
-    pos = targets * (1.0 - p).pow(gamma_pos) * torch.log(p.clamp_min(1e-6))
-    neg = (1.0 - targets) * p.pow(gamma_neg) * torch.log((1.0 - p).clamp_min(1e-6))
-    out = -(pos + neg)
-    if reduction == "sum":
-        return out.sum()
-    if reduction == "none":
-        return out
-    return out.mean() if out.numel() else logits.sum() * 0.0

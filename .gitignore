@@ -1,21 +1,18 @@
 # 数据与权重
 data/
-ft_datasets/
 
 # 模型 / 微调代码
 GroundingDINO/
-ft_tsp3d/ft_s12/
-
+archive/
 
 # 实验日志 / TensorBoard
-Results/thinking/
-iteration/
 lockfiles/
+tb/
 outputs/
 outputs_Stage1/
-outputs_Stage2
-tb/
-ft_tsp3d/ft_log/
+outputs_Stage2/
+iteration/
+Results/
 
 # Python 缓存与构建产物 / 其他
 __pycache__/

@@ -116,7 +116,7 @@ BASE="$BASE habitat_baselines.rl.policy.wm_min_view_disp=0.15"
 BASE="$BASE habitat_baselines.rl.policy.wm_min_view_yaw=15.0"
 # S-penalty
 BASE="$BASE habitat_baselines.rl.policy.enable_s_penalty=True"
-BASE="$BASE habitat_baselines.rl.policy.sigma_tar=0.70"
+BASE="$BASE habitat_baselines.rl.policy.sigma_tar=0.60"
 BASE="$BASE habitat_baselines.rl.policy.s_penalty_thresh=0.15"
 BASE="$BASE habitat_baselines.rl.policy.s_penalty_floor=0.3"
 BASE="$BASE habitat_baselines.rl.policy.s_penalty_uncovered_w=1.0"

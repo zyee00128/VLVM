@@ -27,4 +27,3 @@ class AcyclicEnforcer:
     def add_state_action(self, position: np.ndarray, action: Any, other: Any = None) -> None:
         state_action = StateAction(position, action, other)
         self.history.add(state_action)
-f.history.add(state_action)

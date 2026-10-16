@@ -1,53 +1,25 @@
 #!/bin/bash
 # ==============================================================================
-# VLVM 微调权重 · 分批多场景导航评测（HM3D val 子集）
+# VLVM 单 checkpoint · sigma_tar 四场景网格搜索
 # ------------------------------------------------------------------------------
-# 与 scripts/ft_tsp3d.sh 配套：本脚本自动完成
-#   「换档 ckpt → 重启 VLM 服务（并核验权重真的加载）→ 逐场景评测 → 汇总日志」。
+# 固定一份 TSP3D 权重，关闭 S-penalty 与 Grounding-DINO 辅助机制，只改变
+# sigma_tar，逐档执行四个 HM3D val 场景并汇总导航与检测级指标。
 #
-# 双机分工：
-#   A 机：base → gate                MACHINE=a bash scripts/ft_eval.sh
-#   B 机：base → distill             MACHINE=b bash scripts/ft_eval.sh
-#
-# 场景集（HM3D val；依据 Results/Results_final.md 全量 20 场景实验的失败结构挑选，
-# 覆盖 高/中/低 三档难度 × fp 主导 / nv 主导 / 转换损失 三类失效模式 + 历史对比场景）：
-#   5cdEh9F2hJL  SR 56.6%  高难基准；Stage1–3 全程单场景，跨实验可比
-#   TEEsavR23oF  SR 38.4%  中；VLFM/VLVM 三场景对比之一
-#   mv2HUxq3B53  SR 43.4%  中；fp 主导 + 转换损失大（O-S +13.2）；对比场景
-#   wcojb4TFT35  SR 39.4%  中；对比场景
-#   zt1RVoi7PcG  SR 24.4%  低；fp 极端（tv 24 集全 fp，O-S +21.0）
-#   mL8ThkuaVTM  SR 13.1%  低；nv 极端（Oracle 4.0%，覆盖盲区）
-#   qyAac8rV8Zk  SR 19.2%  低；类别-场景耦合（bed 0/17 全错）
-#   Dd4bFSTQ8gi  SR 42.4%  中；toilet fp 23 + 转换损失（O-S +12.1）
-#   覆盖场景集：SCENES="5cdEh9F2hJL zt1RVoi7PcG wcojb4TFT35" bash scripts/ft_eval.sh
-#
-# 实验条件（固定覆盖）：
-#   * 关闭 GD 机制：habitat_baselines.rl.policy.gdp_enable=False（第二提议源/帧级合票停用）；
-#   * 其余机制沿用 config/experiments/vlvm_objectnav_hm3d.yaml 定稿档。
-#     临时加开其它机制：EXTRA_OVERRIDES="habitat_baselines.rl.policy.enable_scan=True"
-#
-# 评测实验矩阵（同权重 × 多组准入参数 / 原版权重对照，2026-09-30 补充）：
-#   * 枚举任意档名用 ARMS；每档独立 hydra 覆盖用 OVERRIDES_<档>（空格分隔）；
-#     同权重多参数变体把 CKPT_<变体> 指向同一 ckpt 文件即可（自动复用已加载服务，不重启）；
-#       ARMS="base_s60 ref" \
-#         OVERRIDES_base_s60="habitat_baselines.rl.policy.sigma_tar=0.60 habitat_baselines.rl.policy.s_penalty_thresh=0.12" \
-#         CKPT_base_s60=data/tsp3d_ft/base_3090_ckpt_last.pth \
-#         bash scripts/ft_eval.sh
-#   * ref 档 = 原版权重参照（默认 data/tsp3d_models/tsp3d_scanrefer.pth，TSP3D_REF_CKPT 可覆盖）；
-#   * 检测级判读（det/tp/fp/entries/maxscore 等）自动落 $RUN_DIR/detect_summary.tsv。
+# 默认权重为 VLVM V1；使用 MODEL_CKPT 覆盖。BASE_CKPT 仅作为旧接口兼容。
+# 默认网格为 0.30–0.70，步长 0.05（s070 用于固定 0.70 的单点档）；
+# 可用 SIGMA_ARMS 只跑部分档位。
+# 默认四场景：5cdEh9F2hJL / TEEsavR23oF / mv2HUxq3B53 / wcojb4TFT35。
 #
 # 用法速览：
-#   DRY_RUN=1 MACHINE=a bash scripts/ft_eval.sh        # 只打印计划（不重启服务/不评测）
-#   LIMIT=20 MACHINE=a bash scripts/ft_eval.sh         # 冒烟：每场景前 20 集
-#   SKIP_DONE=1 RUN_DIR=... bash scripts/ft_eval.sh    # 断点续跑（跳过已完成的 档_场景）
-#   SKIP_SERVERS=1 bash scripts/ft_eval.sh             # 服务已手动起好，只跑评测（不换 ckpt）
-#   FAIL_FAST=1 bash scripts/ft_eval.sh                # 任一场景失败即停（默认记录后继续）
-#   REQUIRE_ALL=1 bash scripts/ft_eval.sh              # ckpt 缺失即退出（默认跳过该档）
-#   SKIP_CKPT_VERIFY=1 bash scripts/ft_eval.sh         # 跳过「服务实际加载权重」核验
+#   DRY_RUN=1 bash scripts/ft_sigma_search.sh
+#   LIMIT=20 bash scripts/ft_sigma_search.sh
+#   MODEL_CKPT=data/tsp3d_models/tsp3d_scanrefer.pth bash scripts/ft_sigma_search.sh
+#   SIGMA_ARMS="s045 s050 s055" bash scripts/ft_sigma_search.sh
+#   SKIP_DONE=1 bash scripts/ft_sigma_search.sh
 #
 # 日志：
-#   $OUT_DIR/ft_eval_<时间戳>/eval_hm3d_<日期>_<时刻>_<档>_<场景>.log
-#   $OUT_DIR/ft_eval_<时间戳>/summary.tsv   # 每场景一行：SR / Oracle / spl / soft_spl / steps / 用时
+#   $OUT_DIR/ft_sigma_search_<时间戳>/eval_hm3d_<日期>_<时刻>_<sigma档>_<场景>.log
+#   $OUT_DIR/ft_sigma_search_<时间戳>/summary.tsv
 # ==============================================================================
 set -o pipefail
 
@@ -92,8 +64,10 @@ TSP3D_PORT="${TSP3D_PORT:-12186}"
 BLIP2ITM_PORT="${BLIP2ITM_PORT:-12182}"
 GROUNDING_DINO_PORT="${GROUNDING_DINO_PORT:-12181}"
 OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/outputs}"
-RUN_DIR="${RUN_DIR:-$OUT_DIR/ft_eval_$(date +%Y-%m-%d_%H%M%S)}"
+RUN_DIR="${RUN_DIR:-$OUT_DIR/ft_sigma_search_$(date +%Y-%m-%d_%H%M%S)}"
 CKPT_DIR="${CKPT_DIR:-$PROJECT_ROOT/data/tsp3d_ft}"
+MODEL_TAG="${MODEL_TAG:-vlvm_v1}"
+MODEL_CKPT="${MODEL_CKPT:-${BASE_CKPT:-$PROJECT_ROOT/data/vlvm_v1/vlvm_v1.pth}}"
 DATA_PATH="${DATA_PATH:-data/datasets/objectnav/hm3d/v1/val/val.json.gz}"
 GPU_TAG="${GPU_TAG:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | grep -oE '[0-9]{4}' | head -1)}"
 GPU_TAG="${GPU_TAG:-nogpu}"
@@ -105,33 +79,41 @@ SKIP_CKPT_VERIFY="${SKIP_CKPT_VERIFY:-}"
 FAIL_FAST="${FAIL_FAST:-}"
 REQUIRE_ALL="${REQUIRE_ALL:-}"
 EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
-GATE_TAU="${GATE_TAU:-0.24}"                    # 占位：训练后校准值（见头注释，暂不生效）
+MAX_SCENE_ATTEMPTS="${MAX_SCENE_ATTEMPTS:-2}"
 
-# ---- 队列（双机分工；ARMS 可覆盖） ----
-if [ -n "${ARMS:-}" ]; then
-    QUEUE="$ARMS"
-else
-    case "${MACHINE:-}" in
-        a|A|1) QUEUE="base gate" ;;
-        b|B|2) QUEUE="base distill" ;;
+# ---- sigma 网格；ARMS 作为旧接口兼容 ----
+QUEUE="${SIGMA_ARMS:-${ARMS:-s030 s035 s040 s045 s050 s055 s060 s065}}"
+
+sigma_for_arm() {
+    case "$1" in
+        s030) printf '0.30' ;;
+        s035) printf '0.35' ;;
+        s040) printf '0.40' ;;
+        s045) printf '0.45' ;;
+        s050) printf '0.50' ;;
+        s055) printf '0.55' ;;
+        s060) printf '0.60' ;;
+        s065) printf '0.65' ;;
+        s070) printf '0.70' ;;
         *)
-            echo ""
-            echo "用法: MACHINE=a|b bash scripts/ft_eval.sh"
-            echo "      A 机: base→gate ；B 机: base→distill（ARMS=\"...\" 覆盖）"
-            echo ""
-            exit 1 ;;
+            echo ">>> [error] 未知 sigma 档位: $1（允许 s030–s070，步长 0.05）" >&2
+            return 1 ;;
     esac
-fi
+}
 
-# ---- 场景集（默认 = HM3D val 代表性 8 场景，见头注释；SCENES 覆盖） ----
-SCENE_LIST="${SCENES:-5cdEh9F2hJL TEEsavR23oF mv2HUxq3B53 wcojb4TFT35 zt1RVoi7PcG mL8ThkuaVTM qyAac8rV8Zk Dd4bFSTQ8gi}"
+# ---- 四场景搜索集；SCENES 可覆盖 ----
+SCENE_LIST="${SCENES:-5cdEh9F2hJL TEEsavR23oF mv2HUxq3B53 wcojb4TFT35}"
 
 echo "================================================="
-echo ">>> 机器队列 : $QUEUE"
+echo ">>> sigma 队列: $QUEUE"
 echo ">>> 场景集   : $(echo $SCENE_LIST | wc -w) 个场景"
 for _s in $SCENE_LIST; do echo "      - $_s"; done
-echo ">>> 服务权重 : 每档自动重启服务（TSP3D_CHECKPOINT=<档 ckpt>，附加载核验）"
-echo ">>> 实验条件 : gdp_enable=False（GD 关闭）+ 定稿档其余机制"
+echo ">>> 模型标识 : $MODEL_TAG"
+echo ">>> 模型权重 : $MODEL_CKPT"
+echo ">>> 实验条件 : enable_s_penalty=False + sx_conflict_gate=False + gdp_enable=False"
+echo ">>> 保持开启 : BLIP2-ITM 语义场检测 + enable_occ_consistency=True"
+echo ">>> 保持不变 : memory-life 与其余定稿机制"
+echo ">>> 失败重试 : 每个 sigma×场景最多 $MAX_SCENE_ATTEMPTS 次，重试前重启服务"
 echo ">>> 运行目录 : $RUN_DIR"
 [ -n "$LIMIT" ] && echo ">>> 冒烟模式 : 每场景前 $LIMIT 集"
 [ -n "$DRY_RUN" ] && echo ">>> DRY-RUN  : 只打印计划（不重启服务 / 不评测）"
@@ -158,48 +140,16 @@ ACTIVE_CKPT=""
 ACTIVE_CKPT_ID=""
 ACTIVE_CKPT_SHA256=""
 
-# ---- 解析某档 ckpt：CKPT_<档> > <档>_<GPU>_ckpt_last.pth > 唯一 <档>_*_ckpt_last.pth ----
+# ---- 所有 sigma 档固定使用同一份 checkpoint ----
 resolve_ckpt() {
-    local arm="$1" override match n resolved ref_ckpt
-    eval "override=\${CKPT_${arm}:-}"
-    if [ -n "$override" ]; then
-        if [ -f "$override" ]; then
-            resolved="$(canonical_ckpt "$override")" || return 1
-            printf '%s' "$resolved"
-            return 0
-        fi
-        echo ">>> [warn] CKPT_${arm}=$override 不存在" >&2
+    local resolved
+    if [ ! -f "$MODEL_CKPT" ]; then
+        echo ">>> [warn] checkpoint 不存在: $MODEL_CKPT" >&2
+        echo ">>>        用 MODEL_CKPT=<路径> 显式指定" >&2
         return 1
     fi
-    # ref 档 = 原版权重参照（权重归零对照；参数按当档 OVERRIDES_ref / EXTRA_OVERRIDES 走）
-    if [ "$arm" = "ref" ]; then
-        ref_ckpt="${TSP3D_REF_CKPT:-$PROJECT_ROOT/data/tsp3d_models/tsp3d_scanrefer.pth}"
-        if [ -f "$ref_ckpt" ]; then
-            resolved="$(canonical_ckpt "$ref_ckpt")" || return 1
-            printf '%s' "$resolved"
-            return 0
-        fi
-        echo ">>> [warn] ref 原版权重不存在: $ref_ckpt（TSP3D_REF_CKPT 可覆盖）" >&2
-        return 1
-    fi
-    local f="$CKPT_DIR/${arm}_${GPU_TAG}_ckpt_last.pth"
-    if [ -f "$f" ]; then
-        resolved="$(canonical_ckpt "$f")" || return 1
-        printf '%s' "$resolved"
-        return 0
-    fi
-    match="$(ls "$CKPT_DIR"/${arm}_*_ckpt_last.pth 2>/dev/null | head -5)"
-    n="$(printf '%s\n' "$match" | grep -c . || true)"
-    if [ "$n" = "1" ]; then
-        resolved="$(canonical_ckpt "$match")" || return 1
-        printf '%s' "$resolved"
-        return 0
-    fi
-    if [ "$n" != "0" ]; then
-        echo ">>> [warn] ${arm} 命中多个候选 ckpt，请用 CKPT_${arm}=<路径> 指定:" >&2
-        printf '%s\n' "$match" >&2
-    fi
-    return 1
+    resolved="$(canonical_ckpt "$MODEL_CKPT")" || return 1
+    printf '%s' "$resolved"
 }
 
 find_single_vlm_session() {
@@ -223,6 +173,25 @@ loaded_ckpt_from_session() {
         | tail -1
 }
 
+loaded_ckpt_from_process() {
+    local pid cmdline loaded
+    for pid in $(pgrep -f 'python.*-m vlfm\.vlm\.tsp3d' 2>/dev/null || true); do
+        [ -r "/proc/$pid/cmdline" ] || continue
+        cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
+        case "$cmdline" in
+            *"-m vlfm.vlm.tsp3d --port $TSP3D_PORT"*) ;;
+            *) continue ;;
+        esac
+        loaded="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+            | sed -n 's/^TSP3D_CHECKPOINT=//p' | tail -1)"
+        if [ -n "$loaded" ]; then
+            printf '%s' "$loaded"
+            return 0
+        fi
+    done
+    return 1
+}
+
 verify_server_checkpoint() {
     local expected="$1" sess="$2" expected_id="${3:-}" expected_sha="${4:-}"
     local loaded loaded_real current_id current_sha
@@ -240,7 +209,11 @@ verify_server_checkpoint() {
         return 1
     fi
 
-    loaded="$(loaded_ckpt_from_session "$sess")"
+    # The startup line scrolls out of tmux history during a long scene.  Read
+    # the live Python process environment first; keep pane parsing only as the
+    # startup-time fallback.
+    loaded="$(loaded_ckpt_from_process || true)"
+    [ -n "$loaded" ] || loaded="$(loaded_ckpt_from_session "$sess")"
     if [ -z "$loaded" ]; then
         echo ">>> [error] 服务日志中未见完整的 '[TSP3D] Weights loaded from ...'"
         echo ">>> TSP3D pane 尾部："
@@ -305,12 +278,21 @@ restart_servers() {
         echo ">>> [error] launch_vlm_servers.sh 退出码非 0（端口占用 / 启动失败）"
         return 1
     fi
+    # S-penalty is disabled during sigma search, but its upstream semantic
+    # field detector must remain live so the search preserves the same value
+    # map observations needed by the later S-penalty stage.
     for i in $(seq 1 30); do
-        port_open "$TSP3D_PORT" && break
+        if port_open "$TSP3D_PORT" && port_open "$BLIP2ITM_PORT"; then
+            break
+        fi
         sleep 2
     done
     if ! port_open "$TSP3D_PORT"; then
         echo ">>> [error] TSP3D 端口 $TSP3D_PORT 未就绪"
+        return 1
+    fi
+    if ! port_open "$BLIP2ITM_PORT"; then
+        echo ">>> [error] S-penalty 前置 BLIP2-ITM 端口 $BLIP2ITM_PORT 未就绪"
         return 1
     fi
     if [ -n "$SKIP_CKPT_VERIFY" ]; then
@@ -373,15 +355,70 @@ detect_metrics() {
         "${det:--}" "${tp:--}" "${fp:--}" "${prec:--}" "${eps:--}" "${entries:--}" "${etp:--}" "${mscore:--}" "${rej:--}"
 }
 
+expected_episodes_for_scene() {
+    local scene="$1"
+    python - "$DATA_PATH" "$scene" "$LIMIT" <<'PY'
+import gzip
+import json
+import sys
+from pathlib import Path
+
+path, scene, limit = sys.argv[1:]
+opener = gzip.open if path.endswith(".gz") else open
+with opener(path, "rt", encoding="utf-8") as handle:
+    payload = json.load(handle)
+episodes = payload.get("episodes", [])
+if not episodes:
+    content_path = Path(path).parent / "content" / f"{scene}.json.gz"
+    with gzip.open(content_path, "rt", encoding="utf-8") as handle:
+        episodes = json.load(handle).get("episodes", [])
+count = sum(scene in str(ep.get("scene_id", "")) for ep in episodes)
+if limit:
+    count = min(count, int(limit))
+print(count)
+PY
+}
+
+completed_episodes_in_log() {
+    local log="$1" completed
+    # Habitat prints the authoritative number of completed episodes in every
+    # non-Oracle success line.  NAV summaries are diagnostic-only and can be
+    # absent for episodes that finish before the normal policy summary hook.
+    completed="$(
+        tr '\r' '\n' < "$log" 2>/dev/null \
+            | grep -E 'Success rate:.*\([0-9]+ out of [0-9]+\)' \
+            | grep -v 'Oracle Success Rate:' \
+            | tail -1 \
+            | sed -nE 's/.*\([0-9]+ out of ([0-9]+)\).*/\1/p'
+    )"
+    if [[ "$completed" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$completed"
+        return 0
+    fi
+    # Retain a fallback for logs produced by older evaluators that do not
+    # print the success denominator.
+    grep -c '^\[NAV\] episode summary:' "$log" 2>/dev/null || true
+}
+
 # ---- 单场景评测 ----
 run_one() {
     local arm="$1" scene="$2" ckpt="$3"
-    local tag="${arm}_${scene}" log donef status t0 t1 sr oracle spl soft steps
+    local sigma tag log donef status t0 t1 sr oracle spl soft steps expected completed
+    sigma="$(sigma_for_arm "$arm")" || return 1
+    expected="$(expected_episodes_for_scene "$scene")" || return 1
+    if [ -z "$expected" ] || [ "$expected" -le 0 ]; then
+        echo ">>> [error] 无法确定场景 $scene 的评测集数"
+        return 1
+    fi
+    tag="${arm}_${scene}"
     log="$RUN_DIR/eval_hm3d_$(date +%Y-%m-%d)_$(date +%H%M%S)_${tag}.log"
     donef="$RUN_DIR/.done/${tag}.done"
     if [ -n "$SKIP_DONE" ] && [ -f "$donef" ]; then
-        echo ">>> [skip] $tag（已完成，SKIP_DONE=1）"
-        return 0
+        if grep -qx "episodes=$expected" "$donef"; then
+            echo ">>> [skip] $tag（已完整完成 $expected 集，SKIP_DONE=1）"
+            return 0
+        fi
+        echo ">>> [warn] $tag 的旧完成标记不含完整集数，按未完成重跑"
     fi
 
     local args=(
@@ -392,18 +429,21 @@ run_one() {
         habitat.simulator.habitat_sim_v0.gpu_device_id=0
         habitat.simulator.habitat_sim_v0.gpu_gpu=False
         habitat_baselines.rl.policy.name="HabitatITMPolicyV1"
+        habitat_baselines.rl.policy.sigma_tar="$sigma"
+        habitat_baselines.rl.policy.enable_s_penalty=False
+        habitat_baselines.rl.policy.sx_conflict_gate=False
+        habitat_baselines.rl.policy.enable_occ_consistency=True
         habitat_baselines.rl.policy.gdp_enable=False
         habitat.dataset.content_scenes="[$scene]"
     )
     if [ -n "$LIMIT" ]; then
         args+=("habitat_baselines.test_episode_count=$LIMIT")
     fi
-    local ov arm_ov
-    eval "arm_ov=\${OVERRIDES_${arm}:-}"          # 每档独立覆盖（参数变体矩阵）
-    for ov in $EXTRA_OVERRIDES $arm_ov; do args+=("$ov"); done
+    local ov
+    for ov in $EXTRA_OVERRIDES; do args+=("$ov"); done
 
     if [ -n "$DRY_RUN" ]; then
-        echo ">>> [dry-run] $tag  (TSP3D ckpt: $ckpt)"
+        echo ">>> [dry-run] $tag  sigma_tar=$sigma  (TSP3D ckpt: $ckpt)"
         echo "    python -u -m vlfm.run ${args[*]}"
         return 0
     fi
@@ -418,12 +458,13 @@ run_one() {
     fi
 
     echo "-------------------------------------------------"
-    echo ">>> 档位 $arm | 场景 $scene | 服务权重 $(basename "$ckpt")"
+    echo ">>> 档位 $arm | sigma_tar=$sigma | 场景 $scene | 服务权重 $(basename "$ckpt")"
     echo ">>> 日志 $log"
     t0=$(date +%s)
     python -u -m vlfm.run "${args[@]}" 2>&1 | tee -a "$log"
     status="${PIPESTATUS[0]}"
     t1=$(date +%s)
+    completed="$(completed_episodes_in_log "$log")"
 
     sr="$(metric_of 'Success rate:' "$log" 'Oracle')"
     oracle="$(metric_of 'Oracle Success Rate:' "$log")"
@@ -432,19 +473,20 @@ run_one() {
     steps="$(metric_of 'Average episode steps_count:' "$log")"
 
     # 检测级判读行（无论成败都落盘，缺行记 '-'）
-    printf '%s\t%s\t%s\n' "$arm" "$scene" "$(detect_metrics "$log")" >> "$RUN_DIR/detect_summary.tsv"
+    printf '%s\t%s\t%s\t%s\n' "$arm" "$sigma" "$scene" "$(detect_metrics "$log")" >> "$RUN_DIR/detect_summary.tsv"
 
-    if [ "$status" -eq 0 ]; then
-        mkdir -p "$RUN_DIR/.done" && touch "$donef"
-        printf '%s\t%s\tOK\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$arm" "$scene" "${sr:--}" "${oracle:--}" "${spl:--}" "${soft:--}" "${steps:--}" \
+    if [ "$status" -eq 0 ] && [ "$completed" -eq "$expected" ]; then
+        mkdir -p "$RUN_DIR/.done"
+        printf 'episodes=%s\nlog=%s\n' "$expected" "$(basename "$log")" > "$donef"
+        printf '%s\t%s\t%s\tOK(%s/%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$arm" "$sigma" "$scene" "$completed" "$expected" "${sr:--}" "${oracle:--}" "${spl:--}" "${soft:--}" "${steps:--}" \
             "$((t1 - t0))" "$(basename "$log")" >> "$RUN_DIR/summary.tsv"
-        echo ">>> 完成 $tag  用时 $((t1 - t0))s  SR=${sr:--} Oracle=${oracle:--} spl=${spl:--}"
+        echo ">>> 完成 $tag ($completed/$expected)  用时 $((t1 - t0))s  SR=${sr:--} Oracle=${oracle:--} spl=${spl:--}"
     else
-        printf '%s\t%s\tFAIL(%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$arm" "$scene" "$status" "${sr:--}" "${oracle:--}" "${spl:--}" "${soft:--}" "${steps:--}" \
+        printf '%s\t%s\t%s\tINCOMPLETE(%s;%s/%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$arm" "$sigma" "$scene" "$status" "$completed" "$expected" "${sr:--}" "${oracle:--}" "${spl:--}" "${soft:--}" "${steps:--}" \
             "$((t1 - t0))" "$(basename "$log")" >> "$RUN_DIR/summary.tsv"
-        echo ">>> [fail] $tag 退出码 $status（日志已保留）"
+        echo ">>> [fail] $tag 仅完成 $completed/$expected 集，退出码 $status（不写完成标记）"
         return 1
     fi
     return 0
@@ -453,20 +495,29 @@ run_one() {
 # ---- 主流程 ----
 if [ -z "$DRY_RUN" ]; then
     mkdir -p "$RUN_DIR/.done"
-    printf 'arm\tscene\tstatus\tsuccess\toracle\tspl\tsoft_spl\tsteps\tsecs\tlog\n' > "$RUN_DIR/summary.tsv"
-    printf 'arm\tscene\tdet\ttp\tfp\tprec\teps_tp\tentries\tentry_tp\tmaxscore_mean\tgate_rejects\n' > "$RUN_DIR/detect_summary.tsv"
-    printf 'loaded_at\tcheckpoint\tsha256\ttmux_session\n' > "$RUN_DIR/checkpoints.tsv"
+    if [ -z "$SKIP_DONE" ] || [ ! -f "$RUN_DIR/summary.tsv" ]; then
+        printf 'arm\tsigma_tar\tscene\tstatus\tsuccess\toracle\tspl\tsoft_spl\tsteps\tsecs\tlog\n' > "$RUN_DIR/summary.tsv"
+        printf 'arm\tsigma_tar\tscene\tdet\ttp\tfp\tprec\teps_tp\tentries\tentry_tp\tmaxscore_mean\tgate_rejects\n' > "$RUN_DIR/detect_summary.tsv"
+        printf 'loaded_at\tcheckpoint\tsha256\ttmux_session\n' > "$RUN_DIR/checkpoints.tsv"
+    else
+        echo ">>> SKIP_DONE=1：保留并追加现有汇总文件"
+    fi
 fi
 
 queue_failed=0
 for arm in $QUEUE; do
-    ckpt="$(resolve_ckpt "$arm")" || ckpt=""
+    if ! sigma_for_arm "$arm" >/dev/null; then
+        queue_failed=1
+        [ -n "$FAIL_FAST" ] && break
+        continue
+    fi
+    ckpt="$(resolve_ckpt)" || ckpt=""
     if [ -z "$ckpt" ]; then
         if [ -n "$DRY_RUN" ]; then
-            ckpt="$CKPT_DIR/${arm}_${GPU_TAG}_ckpt_last.pth"
-            echo ">>> [dry-run] $arm ckpt 未找到 → 按默认命名展示（正式运行会 [skip]）: $ckpt"
+            ckpt="$MODEL_CKPT"
+            echo ">>> [dry-run] checkpoint 未找到（正式运行会 [skip]）: $ckpt"
         else
-            echo ">>> [skip] $arm：未找到 ckpt（$CKPT_DIR/${arm}_*_ckpt_last.pth）——训练完成后再跑本档"
+            echo ">>> [skip] $arm：未找到 checkpoint：$MODEL_CKPT"
             if [ -n "$REQUIRE_ALL" ]; then
                 echo ">>> [error] REQUIRE_ALL=1：ckpt 缺失，退出"
                 exit 1
@@ -481,7 +532,7 @@ for arm in $QUEUE; do
         if [ -n "$DRY_RUN" ]; then
             echo ">>> [dry-run] 计划重启服务: kill vlm_servers_* → TSP3D_CHECKPOINT=$ckpt bash scripts/launch_vlm_servers.sh → 核验 [TSP3D] Weights loaded from"
         elif [ "$ACTIVE_CKPT" = "$ckpt" ] && [ -n "$ACTIVE_TSP3D_SESSION" ]; then
-            # 同权重多参数变体（如 σ 扫描）：服务无需重启，只做轻量复核。
+            # 全部 sigma 档使用同权重：服务无需重启，只做轻量复核。
             echo ">>> 复用已加载服务（同 ckpt，不重启）: $ckpt"
             if [ -z "$SKIP_CKPT_VERIFY" ] \
                 && ! verify_server_checkpoint "$ckpt" "$ACTIVE_TSP3D_SESSION" "$ACTIVE_CKPT_ID" "$ACTIVE_CKPT_SHA256"; then
@@ -507,7 +558,24 @@ for arm in $QUEUE; do
         fi
     fi
     for scene in $SCENE_LIST; do
-        if ! run_one "$arm" "$scene" "$ckpt"; then
+        attempt=1
+        scene_ok=0
+        while [ "$attempt" -le "$MAX_SCENE_ATTEMPTS" ]; do
+            echo ">>> 场景尝试 $attempt/$MAX_SCENE_ATTEMPTS：$arm × $scene"
+            if run_one "$arm" "$scene" "$ckpt"; then
+                scene_ok=1
+                break
+            fi
+            if [ "$attempt" -lt "$MAX_SCENE_ATTEMPTS" ] && [ -z "$DRY_RUN" ]; then
+                echo ">>> $arm × $scene 未完整结束；重启服务后从该场景重新评测"
+                if ! restart_servers "$ckpt"; then
+                    echo ">>> [error] 重试前服务重启失败"
+                    break
+                fi
+            fi
+            attempt=$((attempt + 1))
+        done
+        if [ "$scene_ok" = "0" ]; then
             queue_failed=1
             if [ -n "$FAIL_FAST" ]; then
                 echo ">>> FAIL_FAST=1：场景失败，停止队列"
@@ -534,9 +602,10 @@ else
         fi
     fi
     echo ""
-    echo "断点续跑: SKIP_DONE=1 RUN_DIR=$RUN_DIR bash scripts/ft_eval.sh"
+    echo "断点续跑: SKIP_DONE=1 RUN_DIR=$RUN_DIR bash scripts/ft_sigma_search.sh"
 fi
 echo "================================================="
 if [ "$queue_failed" != "0" ]; then
     echo ">>> 注意：本次存在跳过的档或失败的场景（见上方 [skip] / [fail] / [error]）。"
+    exit 1
 fi

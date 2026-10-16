@@ -8,9 +8,8 @@ export HF_ENDPOINT=https://hf-mirror.com
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export VLVM_PYTHON=${VLVM_PYTHON:-$(command -v python)}
 export TSP3D_DATA_PATH=${TSP3D_DATA_PATH:-${PROJECT_ROOT}/data/tsp3d_models}
-# 标准权重 = tsp3d_scanrefer.pth；
-# TSP3D_CHECKPOINT=<path> bash scripts/launch_vlm_servers.sh
-export TSP3D_CHECKPOINT=${TSP3D_CHECKPOINT:-${TSP3D_DATA_PATH}/tsp3d_scanrefer.pth}
+# S4 最终标准权重 = VLVM V1；仍可用 TSP3D_CHECKPOINT=<path> 显式覆盖。
+export TSP3D_CHECKPOINT=${TSP3D_CHECKPOINT:-${PROJECT_ROOT}/data/vlvm_v1/vlvm_v1.pth}
 export TSP3D_PORT=${TSP3D_PORT:-12186}
 export BLIP2ITM_PORT=${BLIP2ITM_PORT:-12182}
 export GROUNDING_DINO_PORT=${GROUNDING_DINO_PORT:-12181}
@@ -85,4 +84,4 @@ echo "Created tmux session '${session_name}'. You must wait up to 90 seconds for
 echo "Run the following to monitor all the server commands:"
 echo "tmux attach-session -t ${session_name}"
 echo "To stop: tmux kill-session -t ${session_name}"
-echo "对比实验权重（手动指定覆盖标准 tsp3d_scanrefer.pth）:"
+echo "对比实验权重（手动指定 TSP3D_CHECKPOINT 覆盖默认 VLVM V1）:"

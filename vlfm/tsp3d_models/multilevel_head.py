@@ -7,15 +7,8 @@ import MinkowskiEngine as ME
 from mmdet3d.structures.bbox_3d import DepthInstance3DBoxes
 from .trans_modules import (BiEncoder, BiEncoderLayer, PositionEmbeddingLearned)
 from .ft_utils import (
-    asymmetric_binary_loss,
     batch_size_of,
-    box_giou,
-    box_iou,
-    center_dim_to_corners,
     empty_prediction,
-    focal_binary_loss,
-    item_at,
-    to_box_tensor,
 )
 
 
@@ -171,7 +164,6 @@ class TSPHead(nn.Module):
                     self.make_block(in_channels[i], out_channels))
                 
         self.fuse = MinkowskiFeatureFusionBlock(out_channels, self.text_dim, out_channels)
-        self._last_ft_outputs = None
 
 
     @staticmethod
@@ -188,6 +180,7 @@ class TSPHead(nn.Module):
             coordinate_map_key=x.coordinate_map_key,
             coordinate_manager=x.coordinate_manager,
         )
+
 
     @staticmethod
     def _lateral_features_at(source, target):
@@ -237,6 +230,7 @@ class TSPHead(nn.Module):
             out_idx = out_idx.to(device=target.F.device, dtype=torch.long)
             aligned = aligned.index_copy(0, out_idx, source.F[in_idx])
         return aligned
+
 
     def _base_ft_forward(self, backbone_feats, text_feats, text_padding_mask):
         """
@@ -387,15 +381,15 @@ class TSPHead(nn.Module):
         bbox_preds, cls_preds, points = self._forward_single(fused)
         batch_size = batch_size_of(visual)
         out = {
-            "final_logits": [], "final_boxes": [], "text_context": text_ctx,
+            "final_logits": [], "final_boxes": [],
         }
         for bi in range(batch_size):
-            logits = cls_preds[bi].reshape(-1)
-            boxes = self._bbox_pred_to_bbox(points[bi], bbox_preds[bi])
-            if logits.numel():
-                chosen = int(logits.argmax().item())
-                logits = logits[chosen:chosen + 1]
-                boxes = boxes[chosen:chosen + 1]
+            all_logits = cls_preds[bi].reshape(-1)
+            all_boxes = self._bbox_pred_to_bbox(points[bi], bbox_preds[bi])
+            if all_logits.numel():
+                logits, indices = torch.topk(
+                    all_logits, k=1, largest=True, sorted=True)
+                boxes = all_boxes[indices]
             else:
                 logits = visual.F.new_empty((0,))
                 boxes = visual.F.new_empty((0, 6))
@@ -403,88 +397,9 @@ class TSPHead(nn.Module):
             out["final_boxes"].append(boxes)
         return out
 
-    def _ft_losses(self, pred, gt_bboxes=None, gt_labels=None,
-                       gt_all_bbox_new=None, auxi_bbox=None,
-                       gate_logits=None, gate_targets=None,
-                       teacher_targets=None):
-        """
-        Compute safe model-side losses for callers without a separate loss module.
-
-        Covers the base / gate / distill arms.
-
-        External fine-tuning pipelines may ignore these values and consume the structured prediction dictionary; 
-        the implementation nevertheless keeps the legacy ``BeaUTyDETR(...).train()`` path functional.
-        """
-        device = pred["text_context"].device
-        dtype = pred["text_context"].dtype
-        bsz = len(pred["final_boxes"])
-
-        base_terms, gate_terms, dist_terms = [], [], []
-        for bi in range(bsz):
-            boxes = pred["final_boxes"][bi]
-            logits = pred["final_logits"][bi]
-            all_arg = item_at(gt_all_bbox_new, bi, bsz)
-            if all_arg is None:
-                all_arg = item_at(auxi_bbox, bi, bsz)
-            box_arg = item_at(gt_bboxes, bi, bsz)
-            target_all = to_box_tensor(all_arg, device, dtype) if all_arg is not None else torch.empty((0, 6), device=device, dtype=dtype)
-            target = to_box_tensor(box_arg, device, dtype) if box_arg is not None else torch.empty((0, 6), device=device, dtype=dtype)
-            if target.numel() == 0 and target_all.numel():
-                target = target_all[:1]
-            label_arg = item_at(gt_labels, bi, bsz)
-            exists = bool(len(target))
-
-            if label_arg is not None:
-                lt = torch.as_tensor(label_arg, device=device)
-                # Class id 0 is a valid positive category, so box presence is the primary existence signal; 
-                # a nonzero label can still supervise positive samples when a caller omits the box.
-                exists = exists or bool((lt != 0).any().item())
-            target_flag = torch.tensor(float(exists), device=device, dtype=dtype)
-            if gate_logits is not None:
-                gtarget = target_flag if gate_targets is None else torch.as_tensor(item_at(gate_targets, bi, bsz), device=device, dtype=dtype).reshape(-1)[0]
-                gate_terms.append(focal_binary_loss(gate_logits[bi].reshape(1), gtarget.reshape(1), alpha=0.75, gamma=2.0))
-            if logits.numel():
-                if len(target):
-                    target_corners = center_dim_to_corners(target)
-                    pred_corners = center_dim_to_corners(boxes)
-                    iou = box_iou(pred_corners, target_corners)
-                    best_iou, best = iou.max(dim=1)
-                    cls_target = (best_iou >= 0.10).to(dtype)
-                    if cls_target.sum() == 0:
-                        cls_target[logits.argmax()] = 1.0
-                    chosen = int(cls_target.argmax().item())
-                    base_terms.append(asymmetric_binary_loss(logits, cls_target))
-                    base_terms.append(nn.functional.smooth_l1_loss(boxes[chosen], target[best[chosen]], reduction="mean"))
-                    base_terms.append(1.0 - box_giou(
-                        center_dim_to_corners(boxes[chosen:chosen + 1]),
-                        target_corners[best[chosen]:best[chosen] + 1]).mean())
-                else:
-                    base_terms.append(asymmetric_binary_loss(logits, torch.zeros_like(logits)))
-                    base_terms.append((torch.sigmoid(logits) ** 2).mean())
-            if teacher_targets is not None and gate_logits is not None:
-                teacher = torch.as_tensor(item_at(teacher_targets, bi, bsz), device=device, dtype=dtype).reshape(-1)[0]
-                dist_terms.append(nn.functional.binary_cross_entropy_with_logits(gate_logits[bi].reshape(1), teacher.detach().reshape(1)))
-
-        def mean_or_zero(values):
-            return torch.stack(values).mean() if values else pred["text_context"].sum() * 0.0
-
-        return {
-            "base_loss": mean_or_zero(base_terms),
-            "gate_loss": mean_or_zero(gate_terms),
-            "distill_loss": mean_or_zero(dist_terms),
-        }
-
-    def forward_train(self, x, text_feats, text_attention_mask,
-                      gt_bboxes=None, gt_labels=None, gt_all_bbox_new=None,
-                      auxi_bbox=None, img_metas=None, gate_logits=None,
-                      gate_targets=None, teacher_targets=None, **kwargs):
-        """
-        base / gate / distill 训练前向：legacy 头 + 模型侧保底损失。
-        """
-        pred = self._base_ft_forward(x, text_feats, text_attention_mask)
-        self._last_ft_outputs = pred
-        return self._ft_losses(pred, gt_bboxes, gt_labels, gt_all_bbox_new,
-                               auxi_bbox, gate_logits, gate_targets, teacher_targets)
+    def forward_train(self, x, text_feats, text_attention_mask):
+        """返回外部微调 pipeline 消费的可微结构化预测。"""
+        return self._base_ft_forward(x, text_feats, text_attention_mask)
 
 
     def _prune_inference(self, x, scores, layer_id, prune_threshold=None):
@@ -856,14 +771,10 @@ class TSPHead(nn.Module):
             gate_prob = torch.sigmoid(gate_logits)
             diag["gate"] = [float(v.detach().cpu()) for v in gate_prob]
             for bi, gp in enumerate(gate_prob):
-                if float(gp.detach()) <= threshold:
+                if float(gp.detach()) < threshold:
                     results[bi] = empty_prediction(
                         inputs[0].F.device, inputs[0].F.dtype,
                         img_metas[bi]["box_type_3d"])
-                else:
-                    # Keep the legacy M1 head intact, but settle confidence with the same P_exist * s_k contract as Stage 3.
-                    bboxes, scores, labels = results[bi]
-                    results[bi] = (bboxes, scores * gp.detach(), labels)
 
         if len(results) > 0:
             _, res_scores, _ = results[0]

@@ -18,6 +18,17 @@ _DEFAULT_DATA_PATH = os.environ.get(
 )
 
 
+def _build_presence_gate_with_isolated_rng(
+        visual_dim: int, text_dim: int, seed: int) -> PresenceGate:
+    """Initialize the CPU Gate without changing the caller's CPU/CUDA RNG state."""
+    # PresenceGate is constructed on CPU and moved with the parent model later.
+    # torch.manual_seed() would also reseed CUDA, while devices=[] only makes
+    # fork_rng restore the CPU generator. Seed the CPU generator directly.
+    with torch.random.fork_rng(devices=[]):
+        torch.default_generator.manual_seed(int(seed))
+        return PresenceGate(visual_dim=visual_dim, text_dim=text_dim)
+
+
 class BeaUTyDETR(nn.Module):
     """
     3D language grounder.
@@ -43,9 +54,10 @@ class BeaUTyDETR(nn.Module):
         enable_gate = bool(ft_config.get("enable_gate", ft_config.get("gate", enable_gate)))
         num_proposals = int(ft_config.get("num_proposals", num_proposals))
         gate_threshold = float(ft_config.get("gate_threshold", gate_threshold))
+        gate_init_seed = int(ft_config.get("gate_init_seed", 0))
         self.ft_config = {
             "enable_gate": enable_gate, "num_proposals": num_proposals,
-            "gate_threshold": gate_threshold,
+            "gate_threshold": gate_threshold, "gate_init_seed": gate_init_seed,
         }
 
         # Visual encoder
@@ -66,7 +78,13 @@ class BeaUTyDETR(nn.Module):
         )       
         
         # self.neck = TR3DNeck()
-        self.presence_gate = PresenceGate(visual_dim=128, text_dim=d_model) if enable_gate else None
+        # Gate 只用于冻结核心的独立训练及推理。隔离其随机初始化，避免
+        # 新增模块改变核心模块初始化及训练 Dropout 的 CPU/CUDA RNG 序列。
+        if enable_gate:
+            self.presence_gate = _build_presence_gate_with_isolated_rng(
+                visual_dim=128, text_dim=d_model, seed=gate_init_seed)
+        else:
+            self.presence_gate = None
         self.head = TSPHead(
             voxel_size=self.voxel_size,
             num_proposals=num_proposals,
@@ -106,13 +124,43 @@ class BeaUTyDETR(nn.Module):
         ).to(inputs['point_clouds'][0].device)
         with torch.no_grad():
             encoded_text = self.text_encoder(**tokenized)
-        text_feats = self.text_projector(encoded_text.last_hidden_state) 
+        if inputs.get("gate_only", False):
+            projector_training = self.text_projector.training
+            self.text_projector.eval()
+            try:
+                with torch.no_grad():
+                    text_feats = self.text_projector(encoded_text.last_hidden_state)
+            finally:
+                self.text_projector.train(projector_training)
+        else:
+            text_feats = self.text_projector(encoded_text.last_hidden_state)
         text_attention_mask = tokenized.attention_mask.ne(1).bool()
         text_time = time.time() - start_time
 
+        gate_only = bool(inputs.get("gate_only", False))
         gate_logits = None
-        if self.presence_gate is not None:
-            gate_logits = self.presence_gate(x[-1], text_feats, text_attention_mask)
+        if self.presence_gate is not None and (gate_only or not self.training):
+            # 训练时只允许 Gate-only 档位计算该分支；推理路径保持不变。
+            cuda_devices = []
+            if text_feats.device.type == "cuda":
+                cuda_devices = [
+                    text_feats.device.index
+                    if text_feats.device.index is not None else torch.cuda.current_device()
+                ]
+            with torch.random.fork_rng(devices=cuda_devices):
+                gate_logits = self.presence_gate(
+                    x[-1], text_feats, text_attention_mask, detach_inputs=True)
+
+        if gate_only:
+            if gate_logits is None:
+                raise RuntimeError("gate_only forward requires enable_gate=True")
+            empty_boxes = x[-1].F.new_empty((0, 6))
+            empty_logits = x[-1].F.new_empty((0,))
+            return {"ft_outputs": {
+                "final_boxes": [empty_boxes],
+                "final_logits": [empty_logits],
+                "gate_logits": gate_logits,
+            }}
 
         # Extract dynamic control parameters
         sigma_sce = inputs.get('sigma_sce', None)
@@ -135,25 +183,8 @@ class BeaUTyDETR(nn.Module):
             fusion_time = time.time() - start_time
             return bbox_results, {'loss':0.}, diagnostics, [visual_time,text_time,fusion_time-head_time,head_time]
 
-        losses = self.head.forward_train(
-            x, text_feats, text_attention_mask, gt_bboxes, gt_labels,
-            gt_all_bbox_new, auxi_bbox, img_metas, gate_logits=gate_logits,
-            gate_targets=inputs.get("gate_targets"),
-            teacher_targets=inputs.get("teacher_targets", inputs.get("gd_targets")),
-        )
-        losses.update({'loss':sum(value for key, value in losses.items() if '_loss' in key)})
-        if inputs.get("return_outputs", False):
-            outputs = getattr(self.head, "_last_ft_outputs", None)
-            if outputs is not None and gate_logits is not None:
-                outputs["gate_logits"] = gate_logits
-                gate_prob = torch.sigmoid(gate_logits).detach()
-                outputs["gate_prob"] = gate_prob
-                outputs["final_scores"] = [
-                    scores.sigmoid() * gate_prob[i]
-                    for i, scores in enumerate(outputs.get("final_logits", []))
-                ]
-            losses["ft_outputs"] = outputs
-        return losses
+        outputs = self.head.forward_train(x, text_feats, text_attention_mask)
+        return {"ft_outputs": outputs}
 
     def train(self, mode: bool = True):
         """切换模型模式，同时保持完全冻结的 RoBERTa 永久处于 eval。"""

@@ -106,7 +106,7 @@ habitat_baselines:
       query_z_min: 0.15
       query_z_max: 1.50
       # TSP3D query
-      sigma_tar: 0.70
+      sigma_tar: 0.60
       sigma_sce: 0.15
       tau: 0.15
       near_field_dist: 1.0
@@ -185,16 +185,6 @@ habitat_baselines:
       clip_param: 0.2
       ppo_epoch: 4
       num_mini_batch: 2
-      value_loss_coef: 0.5
-      entropy_coef: 0.01
-      lr: 2.5e-4
-      eps: 1e-5
-      max_grad_norm: 0.2
-      num_steps: 64
-      use_gae: True
-      gamma: 0.99
-      tau: 0.95
-2
       value_loss_coef: 0.5
       entropy_coef: 0.01
       lr: 2.5e-4

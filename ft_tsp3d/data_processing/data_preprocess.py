@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage3 · 数据供给层 · 离线模拟局部视角采样（Synthetic Local-View Slicing）
+"""数据供给层 · 离线模拟局部视角采样（Synthetic Local-View Slicing）
 
 1) 仿真与渲染（与 VLVM 在线传感器同源）
    - 独立 habitat_sim 实例；传感器 = COLOR + DEPTH + SEMANTIC（RGB 必需，否则语义图恒全零）。
@@ -13,21 +13,22 @@
      `robot_xyz = [x_e, y_e, 0.88]`（z 恒 0.88，即“离地高度 + 0.88”约定）。
 
 2) 样本形态（复用在线 world 融合与发送侧）
-   - `TSP3DInputPreprocessor(fusion_style="world", ...)`：体素 0.02、半径 6.0、去重门 0.15 m / 15°
-     、8 帧窗、near_refresh 3.0=True；发送侧 distance_sample(1.5/3.0 → 0.01/0.02/0.05) + cap 200k(random)。
+   - `TSP3DInputPreprocessor(fusion_style="world", ...)`：
+     体素 0.02、半径 6.0、去重门 0.15 m / 15°、8 帧窗、near_refresh 3.0=True；
+     发送侧 distance_sample(1.5/3.0 → 0.01/0.02/0.05) + cap 200k(random)。
    - 每个“视图样本”= K~U(1,8) 帧短轨迹（连续帧须跨过 0.15 m / 15° 去重门），查询位姿 = 最后一帧。
    - 点云以 float16 落盘（与在线 wire dtype 一致）。
 
 3) 文本与标签
-   - 目标词表 = 框架 6 类 `["chair","bed","potted plant","toilet","tv","couch"]`；原始语义名经
-     `grounding_dino/vocab.py` 的 alias/单复数/小写归一映射到规范类（多词变体不映射，按用户裁定）。
+   - 目标词表 = 框架 6 类 `["chair","bed","potted plant","toilet","tv","couch"]`；
+     原始语义名经 `grounding_dino/vocab.py` 的 alias/单复数/小写归一映射到规范类（多词变体不映射，按用户裁定）。
    - 正样本：查询类在视图内有可见实例（像素 >= `--min-vis-px`），目标 = 该类可见像素最多的实例；
      GT = **完整实例 AABB**（canonical 系轴对齐重包裹）；云内目标点数须 >= `--min-target-pts`。
    - 负样本：从 6 类词表随机取一个“视图内所有实例像素均 < `--min-vis-px`(40)（弱可见 1~39 px 视为不存在）”的规范类，GT 为空。
    - 正负配比全局控制 = 1:`--neg-per-pos`（默认 1:3）。
    - 截断比例（目标 AABB 表面采样点中落在 K 帧任一视锥且深度 ∈[0.5,5.0] 之外的比例）：
-     `> --trunc-drop`(0.85) 直接剔除（只写 `dropped.jsonl`）；`(--trunc-low, --trunc-drop]` 记 weight=0.5；
-     其余 weight=1.0。负样本不受影响。
+     `> --trunc-drop`(0.85) 直接剔除（只写 `dropped.jsonl`）；
+     `(--trunc-low, --trunc-drop]` 记 weight=0.5；其余 weight=1.0。负样本不受影响。
 
 4) 场景池与划分
    - 场景目录 = `<hm3d_root>/<split_dir>/<scene_id>/`（默认 train，137 个 annotated train 场景）。
@@ -36,12 +37,10 @@
 5) 产物（默认 `vlvm/data/ft_datasets/local_view`）
    - `splits.json` / `stats.json` / `dropped.jsonl`
    - `{train,val}/<scene_id>.npz`：`points`(float16 (M,6)) + `offsets`(int64 (V+1,)) + `records_json`(str)
-     `records_json` 每条记录 = 一个训练样本：`{"view", "k", "poses", "query", "label", "weight",
-     "target": {...}}`；同一视图的正/负样本共享一份点云（`points[offsets[v]:offsets[v+1]]`）。
+     `records_json` 每条记录 = 一个训练样本：`{"view", "k", "poses", "query", "label", "weight", "target": {...}}`；
+     同一视图的正/负样本共享一份点云（`points[offsets[v]:offsets[v+1]]`）。
 
-6) 蒸馏侧车
-   - 与主 npz 同遍产出 `gd/{train,val}/<scene_id>.npz`（`meta_json` + `views_json`：帧级 GD 证据，
-     含 `ok` 标志与逐检测深度支撑）；对已生成数据集可用 `gd_sidecar.py` 回放补充，二者产物同构。
+本文件只负责主 npz（`splits.json` / `stats.json` / `dropped.jsonl` / `{train,val}/*.npz`）。
 """
 from __future__ import annotations
 
@@ -150,12 +149,6 @@ class Config:
     trunc_max_pts: int = 1500
     # ---- misc ----
     verify_calib: bool = False
-    # ---- distill sidecar ----
-    gd_sidecar: bool = False
-    gd_out_dir: Optional[str] = None
-    gd_device: Optional[str] = None
-    gd_box_thr: float = 0.2
-    gd_text_thr: float = 0.25
 
     @property
     def dataset_config(self) -> str:
@@ -434,15 +427,14 @@ class Stats:
         return d
 
 
-def process_scene(scene_id: str, cfg: Config, rr: SceneRenderer, stats: Stats, dropped_fh,
-                  gd_runner=None) -> Optional[dict]:
-    """`gd_runner` 非空时（--gd-sidecar）在保存视图处顺带产出 GD 侧车视图条目。"""
+def process_scene(scene_id: str, cfg: Config, rr: SceneRenderer, stats: Stats,
+                  dropped_fh) -> Optional[dict]:
+    """生成单场景主 npz 内容（侧车 / 实例表面已随归档移出，此处只产主数据）。"""
     pre = build_preprocessor(cfg)
     rng = np.random.default_rng(cfg.seed * 1000003 + sum(map(ord, scene_id)))  # 逐场景确定性 seed
     points_chunks: List[np.ndarray] = []
     offsets: List[int] = [0]
     records: List[dict] = []
-    gd_views: List[dict] = []  # 仅 --gd-sidecar 模式填充
     n_pts_total = 0
     saved_views = 0
     attempts = 0
@@ -487,10 +479,6 @@ def process_scene(scene_id: str, cfg: Config, rr: SceneRenderer, stats: Stats, d
                 cam_pos_e = np.array([pos_e[0], pos_e[1], cfg.camera_height])
                 pre.update(fast_voxel_first(cloud_w, cfg.map_voxel_size), cam_pos_e, yaw_meas)
                 frame = {"pos_e": pos_e, "floor": floor_y, "yaw": yaw_meas, "sem": sem_ids}
-                if gd_runner is not None:
-                    # 一步生成模式：暂存原帧（仅保留当前视图，≤ K 帧）
-                    frame["rgb"] = np.asarray(obs["rgb"])[:, :, :3]
-                    frame["depth"] = np.asarray(obs["depth"], dtype=np.float32)
                 frames.append(frame)
                 last_pos_h, last_pos_e, last_yaw = pos_h, pos_e, yaw_meas
                 placed = True
@@ -587,11 +575,6 @@ def process_scene(scene_id: str, cfg: Config, rr: SceneRenderer, stats: Stats, d
             r["poses"] = [{"x": round(f["pos_e"][0], 3), "y": round(f["pos_e"][1], 3), "floor": round(f["floor"], 3),
                            "yaw_deg": round(math.degrees(f["yaw"]), 1)} for f in frames]
             records.append(r)
-        if gd_runner is not None:
-            gd_views.append({
-                "view": int(view_idx), "k": len(frames),
-                "frames": [gd_runner.frame_entry(f["rgb"], f["depth"]) for f in frames],
-            })
         points_chunks.append(cloud_f16)
         n_pts_total += len(cloud_f16)
         offsets.append(n_pts_total)
@@ -605,8 +588,6 @@ def process_scene(scene_id: str, cfg: Config, rr: SceneRenderer, stats: Stats, d
         "points": np.concatenate(points_chunks, axis=0).astype(np.float16),
         "offsets": np.asarray(offsets, dtype=np.int64),
         "records_json": json.dumps(records),
-        # 仅 --gd-sidecar 模式非空；main() 会取出另存为侧车文件（不进主 npz）
-        "gd_views": gd_views,
         "attempts": attempts, "saved_views": saved_views,
     }
 
@@ -630,13 +611,6 @@ def main() -> None:
     ap.add_argument("--max-points", type=int, default=Config.max_points)
     ap.add_argument("--gpu-id", type=int, default=Config.gpu_id)
     ap.add_argument("--skip-existing", action="store_true")
-    ap.add_argument("--gd-sidecar", action="store_true",
-                    help="一步生成蒸馏侧车：同遍产出 gd/{split}/<scene>.npz（GD 教师帧级证据）")
-    ap.add_argument("--gd-out-dir", default=None, help="侧车输出根目录（默认 <out-dir>/gd）")
-    ap.add_argument("--gd-device", default=None, help="GD 推理设备（默认 cuda:<gpu-id>）")
-    ap.add_argument("--gd-box-thr", type=float, default=0.2,
-                    help="侧车存储用 GD 框阈值（低于在线 0.35，保留更多教师信息）")
-    ap.add_argument("--gd-text-thr", type=float, default=0.25)
     ap.add_argument("--shard", type=int, default=0, help="分片编号（多进程并行时用，0-based）")
     ap.add_argument("--shards", type=int, default=1, help="分片总数（>1 时不重复写 splits.json）")
     ap.add_argument("--dry-run", action="store_true")
@@ -648,8 +622,6 @@ def main() -> None:
         k_max=args.k_max, neg_per_pos=args.neg_per_pos, min_vis_px=args.min_vis_px,
         min_target_pts=args.min_target_pts, trunc_drop=args.trunc_drop, trunc_low=args.trunc_low,
         max_points=args.max_points, gpu_id=args.gpu_id, skip_existing=args.skip_existing,
-        gd_sidecar=args.gd_sidecar, gd_out_dir=args.gd_out_dir, gd_device=args.gd_device,
-        gd_box_thr=args.gd_box_thr, gd_text_thr=args.gd_text_thr,
     )
 
     scenes = discover_scenes(cfg)
@@ -676,25 +648,6 @@ def main() -> None:
             "note": "nav 20 scenes (val split) are excluded from generation by design",
         }, indent=1, ensure_ascii=False))
 
-    # 蒸馏侧车：一步生成模式下与主 npz 同遍产出（见 gd_sidecar.py）
-    gd_runner = None
-    gd_dir = None
-    gd_meta = None
-    if cfg.gd_sidecar:
-        from gd_sidecar import FrameGdRunner, sidecar_meta  # 同目录导入
-        gd_dir = Path(cfg.gd_out_dir) if cfg.gd_out_dir else out / "gd"
-        gd_device = cfg.gd_device or f"cuda:{cfg.gpu_id}"
-        gd_runner = FrameGdRunner(
-            box_thr=cfg.gd_box_thr, text_thr=cfg.gd_text_thr,
-            min_depth=cfg.min_depth, max_depth=cfg.max_depth, device=gd_device,
-        )
-        gd_meta = sidecar_meta(gd_runner, {
-            "image_h": cfg.image_h, "image_w": cfg.image_w, "hfov_deg": cfg.hfov_deg,
-            "camera_height": cfg.camera_height, "min_depth": cfg.min_depth, "max_depth": cfg.max_depth,
-            "fx": round((cfg.image_w / 2.0) / math.tan(math.radians(cfg.hfov_deg) / 2.0), 3),
-        })
-        print(f"[gd] sidecar enabled -> {gd_dir} (device={gd_device}, box_thr={cfg.gd_box_thr})")
-
     stats = Stats()
     dropped_path = out / "dropped.jsonl"
     failures_path = out / "failures.jsonl"
@@ -715,7 +668,7 @@ def main() -> None:
                 failed = False
                 try:
                     rr = SceneRenderer(scene_dir, cfg)
-                    res = process_scene(scene_id, cfg, rr, stats, dropped_fh, gd_runner=gd_runner)
+                    res = process_scene(scene_id, cfg, rr, stats, dropped_fh)
                 except Exception as exc:  # 单场景失败（资产损坏 / GL 显存不足）不拖垮整个分片
                     failed = True
                     msg = f"{type(exc).__name__}: {exc}"
@@ -739,24 +692,14 @@ def main() -> None:
                 if res is None:
                     print(f"[{split}] {i}/{len(split_scenes)} {scene_id}: NO SAMPLES ({time.time() - t0:.1f}s)")
                     continue
-                gd_views = res.pop("gd_views", None)
                 np.savez_compressed(dst, **res)
                 n_rec = len(json.loads(res["records_json"]))
-                gd_note = ""
-                if cfg.gd_sidecar:
-                    gd_dst = gd_dir / split / dst.name
-                    gd_dst.parent.mkdir(parents=True, exist_ok=True)
-                    np.savez_compressed(gd_dst, meta_json=json.dumps(gd_meta, ensure_ascii=False),
-                                        views_json=json.dumps(gd_views or [], ensure_ascii=False))
-                    gd_note = f" gd_views={len(gd_views or [])}"
                 print(f"[{split}] {i}/{len(split_scenes)} {scene_id}: views={len(res['offsets']) - 1} "
-                      f"records={n_rec} pts={len(res['points'])}{gd_note} ({time.time() - t0:.1f}s, "
+                      f"records={n_rec} pts={len(res['points'])} ({time.time() - t0:.1f}s, "
                       f"elapsed {time.time() - t_start:.0f}s)")
 
     (out / "stats.json").write_text(json.dumps(stats.as_dict(), indent=1, ensure_ascii=False))
     print("stats:", json.dumps(stats.as_dict(), ensure_ascii=False))
-    if gd_runner is not None:
-        print("gd runner stats:", json.dumps(gd_runner.stats(), ensure_ascii=False))
 
 
 if __name__ == "__main__":

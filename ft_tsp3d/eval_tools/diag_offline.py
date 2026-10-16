@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
-"""E3 离线判读：微调权重 vs 原版权重，在 val 视图上的「在线同源推理」输出对比（2026-09-30）。
+"""E3 离线判读：两个权重在 val 视图上的「在线同源推理」输出对比
 
-判读目标（首轮评测 base 档崩坏的成因分离）
-----------------------------------------
-A = **分数分布下移被 sigma_tar 截断**：两权重「框召回」接近，但 base 的分数普遍更低
-    （大量跌到在线准入线 0.70 之下 -> 在线看到的检测数塌缩）；
-B = **输出消失 / 召回崩**：base 的框（任意分数）明显减少、真目标命中率显著低于 ref。
-
-口径（与在线完全同源）
+口径
 ----------------------
 * 输入 = `local_view/{split}/<scene>.npz` 的融合点云（与在线发送侧同源预处理产物，
   float16 存储 -> float32 前向）；query = record 的规范类名（`use_vlfm_nlp=False`）；
@@ -23,13 +17,16 @@ B = **输出消失 / 召回崩**：base 的框（任意分数）明显减少、�
 * pos 样本（label=1，含 GT）：是否有框 / 最高分框与 GT AABB 的 3D IoU / 命中率
   （IoU>=0.25 与 >=0.50）/ 被剪光（pruned_all）计数 / 分数分布（全量 + 命中）；
 * neg 样本（label=0）：输出框的有无与分数分布（fp 输出倾向）；
+* 区分度：AUROC / AUPRC、FPR@TPR90/95、Precision@R90/95、同视图 pair accuracy；
+* 分数形状与校准：正确/错误均值、gap、Cohen's d、ECE-15、Brier、NLL；
+* Gate checkpoint 额外报告 presence AUROC/AUPRC、实际门槛下 recall_open / intercept；
 * 逐场景 / 逐类聚合；per-record 明细落 jsonl 供深挖。
 
 用法
 ----
-  python -u ft_tsp3d/diag_offline.py --ckpt <权重> --tag <标签> --out-dir ft_tsp3d/ft_log/e3 \
-      [--neg-per-view 1] [--views-cap N] [--scenes s1,s2]
-  python -u ft_tsp3d/diag_offline.py --compare <A_summary.json> <B_summary.json>
+  python -u ft_tsp3d/eval_tools/diag_offline.py --ckpt <权重> --tag <标签> --out-dir ft_tsp3d/ft_log/e3 \
+      [--neg-per-view 1] [--views-cap N] [--scenes s1,s2] [--gate-threshold TAU]
+  python -u ft_tsp3d/eval_tools/diag_offline.py --compare <A_summary.json> <B_summary.json>
 """
 from __future__ import annotations
 
@@ -61,9 +58,8 @@ IOU_STRONG = 0.50       # 强命中
 SCORE_BINS = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0 + 1e-6]
 
 
-# ----------------------------------------------------------------------
+
 # 几何
-# ----------------------------------------------------------------------
 def aabb_from_corners(corners: np.ndarray) -> np.ndarray:
     """(8,3) corners -> (min_x, min_y, min_z, max_x, max_y, max_z)。"""
     return np.array([
@@ -101,9 +97,7 @@ def dynamic_sigma_sce(pts: np.ndarray) -> float:
     return SIGMA_SCE
 
 
-# ----------------------------------------------------------------------
 # 统计容器
-# ----------------------------------------------------------------------
 def _hist(scores: List[float]) -> Dict[str, int]:
     arr = np.asarray(scores, dtype=np.float64)
     out: Dict[str, int] = {}
@@ -162,9 +156,223 @@ def _new_neg() -> Dict[str, Any]:
     return {"n": 0, "has_box": 0, "scores": []}
 
 
-# ----------------------------------------------------------------------
+def _rankdata(values: np.ndarray) -> np.ndarray:
+    """Average ranks for ties, 1-based."""
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    sorted_values = values[order]
+    i = 0
+    while i < values.size:
+        j = i + 1
+        while j < values.size and sorted_values[j] == sorted_values[i]:
+            j += 1
+        ranks[order[i:j]] = (i + 1 + j) / 2.0
+        i = j
+    return ranks
+
+
+def _binary_auc(scores: np.ndarray, labels: np.ndarray) -> Optional[float]:
+    n_pos = int((labels == 1).sum())
+    n_neg = int((labels == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return None
+    ranks = _rankdata(scores)
+    value = (ranks[labels == 1].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(value)
+
+
+def _average_precision(scores: np.ndarray, labels: np.ndarray) -> Optional[float]:
+    """Non-interpolated AP with equal-score samples grouped as one threshold."""
+    n_pos = int((labels == 1).sum())
+    if n_pos == 0:
+        return None
+    order = np.argsort(-scores, kind="mergesort")
+    ranked_scores = scores[order]
+    ranked_labels = (labels[order] == 1).astype(np.float64)
+    tp = np.cumsum(ranked_labels)
+    end = np.r_[np.flatnonzero(ranked_scores[1:] != ranked_scores[:-1]), ranked_scores.size - 1]
+    recall = tp[end] / n_pos
+    precision = tp[end] / (end + 1)
+    recall_prev = np.r_[0.0, recall[:-1]]
+    return float(np.sum((recall - recall_prev) * precision))
+
+
+def _compact_score_stats(values: np.ndarray) -> Dict[str, Any]:
+    if values.size == 0:
+        return {"n": 0}
+    clipped = np.clip(values.astype(np.float64), 1e-7, 1.0 - 1e-7)
+    logits = np.log(clipped / (1.0 - clipped))
+    return {
+        "n": int(values.size),
+        "mean": round(float(values.mean()), 6),
+        "median": round(float(np.median(values)), 6),
+        "sd": round(float(values.std()), 6),
+        "p10": round(float(np.percentile(values, 10)), 6),
+        "p90": round(float(np.percentile(values, 90)), 6),
+        "logit_mean": round(float(logits.mean()), 6),
+        "logit_sd": round(float(logits.std()), 6),
+    }
+
+
+def _operating_point(scores: np.ndarray, labels: np.ndarray, target_recall: float) -> Dict[str, Any]:
+    """Largest discrete threshold satisfying recall >= target_recall under score >= threshold."""
+    pos = np.sort(scores[labels == 1])
+    n_pos = int(pos.size)
+    n_neg = int((labels == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return {"target_recall": float(target_recall), "threshold": None}
+    allowed_misses = int(np.floor((1.0 - float(target_recall)) * n_pos + 1e-12))
+    threshold = float(pos[min(allowed_misses, n_pos - 1)])
+    predicted = scores >= threshold
+    tp = int((predicted & (labels == 1)).sum())
+    fp = int((predicted & (labels == 0)).sum())
+    fn = n_pos - tp
+    tn = n_neg - fp
+    return {
+        "target_recall": float(target_recall),
+        "threshold": threshold,
+        "recall": float(tp / n_pos),
+        "fpr": float(fp / n_neg),
+        "precision": float(tp / max(tp + fp, 1)),
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+    }
+
+
+def _calibration(scores: np.ndarray, labels: np.ndarray, bins: int = 15) -> Dict[str, Any]:
+    if scores.size == 0:
+        return {"n": 0}
+    labels_f = labels.astype(np.float64)
+    clipped = np.clip(scores.astype(np.float64), 1e-7, 1.0 - 1e-7)
+    brier = float(np.mean((scores - labels_f) ** 2))
+    nll = float(-np.mean(labels_f * np.log(clipped) + (1.0 - labels_f) * np.log(1.0 - clipped)))
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    ece = 0.0
+    table: List[Dict[str, Any]] = []
+    for i in range(bins):
+        mask = ((scores >= edges[i]) &
+                ((scores < edges[i + 1]) if i < bins - 1 else (scores <= edges[i + 1])))
+        if not bool(mask.any()):
+            continue
+        confidence = float(scores[mask].mean())
+        accuracy = float(labels_f[mask].mean())
+        ece += float(mask.mean()) * abs(accuracy - confidence)
+        table.append({
+            "lo": float(edges[i]), "hi": float(edges[i + 1]), "n": int(mask.sum()),
+            "confidence": confidence, "accuracy": accuracy,
+        })
+    return {"n": int(scores.size), "bins": bins, "ece": ece,
+            "brier": brier, "nll": nll, "table": table}
+
+
+def _pair_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    grouped: Dict[tuple, List[Dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault((record["scene"], record["view"]), []).append(record)
+    pair_values: List[float] = []
+    violation_gaps: List[float] = []
+    n_candidate_views = 0
+    for view_records in grouped.values():
+        correct = [float(r.get("score") or 0.0) for r in view_records
+                   if int(r["label"]) == 1 and bool(r.get("hit25", False))]
+        target_absent = [float(r.get("score") or 0.0) for r in view_records
+                         if int(r["label"]) == 0]
+        errors = [float(r.get("score") or 0.0) for r in view_records
+                  if not (int(r["label"]) == 1 and bool(r.get("hit25", False)))]
+        for positive in correct:
+            for negative in target_absent:
+                pair_values.append(1.0 if positive > negative else 0.5 if positive == negative else 0.0)
+        if correct and errors:
+            n_candidate_views += 1
+            gap = max(errors) - max(correct)
+            if gap > 0.0:
+                violation_gaps.append(gap)
+    pair_arr = np.asarray(pair_values, dtype=np.float64)
+    violation_arr = np.asarray(violation_gaps, dtype=np.float64)
+    return {
+        "n_pairs": int(pair_arr.size),
+        "accuracy": (float(pair_arr.mean()) if pair_arr.size else None),
+        "n_candidate_views": n_candidate_views,
+        "n_violation_views": int(violation_arr.size),
+        "violation_rate": (float(violation_arr.size / n_candidate_views)
+                           if n_candidate_views else None),
+        "violation_gap_mean": (float(violation_arr.mean()) if violation_arr.size else None),
+        "violation_gap_median": (float(np.median(violation_arr)) if violation_arr.size else None),
+    }
+
+
+def _discrimination_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    scores = np.asarray([float(record.get("score") or 0.0) for record in records], dtype=np.float64)
+    labels = np.asarray([
+        int(int(record["label"]) == 1 and bool(record.get("hit25", False)))
+        for record in records
+    ], dtype=np.int8)
+    correct = scores[labels == 1]
+    errors = scores[labels == 0]
+    correct_stats = _compact_score_stats(correct)
+    error_stats = _compact_score_stats(errors)
+    prob_sd = np.sqrt((correct.var() + errors.var()) / 2.0) if correct.size and errors.size else 0.0
+    correct_logits = np.log(np.clip(correct, 1e-7, 1 - 1e-7) /
+                            (1 - np.clip(correct, 1e-7, 1 - 1e-7)))
+    error_logits = np.log(np.clip(errors, 1e-7, 1 - 1e-7) /
+                          (1 - np.clip(errors, 1e-7, 1 - 1e-7)))
+    logit_sd = (np.sqrt((correct_logits.var() + error_logits.var()) / 2.0)
+                if correct.size and errors.size else 0.0)
+    probability_gap = (float(correct.mean() - errors.mean()) if correct.size and errors.size else None)
+    logit_gap = (float(correct_logits.mean() - error_logits.mean())
+                 if correct.size and errors.size else None)
+    return {
+        "definition": "correct := label=1 and Top-1 IoU>=0.25; all other records := error",
+        "n": int(scores.size), "n_correct": int(correct.size), "n_error": int(errors.size),
+        "correct_rate": float(correct.size / max(scores.size, 1)),
+        "auroc": _binary_auc(scores, labels),
+        "auprc": _average_precision(scores, labels),
+        "at_tpr90": _operating_point(scores, labels, 0.90),
+        "at_tpr95": _operating_point(scores, labels, 0.95),
+        "correct_score": correct_stats,
+        "error_score": error_stats,
+        "score_gap": probability_gap,
+        "logit_gap": logit_gap,
+        "cohen_d": (float(probability_gap / prob_sd) if probability_gap is not None and prob_sd > 0 else None),
+        "logit_cohen_d": (float(logit_gap / logit_sd) if logit_gap is not None and logit_sd > 0 else None),
+        "pair": _pair_metrics(records),
+        "calibration": _calibration(scores, labels, bins=15),
+    }
+
+
+def _presence_gate_metrics(records: List[Dict[str, Any]], threshold: Optional[float]) -> Optional[Dict[str, Any]]:
+    selected = [record for record in records if record.get("presence_prob") is not None]
+    if not selected:
+        return None
+    scores = np.asarray([float(record["presence_prob"]) for record in selected], dtype=np.float64)
+    labels = np.asarray([int(record["label"]) for record in selected], dtype=np.int8)
+    out: Dict[str, Any] = {
+        "definition": "positive := target class is present in the view",
+        "n": int(scores.size), "n_pos": int((labels == 1).sum()), "n_neg": int((labels == 0).sum()),
+        "auroc": _binary_auc(scores, labels), "auprc": _average_precision(scores, labels),
+        "positive_score": _compact_score_stats(scores[labels == 1]),
+        "negative_score": _compact_score_stats(scores[labels == 0]),
+        "threshold": threshold,
+    }
+    if threshold is not None:
+        closed = scores < float(threshold)
+        pos = labels == 1
+        neg = labels == 0
+        out["at_threshold"] = {
+            "recall_open": float((~closed[pos]).mean()) if bool(pos.any()) else None,
+            "false_close": float(closed[pos].mean()) if bool(pos.any()) else None,
+            "intercept": float(closed[neg].mean()) if bool(neg.any()) else None,
+            "target_absent_fpr": float((~closed[neg]).mean()) if bool(neg.any()) else None,
+            "n_false_close": int((closed & pos).sum()),
+            "n_intercept": int((closed & neg).sum()),
+        }
+    return out
+
+
+def _f4(value: Optional[float]) -> str:
+    return "-" if value is None else f"{float(value):.4f}"
+
+
 # run：单权重全量遍历
-# ----------------------------------------------------------------------
 def run(args: argparse.Namespace) -> int:
     import torch
     from vlfm.vlm.tsp3d import TSP3D
@@ -178,8 +386,6 @@ def run(args: argparse.Namespace) -> int:
 
     cfg = LoaderConfig(
         split=args.split,
-        use_sidecar=False,                  # 判读不需要教师信号
-        inst_dir="/nonexistent__e3_skip",   # 绕过可见实体计算（E3 不消费）
         cache_scenes=3,
         limit_views=int(args.views_cap),
         scenes=args.scenes,
@@ -191,9 +397,15 @@ def run(args: argparse.Namespace) -> int:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"[E3] loading ckpt: {ckpt}")
     model = TSP3D(weights_path=ckpt, device=device)
+    gate_enabled = bool(model.ft_config.get("enable_gate", False))
+    effective_gate_threshold = args.gate_threshold
+    if gate_enabled and effective_gate_threshold is None:
+        effective_gate_threshold = float(model.ft_config.get("gate_threshold", 0.30))
+    print(f"[E3] gate: enabled={gate_enabled} threshold={effective_gate_threshold}")
 
     pos, neg = _new_pos(), _new_neg()
     per_class: Dict[str, Dict[str, Any]] = {}
+    records: List[Dict[str, Any]] = []
     jsonl_path = out_dir / f"{args.tag}_per_record.jsonl"
     jsonl = jsonl_path.open("w")
     t0 = time.time()
@@ -217,6 +429,7 @@ def run(args: argparse.Namespace) -> int:
                         sigma_tar=0.0,          # 全量输出（判读核心）
                         tau=TAU,
                         use_vlfm_nlp=False,
+                        gate_threshold=args.gate_threshold,
                     )
                 except Exception as exc:  # noqa: BLE001
                     failures += 1
@@ -235,6 +448,9 @@ def run(args: argparse.Namespace) -> int:
                     "has_box": has_box, "pruned_all": pruned_all,
                     "score": (round(score, 5) if score is not None else None),
                 }
+                presence_prob = diag.get("presence_prob")
+                if presence_prob is not None:
+                    rec["presence_prob"] = round(float(presence_prob), 6)
                 if int(r["label"]) == 1 and r["gt"] is not None:
                     if has_box:
                         a = aabb_from_corners(np.asarray(dets[0]["box_3d"], dtype=np.float64))
@@ -275,6 +491,7 @@ def run(args: argparse.Namespace) -> int:
                     pc["neg"]["has_box"] += int(has_box)
                     if score is not None:
                         pc["neg"]["scores"].append(score)
+                records.append(rec)
                 jsonl.write(json.dumps(rec) + "\n")
                 call_idx += 1
             views_done += 1
@@ -288,9 +505,12 @@ def run(args: argparse.Namespace) -> int:
         jsonl.close()
 
     wall = time.time() - t0
+    discrimination = _discrimination_metrics(records)
+    presence_gate = _presence_gate_metrics(records, effective_gate_threshold)
     summary = {
         "tag": args.tag, "ckpt": ckpt, "split": args.split,
         "sigma_tar": 0.0, "sigma_sce": SIGMA_SCE, "tau": TAU,
+        "gate_enabled": gate_enabled, "gate_threshold": effective_gate_threshold,
         "neg_per_view": int(args.neg_per_view), "views": views_done,
         "n_pos": pos["n"], "n_neg": neg["n"], "n_calls": call_idx,
         "failures": failures, "wall_sec": round(wall, 1),
@@ -300,6 +520,8 @@ def run(args: argparse.Namespace) -> int:
             cls: {"pos": _finalize_pos(v["pos"]), "neg": _finalize_neg(v["neg"])}
             for cls, v in sorted(per_class.items())
         },
+        "discrimination": discrimination,
+        "presence_gate": presence_gate,
         "jsonl": str(jsonl_path),
     }
     sum_path = out_dir / f"{args.tag}_summary.json"
@@ -325,6 +547,25 @@ def run(args: argparse.Namespace) -> int:
         s = n["score"]
         print(f"  NEG  has_box={n['has_box_pct']}%  score mean={s['mean']}  "
               f"median={s['median']}  ge0.70={s['ge070_pct']}%")
+    disc = summary["discrimination"]
+    r90, r95 = disc["at_tpr90"], disc["at_tpr95"]
+    print(f"  DISC auroc={_f4(disc['auroc'])}  auprc={_f4(disc['auprc'])}  "
+          f"pair_acc={_f4(disc['pair']['accuracy'])}  gap={_f4(disc['score_gap'])}")
+    print(f"  SHAPE cohen_d={_f4(disc['cohen_d'])}  logit_gap={_f4(disc['logit_gap'])}  "
+          f"logit_cohen_d={_f4(disc['logit_cohen_d'])}  "
+          f"view_violation={_f4(disc['pair']['violation_rate'])}  "
+          f"violation_gap={_f4(disc['pair']['violation_gap_mean'])}")
+    print(f"  HIGH-RECALL fpr@tpr90={_f4(r90.get('fpr'))}  precision@r90={_f4(r90.get('precision'))}  "
+          f"fpr@tpr95={_f4(r95.get('fpr'))}  precision@r95={_f4(r95.get('precision'))}")
+    calibration = disc["calibration"]
+    print(f"  CAL ece15={_f4(calibration.get('ece'))}  brier={_f4(calibration.get('brier'))}  "
+          f"nll={_f4(calibration.get('nll'))}")
+    gate_metrics = summary.get("presence_gate")
+    if gate_metrics is not None:
+        at_gate = gate_metrics.get("at_threshold", {})
+        print(f"  GATE auroc={_f4(gate_metrics['auroc'])}  auprc={_f4(gate_metrics['auprc'])}  "
+              f"threshold={gate_metrics.get('threshold')}  "
+              f"recall_open={at_gate.get('recall_open')}  intercept={at_gate.get('intercept')}")
     print("  per-class(pos): " + "  ".join(
         f"{cls}[n={v['pos']['n']} hit={v['pos']['hit025_pct']}%]"
         for cls, v in summary["per_class"].items() if v["pos"]["n"] > 0))
@@ -334,9 +575,7 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----------------------------------------------------------------------
 # compare：两份 summary 对比
-# ----------------------------------------------------------------------
 def _fmt(v: Optional[float], suffix: str = "%") -> str:
     return f"{v}{suffix}" if v is not None else "-"
 
@@ -379,6 +618,46 @@ def compare(path_a: str, path_b: str) -> int:
           f"{_num_delta(na['score'].get('mean'), nb['score'].get('mean')):>14}")
     print(f"{'neg score ge0.70 %':<34}{_fmt(na['score'].get('ge070_pct')):>12}{_fmt(nb['score'].get('ge070_pct')):>12}"
           f"{d(na['score'].get('ge070_pct', 0.0), nb['score'].get('ge070_pct', 0.0)):>14}")
+    da, db = a.get("discrimination"), b.get("discrimination")
+    if da and db:
+        metric_rows = [
+            ("AUROC", da.get("auroc"), db.get("auroc")),
+            ("AUPRC", da.get("auprc"), db.get("auprc")),
+            ("FPR@TPR90", da.get("at_tpr90", {}).get("fpr"), db.get("at_tpr90", {}).get("fpr")),
+            ("FPR@TPR95", da.get("at_tpr95", {}).get("fpr"), db.get("at_tpr95", {}).get("fpr")),
+            ("Precision@R90", da.get("at_tpr90", {}).get("precision"), db.get("at_tpr90", {}).get("precision")),
+            ("Precision@R95", da.get("at_tpr95", {}).get("precision"), db.get("at_tpr95", {}).get("precision")),
+            ("pair accuracy", da.get("pair", {}).get("accuracy"), db.get("pair", {}).get("accuracy")),
+            ("view violation rate", da.get("pair", {}).get("violation_rate"),
+             db.get("pair", {}).get("violation_rate")),
+            ("violation gap mean", da.get("pair", {}).get("violation_gap_mean"),
+             db.get("pair", {}).get("violation_gap_mean")),
+            ("score gap", da.get("score_gap"), db.get("score_gap")),
+            ("logit gap", da.get("logit_gap"), db.get("logit_gap")),
+            ("Cohen's d", da.get("cohen_d"), db.get("cohen_d")),
+            ("logit Cohen's d", da.get("logit_cohen_d"), db.get("logit_cohen_d")),
+            ("ECE-15", da.get("calibration", {}).get("ece"), db.get("calibration", {}).get("ece")),
+            ("Brier", da.get("calibration", {}).get("brier"), db.get("calibration", {}).get("brier")),
+            ("NLL", da.get("calibration", {}).get("nll"), db.get("calibration", {}).get("nll")),
+        ]
+        print("-" * 78)
+        for name, value_a, value_b in metric_rows:
+            print(f"{name:<34}{_f4(value_a):>12}{_f4(value_b):>12}"
+                  f"{_num_delta(value_a, value_b):>14}")
+    ga, gb = a.get("presence_gate"), b.get("presence_gate")
+    if ga or gb:
+        print("-" * 78)
+        gate_rows = [
+            ("Gate AUROC", (ga or {}).get("auroc"), (gb or {}).get("auroc")),
+            ("Gate AUPRC", (ga or {}).get("auprc"), (gb or {}).get("auprc")),
+            ("Gate recall_open", (ga or {}).get("at_threshold", {}).get("recall_open"),
+             (gb or {}).get("at_threshold", {}).get("recall_open")),
+            ("Gate intercept", (ga or {}).get("at_threshold", {}).get("intercept"),
+             (gb or {}).get("at_threshold", {}).get("intercept")),
+        ]
+        for name, value_a, value_b in gate_rows:
+            print(f"{name:<34}{_f4(value_a):>12}{_f4(value_b):>12}"
+                  f"{_num_delta(value_a, value_b):>14}")
     print("-" * 78)
     print("per-class pos (hit@0.25 % | n):")
     classes = sorted(set(a["per_class"]) | set(b["per_class"]))
@@ -410,7 +689,6 @@ def _num_delta(x: Optional[float], y: Optional[float]) -> str:
     return f"{x - y:+.4f}"
 
 
-# ----------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="E3 离线判读（在线同源推理，全量输出）")
     ap.add_argument("--ckpt", type=str, default="", help="权重路径（run 模式）")
@@ -421,6 +699,8 @@ def main() -> int:
     ap.add_argument("--views-cap", type=int, default=0)
     ap.add_argument("--scenes", type=str, default="")
     ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--gate-threshold", type=float, default=None,
+                    help="显式 Presence Gate 门槛；省略时使用 checkpoint/default 配置")
     ap.add_argument("--compare", nargs=2, default=None, metavar=("A.json", "B.json"),
                     help="对比两份 summary（不跑模型）")
     args = ap.parse_args()

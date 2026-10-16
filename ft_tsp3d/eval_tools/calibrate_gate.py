@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""τ_gate 训练后校准（§8 · 2 / §11.3 #2）。
+"""τ_gate 训练后校准。
 
-输入：`pipeline.py --dump-gate` 的产物 npz（`p_exist` / `y` / `weight` / `scene` / `view`；
-`y` = record 的 `label`，即「查询类在本视图任一实例像素 ≥ min_vis_px(40)」）。
+输入：`pipeline.py --dump-gate` 的产物 npz
+（`p_exist` / `y` / `weight` / `scene` / `view`；
+  `y` = record 的 `label`，即「查询类在本视图任一实例像素 ≥ min_vis_px(40)」）。
 
-方法（保召回约束，§9 门控=召回守卫）：
-  * 门控短路条件 = `P_exist ≤ τ` ⇒ 开闸 = `P_exist > τ`；
-  * 在「召回 ≥ r_target」约束下取 **最大 τ**（实质 = 正样本分布的低分位，取
-    `τ* = quantile(P | y=1, 1 − r_target)` 并回校 FN 数）；
+方法：
+  * 门控短路条件 = `P_exist < τ` ⇒ 开闸 = `P_exist ≥ τ`；
+  * 在「召回 ≥ r_target」约束下取 **最大 τ**
+  （实质 = 正样本分布的低分位，取 τ* = quantile(P | y=1, 1 − r_target)` 并回校 FN 数）；
   * 输出 τ 扫描表（拦截率 / 召回 / 误关率）+ 建议 τ + AUC，供人工裁决与在线部署。
 
-判定口径提醒：门控 FN（真目标被门掉）不可恢复，优先保召回；本阶段判定指标 =
-假阳性早停拦截率 / 门控召回（GT 存在视图开闸率）/ 误关率 + SR（非 Gap）。
+判定口径提醒：门控 FN（真目标被门掉）不可恢复，优先保召回；
+本阶段判定指标 = 假阳性早停拦截率 / 门控召回（GT 存在视图开闸率）/ 误关率 + SR（非 Gap）。
 
 用法：
 ```
-python ft_tsp3d/calibrate_gate.py --dump ft_runs/m4/gate_val.npz
-python ft_tsp3d/calibrate_gate.py --dump ... --tau 0.30        # 只报该 τ 的指标
+python ft_tsp3d/eval_tools/calibrate_gate.py --dump ft_runs/m4/gate_val.npz
+python ft_tsp3d/eval_tools/calibrate_gate.py --dump ... --tau 0.30        # 只报该 τ 的指标
 ```
 """
 from __future__ import annotations
@@ -57,9 +58,20 @@ def auc_score(p: np.ndarray, y: np.ndarray) -> Optional[float]:
     return float((ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
 
+def average_precision(p: np.ndarray, y: np.ndarray) -> Optional[float]:
+    """按 score 降序计算非插值 AP；无正样本时返回 None。"""
+    n_pos = int((y == 1).sum())
+    if n_pos == 0:
+        return None
+    order = np.argsort(-p, kind="mergesort")
+    ranked = (y[order] == 1).astype(np.float64)
+    precision = np.cumsum(ranked) / np.arange(1, ranked.size + 1, dtype=np.float64)
+    return float((precision * ranked).sum() / n_pos)
+
+
 def gate_metrics(p: np.ndarray, y: np.ndarray, tau: float, weight: Optional[np.ndarray] = None) -> Dict:
     """给定 τ 的门控三指标：拦截率（y=0 被门掉）/ 召回（y=1 开闸）/ 误关率（y=1 被门掉）。"""
-    short = p <= float(tau)
+    short = p < float(tau)
     out: Dict[str, object] = {"tau": float(tau), "n": int(p.size)}
     if (y == 1).any():
         out["recall_open"] = float((~short[y == 1]).mean())        # 门控召回（开闸率）
@@ -67,6 +79,7 @@ def gate_metrics(p: np.ndarray, y: np.ndarray, tau: float, weight: Optional[np.n
         out["n_fn"] = int((short & (y == 1)).sum())
     if (y == 0).any():
         out["intercept"] = float(short[y == 0].mean())             # 假阳性早停拦截率（离线口径）
+        out["target_absent_fpr"] = float((~short[y == 0]).mean())
         out["n_pass"] = int((~short & (y == 0)).sum())
     if weight is not None and weight.size == p.size and (y == 0).any():
         w = weight.astype(np.float64)
@@ -74,20 +87,21 @@ def gate_metrics(p: np.ndarray, y: np.ndarray, tau: float, weight: Optional[np.n
     return out
 
 
-def recommend_tau(p: np.ndarray, y: np.ndarray, target_recall: float = 0.995) -> Dict:
-    """保召回约束下的最大 τ（正样本低分位 + FN 回校）。"""
-    pos = np.sort(p[y == 1])
+def recommend_tau(p: np.ndarray, y: np.ndarray, target_recall: float = 0.99) -> Dict:
+    """在严格 `< τ` veto 契约下，穷举离散边界取满足召回约束的最大 τ。"""
+    pos = np.asarray(p[y == 1], dtype=np.float64)
     if pos.size == 0:
         return {"tau": None, "reason": "no_positive_samples"}
-    k = int(math.floor((1.0 - float(target_recall)) * pos.size))  # 允许的 FN 数
-    tau = float(pos[min(k, pos.size - 1)])
-    # 回校：开闸数（pos > tau）须 ≥ target_recall·n（把 τ 往下压到满足）
-    while tau > 0.0 and float((pos > tau).mean()) < target_recall:
-        tau = float(np.nextafter(tau, 0.0))
-        if tau <= 0.0:
-            break
+    if not 0.0 < float(target_recall) <= 1.0:
+        raise ValueError("target_recall must be in (0, 1]")
+    allowed = int(math.floor((1.0 - float(target_recall)) * pos.size + 1e-12))
+    candidates = [float(v) for v in np.unique(pos)]
+    candidates += [float(np.nextafter(v, np.inf)) for v in np.unique(pos)]
+    feasible = [t for t in candidates if int((pos < t).sum()) <= allowed]
+    tau = max(feasible) if feasible else float(pos.min())
     return {"tau": tau, "target_recall": float(target_recall),
-            "recall_open": float((pos > tau).mean()), "n_fn_allowed": k}
+            "recall_open": float((pos >= tau).mean()),
+            "n_fn": int((pos < tau).sum()), "n_fn_allowed": allowed}
 
 
 def scan_table(p: np.ndarray, y: np.ndarray, n: int = 25) -> List[Dict]:
@@ -99,7 +113,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dump", required=True, help="pipeline --dump-gate 产物 npz")
     ap.add_argument("--tau", type=float, default=None, help="给定 τ 时只报该值指标")
-    ap.add_argument("--target-recall", type=float, default=0.995)
+    ap.add_argument("--target-recall", type=float, default=0.99)
     ap.add_argument("--table", type=int, default=25, help="扫描表点数（0 = 不打印）")
     ap.add_argument("--out", default=None, help="报告落盘 json")
     args = ap.parse_args()
@@ -114,7 +128,8 @@ def main() -> None:
     report: Dict = {
         "dump": str(args.dump), "n": int(p.size),
         "n_pos": int((y == 1).sum()), "n_neg": int((y == 0).sum()),
-        "auc": auc_score(p, y),
+        "auroc": auc_score(p, y),
+        "auprc": average_precision(p, y),
         "pos_stats": {"p50": float(np.median(p[y == 1])) if (y == 1).any() else None,
                       "p05": float(np.percentile(p[y == 1], 5)) if (y == 1).any() else None,
                       "p95": float(np.percentile(p[y == 1], 95)) if (y == 1).any() else None},

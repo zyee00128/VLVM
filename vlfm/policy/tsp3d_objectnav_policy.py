@@ -84,7 +84,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             occ_threshold: float = 0.0,
             free_threshold: float = 0.0,
             sigma_sce: float = 0.15,
-            sigma_tar: float = 0.70,
+            sigma_tar: float = 0.60,
             tau: float = 0.15,
             near_field_dist: float = 1.0,
             near_field_sigma_scale: float = 0.8,
@@ -1353,7 +1353,7 @@ class VLVMConfig:
     query_z_max: float = 1.50         # Upper bound of the fixed query height band (m)
 
     # Phase 5a: TSP3D Perception & Visual Grounding
-    sigma_tar: float = 0.70             # Target confidence threshold (admission); higher = stricter/fewer detections, lower = more detections but more false positives.
+    sigma_tar: float = 0.60             # VLVM V1 fixed target-confidence threshold for S-penalty optimization.
     sigma_sce: float = 0.15             # TGP scene voxel retention threshold; higher = more aggressive pruning (fewer hallucinations, may miss targets).
     tau: float = 0.15                   # Soft-pruning temperature; higher = smoother/looser pruning, lower = harder thresholding.
     near_field_dist: float = 1.0        # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.

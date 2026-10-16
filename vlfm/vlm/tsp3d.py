@@ -18,6 +18,9 @@ from vlfm.tsp3d_models.bdetr import BeaUTyDETR
 PROMPT_SEPARATOR = "|"
 # 权重/配置目录默认 <repo>/data/tsp3d_models。
 TSP3D_DATA_DIR = str(Path(__file__).resolve().parents[2] / "data" / "tsp3d_models")
+VLVM_V1_CHECKPOINT = str(
+    Path(__file__).resolve().parents[2] / "data" / "vlvm_v1" / "vlvm_v1.pth"
+)
 
 
 def _default_checkpoint(data_dir: str) -> str:
@@ -29,12 +32,14 @@ def _default_checkpoint(data_dir: str) -> str:
         if os.path.exists(candidate):
             return candidate
     return os.path.join(data_dir, "tsp3d_scanrefer.pth")
-TSP3D_DEFAULT_CHECKPOINT = os.environ.get("TSP3D_CHECKPOINT") or _default_checkpoint(
-    os.environ.get("TSP3D_DATA_PATH", TSP3D_DATA_DIR)
+TSP3D_DEFAULT_CHECKPOINT = (
+    os.environ.get("TSP3D_CHECKPOINT")
+    or (VLVM_V1_CHECKPOINT if os.path.exists(VLVM_V1_CHECKPOINT) else None)
+    or _default_checkpoint(os.environ.get("TSP3D_DATA_PATH", TSP3D_DATA_DIR))
 )
 
 
-def _load_tsp3d_checkpoint(path: str) -> Any:
+def _load_tsp3d_checkpoint(path: str, map_location: Any = "cpu") -> Any:
     """
     Load a checkpoint on CPU, with torch 2.6 compatibility.
 
@@ -44,9 +49,9 @@ def _load_tsp3d_checkpoint(path: str) -> Any:
     large transient memory spike.
     """
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
-        return torch.load(path, map_location="cpu")
+        return torch.load(path, map_location=map_location)
 
 
 def _checkpoint_state_dict(checkpoint: Any) -> Dict[str, Any]:
@@ -299,7 +304,7 @@ class TSP3D:
                     else:
                         conf = float(scores_np[i])
                     if conf >= float(sigma_tar):
-                        # ``scores_3d`` is already the settled confidence P_exist * s_k from BeaUTyDETR.
+                        # Gate is veto-only: a surviving ``scores_3d`` remains the core raw score.
                         # Keep the presence probability alongside each candidate for calibration.
                         candidates.append({
                             "box_3d": box.tolist(),
