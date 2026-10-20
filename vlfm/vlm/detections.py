@@ -278,6 +278,20 @@ class ObjectDetections:
     def filter_by_class(self, classes: List[str], use_vlfm_nlp: bool = True) -> "ObjectDetections":
         """
         Filters detections in-place to keep only specified classes.
+
+        VLFM: ``keep = [p in classes for p in self.phrases]`` —— 严格等值、区分大小写、不支持组合短语。
+        VLVM: 放宽，只保留"名称相关"的检测。
+          目标 ``chair`` 会保留 ``armchair``，``tv`` 会保留 ``tv stand``，``bed`` 会保留 ``bedroom``；
+          代价是名称包含关系带来的误保留。过滤动作本身（``keep`` -> ``_filter`` -> 
+          就地裁剪 ``boxes``/``logits``/``phrases``）与原版完全相同。
+
+        ``use_vlfm_nlp = False``: 只取首段（primary class）参与匹配，该分支在当前在线链路里 **不会生效**。
+          policy 的 ``phrases`` 与 ``target_classes`` 同源（``objectgoal`` -> 单个规范类名），
+          首段必然属于 ``target_classes``，收窄条件恒不成立。
+
+        * 微调侧（``ft_tsp3d``）没有本环节：训练样本的 ``query`` 本身就是规范类名；
+          ``use_vlfm_nlp=False`` 时在线送入 TSP3D 的文本同样是单类、无 ``" ."`` 后缀，与训练一致。
+          若置 ``True``，在线文本会变成 ``"chair ."``，与训练分布不一致。
         """
         if len(self.phrases) == 0:
             return self
@@ -319,13 +333,14 @@ class ObjectDetections:
 
     def filter_by_mask(self, keep) -> "ObjectDetections":
         """
-        In-place filter with an explicit boolean mask (e.g. geometric admission gate).
+        In-place filter with an explicit boolean mask (occupancy geometric admission gate).
 
         Args:
             keep: bool mask (numpy / torch) of length == num_detections.
         """
         if len(self.logits) == 0:
             return self
+        
         if not torch.is_tensor(keep):
             keep = torch.as_tensor(np.asarray(keep, dtype=bool))
         keep = keep.to(device=self.logits.device)

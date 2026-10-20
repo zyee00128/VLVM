@@ -2,14 +2,15 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
+from vlfm.s_penalty_constants import S_MIN, S_QUERY_RADIUS_M
+
+
 @dataclass
 class SPenaltyConfig:
-    """S-penalty hyper-parameters."""
+    """Runtime S-penalty settings; only ``thresh`` is searched in P1."""
 
     enable: bool = True
-    thresh: float = 0.15    # S below this -> penalty (ITM raw cosine scale ~0.10-0.15)
-    floor: float = 0.3      # w_S lower bound (keeps recall for borderline true targets)
-    radius_m: float = 0.5   # S query radius (m) around the detection point
+    thresh: float = 0.15
     uncovered_w: float = 1.0  # weight when there is NO semantic coverage (S=None/<=0);
                               # 1.0 = free pass (A1 default), <1.0 = mild penalty for
                               # detections the value map cannot corroborate at all.
@@ -42,6 +43,19 @@ def near_surface_point(box_corners: np.ndarray, camera_pos: np.ndarray) -> Optio
     return corners[idx].mean(axis=0)
 
 
+def query_point_distance(s_pt: Any, robot_xyz: np.ndarray) -> Optional[float]:
+    """Distance from the robot to the S query point for SP1 stratification."""
+    try:
+        point = np.asarray(s_pt, dtype=np.float64).reshape(-1)
+        robot = np.asarray(robot_xyz, dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+    dims = int(min(point.size, robot.size, 3))
+    if dims < 2:
+        return None
+    return float(np.linalg.norm(point[:dims] - robot[:dims]))
+
+
 def compute_w_s(s: Optional[float], cfg: SPenaltyConfig) -> Tuple[float, Optional[float]]:
     """
     Map a semantic-field value S to a penalty weight w_S
@@ -53,9 +67,9 @@ def compute_w_s(s: Optional[float], cfg: SPenaltyConfig) -> Tuple[float, Optiona
     
     if s is None or s <= 0.0:
         return float(cfg.uncovered_w), None
-    if s >= cfg.thresh:
-        return 1.0, s
-    return max(cfg.floor, s / max(cfg.thresh, 1e-6)), s
+    s_f = float(s)
+    w_s = min(1.0, max(s_f, S_MIN) / max(float(cfg.thresh), 1e-6))
+    return float(w_s), s_f
 
 
 def apply_s_penalty(
@@ -65,35 +79,34 @@ def apply_s_penalty(
     query_semantic: Callable[[float, float, Optional[float]], Optional[float]],
     cfg: SPenaltyConfig,
     sigma_tar: float,
+    sigma_prop: Optional[float],
     use_surface: bool,
     goal_use_surface: bool,
     nlp_mode: bool,
     out_log: Optional[List[Dict[str, Any]]] = None,
     per_det_meta: Optional[List[Any]] = None,
     meta_out: Optional[List[Any]] = None,
-    conflict_gate: bool = True,
-    conflict_conf_hi: float = 0.80,
+    step: Optional[int] = None,
+    candidate_records: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Tuple[float, np.ndarray, Optional[np.ndarray], List[str]]]:
     """
     S-penalty + admission gate for filtered detections.
 
     Returns [(conf_amp, centroid, near_surface, active_classes)].
 
-    If ``out_log`` is given, one dict per detection is appended for 
-    detection-level diagnostics: {conf, conf_amp, centroid, s, admitted}.
+    If ``out_log`` is given, one SP1 record per detection is appended for both
+    admitted and rejected detections. The record preserves raw c/S inputs, the
+    exact S branch, query point and distance, and the admission decision.
 
     ``per_det_meta`` is copied item-by-item into ``meta_out`` for each ADMITTED detection.
-
-    Conflict gate: with ``conflict_gate=True``, 
-    detections satisfying "conf ≥ conflict_conf_hi ∧ 0 < S < cfg.thresh" 
-    are rejected outright at the write entry 
-    (even if conf·w_S already reaches the admission line).
     """
     import torch  # local import keeps the module torch-free at import time
 
     pending = []
     if per_det_meta is not None:
         assert len(per_det_meta) == len(detections.boxes), "per_det_meta length mismatch"
+    if candidate_records is not None:
+        assert len(candidate_records) == len(detections.boxes), "candidate_records length mismatch"
     for k, (centroid, conf, box) in enumerate(
         zip(detections.centroids, detections.logits, detections.boxes)
     ):
@@ -106,33 +119,65 @@ def apply_s_penalty(
 
         # query S at the bbox near-surface point (facing the camera).
         s_pt = centroid_np
+        s_pt_source = "centroid"
         if use_surface and box_np is not None:
-            s_pt = near_surface_point(box_np, robot_xyz)
-            if s_pt is None:
-                s_pt = centroid_np
-        s = query_semantic(s_pt[0], s_pt[1], cfg.radius_m)
+            near_pt = near_surface_point(box_np, robot_xyz)
+            if near_pt is not None:
+                s_pt = near_pt
+                s_pt_source = "surface"
+        s = query_semantic(s_pt[0], s_pt[1], S_QUERY_RADIUS_M)
         w_s, _ = compute_w_s(s, cfg)
         conf_amp = conf_f * w_s
         admitted = conf_amp >= sigma_tar
         reject_reason = None if admitted else (
             "uncovered" if (s is None or float(s) <= 0.0) else "low_conf"
         )
-        # Conflict gate
-        if admitted and conflict_gate and cfg.enable and s is not None and float(s) > 0.0:
-            if float(conf_f) >= float(conflict_conf_hi) and float(s) < float(cfg.thresh):
-                admitted = False
-                reject_reason = "conflict"
         if out_log is not None:
-            out_log.append(
-                {
+            if s is None or float(s) <= 0.0:
+                branch = "uncovered"
+            elif float(s) >= float(cfg.thresh):
+                branch = "covered-high"
+            else:
+                branch = "covered-low"
+            candidate_id = None
+            if per_det_meta is not None and isinstance(per_det_meta[k], dict):
+                candidate_id = per_det_meta[k].get("candidate_id")
+            log_record = {
+                    "candidate_id": candidate_id,
+                    "step": None if step is None else int(step),
                     "conf": conf_f,
+                    "pass_prop_045": bool(conf_f >= 0.45),
+                    "pass_prop_050": bool(conf_f >= 0.50),
+                    "pass_prop_055": bool(conf_f >= 0.55),
+                    "pass_prop_060": bool(conf_f >= 0.60),
+                    # Keep the service return floor and the policy admission
+                    # line explicit.  Phase-G can request a wider proposal
+                    # pool without allowing sub-admission candidates into
+                    # memory/navigation.
+                    "sigma_prop_floor": float(
+                        sigma_tar if sigma_prop is None else sigma_prop
+                    ),
+                    "sigma_tar_admit": float(sigma_tar),
                     "conf_amp": conf_amp,
                     "centroid": centroid_np,
                     "s": s,
+                    "s_pt": np.asarray(s_pt, dtype=np.float64).reshape(-1)[:3].tolist(),
+                    "s_pt_source": s_pt_source,
+                    "w_s": float(w_s),
+                    "branch": branch,
+                    "dist": query_point_distance(s_pt, robot_xyz),
                     "admitted": bool(admitted),
                     "reject": reject_reason,
+                    "use_surface": bool(use_surface),
+                    "s_enabled": bool(cfg.enable),
+                    "radius_m": S_QUERY_RADIUS_M,
+                    "thresh": float(cfg.thresh),
+                    "s_min": S_MIN,
+                    "derived_min_w": min(1.0, S_MIN / max(float(cfg.thresh), 1e-6)),
                 }
-            )
+            out_log.append(log_record)
+            if candidate_records is not None:
+                candidate_records[k].update(log_record)
         if not admitted:
             continue  # gate: reject
         # near-surface point stored for the nav goal (first-write fixed).

@@ -321,7 +321,7 @@ class TSP3D:
                 print("[TSP3D Server] NMS returned empty (no box passed score_thr)")
         else:
             print(f"[TSP3D Server] bbox_results empty (all voxels likely pruned)! sigma_sce={sigma_sce}, text='{processed_text}'")
-                        
+
         diagnostics["num_returned"] = len(formatted_detections)
         diagnostics["top1"] = return_top1
         return formatted_detections, diagnostics

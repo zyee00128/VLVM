@@ -127,7 +127,6 @@ def _act_panoramic(
         action = self._explore(observations)
     else:
         mode = "navigate"
-        print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
         pcd_local = pp.raw_frame(pcd, robot_xyz, robot_yaw, self._camera_height)
         det = self._query_and_process(
             pcd_local, robot_xyz, robot_yaw, pcd, rgb, tf, max_depth, fx, fy,
@@ -320,7 +319,6 @@ def _act_world_scan(
         action = self._explore(observations)
     else:
         mode = "navigate"
-        print(f"[TSP3D Mode] Target '{self._target_object}' located at {goal_3d}. Navigating.")
         self._last_lock_step = self._num_steps  # opportunistic trigger: reset on a nav-goal lock
         pp.update(pcd, robot_xyz, robot_yaw)
         pcd_local = pp.prepare(robot_xyz, robot_yaw, camera_height=self._camera_height)
@@ -347,12 +345,8 @@ def _after_scan_action(
     pending = getattr(self, "_last_pending", None) or []
     if pending:
         best = max(pending, key=lambda p: float(p[0]))  # highest c'
-        conf_amp, centroid, near_surface, _ = best
+        _, centroid, near_surface, _ = best
         goal = near_surface if near_surface is not None else centroid
-        print(
-            f"[ScanEnd] best c'={conf_amp:.3f} goal={np.round(np.asarray(goal)[:2], 2)} "
-            "-> moving to target"
-        )
         return self._pointnav(np.asarray(goal)[:2], stop=False)
     return self._explore(observations)
 

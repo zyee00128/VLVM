@@ -110,7 +110,7 @@ echo ">>> 场景集   : $(echo $SCENE_LIST | wc -w) 个场景"
 for _s in $SCENE_LIST; do echo "      - $_s"; done
 echo ">>> 模型标识 : $MODEL_TAG"
 echo ">>> 模型权重 : $MODEL_CKPT"
-echo ">>> 实验条件 : enable_s_penalty=False + sx_conflict_gate=False + gdp_enable=False"
+echo ">>> 实验条件 : enable_s_penalty=False + gdp_enable=False"
 echo ">>> 保持开启 : BLIP2-ITM 语义场检测 + enable_occ_consistency=True"
 echo ">>> 保持不变 : memory-life 与其余定稿机制"
 echo ">>> 失败重试 : 每个 sigma×场景最多 $MAX_SCENE_ATTEMPTS 次，重试前重启服务"
@@ -431,7 +431,6 @@ run_one() {
         habitat_baselines.rl.policy.name="HabitatITMPolicyV1"
         habitat_baselines.rl.policy.sigma_tar="$sigma"
         habitat_baselines.rl.policy.enable_s_penalty=False
-        habitat_baselines.rl.policy.sx_conflict_gate=False
         habitat_baselines.rl.policy.enable_occ_consistency=True
         habitat_baselines.rl.policy.gdp_enable=False
         habitat.dataset.content_scenes="[$scene]"

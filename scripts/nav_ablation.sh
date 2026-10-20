@@ -118,11 +118,9 @@ BASE="$BASE habitat_baselines.rl.policy.wm_min_view_yaw=15.0"
 BASE="$BASE habitat_baselines.rl.policy.enable_s_penalty=True"
 BASE="$BASE habitat_baselines.rl.policy.sigma_tar=0.60"
 BASE="$BASE habitat_baselines.rl.policy.s_penalty_thresh=0.15"
-BASE="$BASE habitat_baselines.rl.policy.s_penalty_floor=0.3"
 BASE="$BASE habitat_baselines.rl.policy.s_penalty_uncovered_w=1.0"
 BASE="$BASE habitat_baselines.rl.policy.s_penalty_use_surface=True"
 BASE="$BASE habitat_baselines.rl.policy.goal_use_surface=True"
-BASE="$BASE habitat_baselines.rl.policy.sx_conflict_gate=True"
 # occ geometry
 BASE="$BASE habitat_baselines.rl.policy.enable_occ_consistency=True"
 # memory-life（含 EMA；lock_exempt_identity 定稿开）
@@ -145,7 +143,7 @@ mk_delta() {
     case "$1" in
         # ---- 大档：五模块各一（默认队列） ----
         no_memlife) echo "habitat_baselines.rl.policy.enable_fb=False habitat_baselines.rl.policy.lock_exempt=False habitat_baselines.rl.policy.lock_exempt_identity=False" ;;
-        no_spen)    echo "habitat_baselines.rl.policy.enable_s_penalty=False habitat_baselines.rl.policy.s_penalty_use_surface=False habitat_baselines.rl.policy.goal_use_surface=False habitat_baselines.rl.policy.sx_conflict_gate=False" ;;
+        no_spen)    echo "habitat_baselines.rl.policy.enable_s_penalty=False habitat_baselines.rl.policy.s_penalty_use_surface=False habitat_baselines.rl.policy.goal_use_surface=False" ;;
         no_occ)     echo "habitat_baselines.rl.policy.enable_occ_consistency=False" ;;
         no_wfusion) echo "habitat_baselines.rl.policy.fusion_style=none" ;;
         no_gd)      echo "habitat_baselines.rl.policy.gdp_enable=False" ;;
@@ -154,7 +152,6 @@ mk_delta() {
         ml_nolockx)   echo "habitat_baselines.rl.policy.lock_exempt=False" ;;
         ml_nolockid)  echo "habitat_baselines.rl.policy.lock_exempt_identity=False" ;;
         ml_nosusp)    echo "habitat_baselines.rl.policy.fb_suspicious_hysteresis=5" ;;
-        sp_nogate)    echo "habitat_baselines.rl.policy.sx_conflict_gate=False" ;;
         sp_nosurf)    echo "habitat_baselines.rl.policy.s_penalty_use_surface=False" ;;
         sp_nogoalsurf) echo "habitat_baselines.rl.policy.goal_use_surface=False" ;;
         wf_nod3)      echo "habitat_baselines.rl.policy.distance_sample=False" ;;

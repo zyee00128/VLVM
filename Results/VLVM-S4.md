@@ -1,68 +1,126 @@
 # VLVM Stage 4：S 语义仲裁与 TSP3D 置信度区分度优化
 
 > S4 坚持 TSP3D 3D-native 主线。R1v1 与 R2 保留在本文；R1v2 的设计、实验、结果分析及后续 Rank/Gate 重构统一维护在 [VLVM-S5.md](VLVM-S5.md)。
-> S4 的模型微调阶段已收敛并关闭。R3-G0/G1/G3/F1 均作为历史对照保留；最终模型锁定为 **VLVM V1（原 R1v1 E3）**。下一步在该权重上固定 `sigma_tar=0.60`，直接进入 S-penalty 机制优化；后续模型重构进入 [VLVM-S5.md](VLVM-S5.md)。
+> S4 的模型微调阶段已收敛并关闭。R3-G0/G1/G3/F1 均作为历史对照保留；最终模型锁定为 **VLVM V1（原 R1v1 E3）**。Phase G 只优化 TSP3D 候选的 S-penalty 与语义仲裁，主搜索参数为 `sigma_tar` 和 `t_S`；后续模型重构进入 [VLVM-S5.md](VLVM-S5.md)。
+> 实验结果已拆分：模型微调、no-S 与历史导航结果见 [VLVM-S4-Exp0.md](VLVM-S4-Exp0.md)；Phase G 的 P0/P1、S 证据和参数实验见 [VLVM-S4-Exp1.md](VLVM-S4-Exp1.md)。
 
 
 ## Phase G：最终 S-penalty 参数与机制优化
 
-最终权重为 `data/vlvm_v1/vlvm_v1.pth`，Presence Gate 关闭；直接复用 Phase D 已完成的四场景 no-S 搜索结果：
+### G.1 当前范围与已关闭支线
 
-$$\text{VLVM V1, no-S:}\qquad \sigma_{tar}=0.60.$$
+最终权重固定为 `data/vlvm_v1/vlvm_v1.pth`。Presence Gate 与在线 GD proposal source 保持关闭；2.5D ValueMap、occ、memory-life、探索与导航机制不改。
 
-后续 S-penalty 实验不再安排 sigma grid、窄搜索或 Gate 阈值标定；`0.60` 是固定控制变量，不作为 S 参数联调项。固定 VLVM V1、Presence Gate 关闭、raw `sigma_tar=0.60`，不再进行模型训练或置信度阈值搜索。
-
-### G1：先验证 S 是否值得使用
-
-在相同候选池上比较 raw $c$ 与 S：
-
-- S-only AUROC/AUPRC；
-- covered 条件下 TP/FP 分布；
-- covered-high、covered-low、uncovered 三路 precision/recall；
-- S 对 raw $c$ 的增量区分度；
-- 按场景、类别和目标距离分层。
-
-若 S 在 covered 子集上没有稳定增量，最终配置保持 S-penalty 关闭，不进入复杂机制。
-
-### G2：现有 penalty 参数收口
-
-固定 `sigma_tar=0.60`，保持冲突门和在线 2D 检测源关闭，按单变量顺序搜索：
-
-1. $t_S\in\{0.10,0.12,0.15,0.18\}$；
-2. 在最佳 $t_S$ 上搜索 $floor\in\{0.3,0.5,0.7\}$；
-3. 在最佳组合上搜索 $radius\in\{0.3,0.5,0.7\}\,\mathrm m$；
-4. `uncovered_w` 首轮固定 1.0。
-
-先用 detection replay 淘汰明显劣势档，只将 Pareto 档送入四场景导航。
-
-### G3：S 主导仲裁升级
-
-在相同 proposal pool 上比较：
-
-| 档位 | 准入/排序方式 |
+| 项目 | Phase G 口径 |
 | :--- | :--- |
-| P0 | S 关闭，仅 raw $c$ |
-| P1 | 当前 $c\cdot w_S(S)$ penalty |
-| P2 | 显式加权质量分 $q(c,S)$，S 权重高于 $c$ |
-| P3 | P2 + 质量带内按距离选择 |
+| H 分数惩罚 | 放弃；H 不是目标语义正确性的稳定证据，不进入 penalty、准入、排序或导航决策 |
+| S conflict gate | 放弃；硬规则 `高 c + 低 S => reject` 过于武断，已退出主线，不再做 on/off 或参数搜索 |
+| `floor` | 删除；由固定 `s_min=0.1` 与 `t_S` 自然派生最低权重 |
+| S `radius_m` | 固定 `0.5 m`；legacy 三档在线结果不足以支持继续搜索 |
+| `uncovered_w` | 固定 `1.0`；没有可靠 S 覆盖时保持中性 |
+| 主要网格参数 | `sigma_tar` 与 `t_S` |
 
-机制升级必须同时完成：
+H1/H2 与 conflict 的历史观测结果只保留在 [VLVM-S4-Exp1.md](VLVM-S4-Exp1.md) 作为弃用依据，不再扩展实验，也不再要求现役日志输出相关字段。
 
-- 拆分候选生成阈值 $\sigma_{prop}$ 与记忆准入阈值 $\tau_{admit}$；
-- covered-high / covered-low / uncovered 分支独立；
-- occ gate 保持在 S 前；
-- 2.5D region map 与 memory-life 保持不变；
-- 质量优先、距离次级，禁止纯最近候选选择；
-- 所有档使用完全相同的候选池，避免候选数差异污染结论。
+### G.2 参数职责与当前 P1 机制
 
-最终 S 机制判定：
+三个门限必须分开：
 
-1. 四场景平均 SR 不低于 P0；
-2. SPL 不出现系统性下降；
-3. fp、覆盖前错误停止和入记忆 FP 明确减少；
-4. fn 不因 covered-low 惩罚明显增加；
-5. 收益至少跨多个场景成立；
-6. 若复杂仲裁不优于 P1，则保留简单 penalty；若 P1 也不优于 P0，则关闭 S。
+| 参数 | 唯一职责 | Phase G 处理 |
+| :--- | :--- | :--- |
+| $\sigma_{prop}$ | TSP3D 服务返回候选的最低 raw 分数，只控制 proposal pool | 设得不高于待测 `sigma_tar`；不是主搜索参数 |
+| $\sigma_{tar}$ | penalty 后分数的最终候选准入阈值 | 主网格参数 |
+| $t_S$ | S 达到不衰减区间的阈值，决定 penalty 强度 | 主网格参数 |
+| `q_admit` | P2 中 $q(c,S)$ 的独立记忆准入阈值 | 仅在确定采用 P2 后启用 |
+
+P1 的固定公式为：
+
+$$
+w_S(S)=
+\begin{cases}
+1, & S\text{ uncovered},\\
+\min\!\left(1,\dfrac{\max(S,0.1)}{t_S}\right), & S\text{ covered},
+\end{cases}
+\qquad c'=c\,w_S(S).
+$$
+
+$$
+c\ge\sigma_{prop}
+\rightarrow \text{occ gate}
+\rightarrow c'=c\,w_S(S)
+\rightarrow c'\ge\sigma_{tar}
+\rightarrow \text{memory}.
+$$
+
+当前机制只研究如何过滤已有候选。`sigma_tar` 网格用于重新标定最终机制的准入工作点，不得把低阈值档的变化解释为“高 S 救回了 $c<0.60$ 候选”；proposal-pool 扩展的贡献必须单列。
+
+### G.3 P2：S 主导仲裁候选机制
+
+P1 只衰减并过滤候选，不能解决多个已准入候选的排序。P2 只保留 S 主导仲裁这一条升级路线：
+
+| S 状态 | 定义 | 处理原则 |
+| :--- | :--- | :--- |
+| covered-high | $S\ge t_S$ | 进入高质量候选区，允许维持较高排序 |
+| covered-low | $0<S<t_S$ | 连续衰减，由统一准入线决定是否保留 |
+| uncovered | 无可靠 S 覆盖 | 保持中性，不把缺失覆盖解释为反证 |
+
+候选质量分可使用经验证集标定的 $q(c,S)$；独立准入参数统一命名为 `q_admit`。多个候选并存时先按质量带筛选，再在质量带内按距离选择。P2 不加入 H，也不恢复 conflict 硬拒绝。
+
+### G.4 `sigma_prop` 与候选池边界
+
+TSP3D 当前为 Top-1 路径，`sigma_prop` 位于模型前向之后。同一帧重复请求多个 `sigma_prop` 只会得到同一个 Top-1 被保留或置空，不会产生多套候选。
+
+| 规则 | 口径 |
+| :--- | :--- |
+| 采集方式 | 使用一个足够低且安全的 `sigma_prop` 单次返回，并记录同一候选是否通过各阈值 |
+| 与主网格关系 | 必须满足 `sigma_prop <= min(sigma_tar grid)`，避免服务端提前截断待测候选 |
+| 参数地位 | 只负责候选池完整性检查，不与 `sigma_tar × t_S` 做第三维联合搜索 |
+| 结果解释 | 低分 proposal 的贡献单列，不用于证明 S 能抬升 raw 置信度 |
+
+### G.5 日志契约
+
+| 文件 | 必须字段 |
+| :--- | :--- |
+| `candidates.jsonl` | stable candidate id、step、scene/episode/class、raw $c$、proposal flags、pre/post-occ、S 状态、$w_S$、$c'$、`sigma_tar` 准入结果、TP |
+| `memory_events.jsonl` | new/merge/delete、memory id、candidate id、进入分数、观测次数、生命周期与删除原因 |
+| `nav_goals.jsonl` | 被选 memory/candidate id、质量分、距离、切换与停止原因 |
+| `episodes.jsonl` | SR/SPL/Oracle、fp/fn/nv、首次错误锁定、真目标覆盖前错误停止 |
+
+H1/H2、H penalty 和 conflict 字段不再属于现役日志契约。occ 必须同时保留 pre/post 记录，避免把不同闭环轨迹的候选数量差异误写为 occ 自身差异。
+
+### G.6 实验顺序
+
+| 阶段 | 目的 | 可变项 | 场景口径 | 状态 |
+| :--- | :--- | :--- | :--- | :--- |
+| P0 | 验证 S 是否值得进入 penalty | 历史 legacy 配置 | 十场景 × 99 集 | 已完成，结果见 Exp1 |
+| P1 legacy | 收口 `floor/radius` 并决定是否保留 | `floor`、`radius_m` | 三场景 × 99 集 | 已完成；二者退出搜索 |
+| P1 `t_S` 粗网格 | 验证新 penalty 的闭环响应 | `t_S` | `5cdEh9F2hJL`、`mL8ThkuaVTM`、`QaLdnwvtxbs`，共 297 集/档 | 已完成，结果见 Exp1 |
+| P1 十场景 | 建立新 penalty 正式基线 | 粗网格胜出档 | P0 同十场景 | 独立记录 |
+| occ 诊断 | 判断 occ 对候选、记忆与导航的真实作用 | occ on/off，其他固定 | 固定对照场景 | 待机制分析 |
+| P2 | 比较简单 penalty 与 S 主导仲裁 | 仲裁机制 | 与 P1 相同场景口径 | 待定 |
+| 最终参数细搜 | 为最终机制确定 `sigma_tar`、`t_S` 并生成论文图表 | `sigma_tar × t_S` | 固定使用 P1 的同一三场景集、相同 297 episodes/seed | 最终机制确定后执行 |
+| 最终十场景 | 只验证锁定配置，不再选参 | 全部固定 | P0 同十场景 | 最后执行 |
+
+最终参数细搜必须在机制结构完全固定后进行。以粗网格工作点为中心，对 `sigma_tar` 和 `t_S` 做局部二维网格；所有网格点使用同一三场景、同一 episode、同一 seed、同一 `sigma_prop`、同一 occ/memory/fallback 配置。具体数值区间依据最终机制的粗网格中心锁定，不在机制比较阶段提前改变。
+
+论文展示至少保留以下统一表格：
+
+| 展示项 | 固定口径 |
+| :--- | :--- |
+| `sigma_tar × t_S` 主结果 | 同一三场景集的 SR、Oracle、SPL、SoftSPL、steps |
+| 候选与记忆结果 | pre/post-occ TP/FP、admitted TP/FP、memory new/merge/delete、首次错误锁定 |
+| 参数图 | SR/SPL 二维热图；固定一轴后的单参数曲线 |
+| 最终对照 | P0、P1、最终机制、VLFM 与初始 VLVM 的同场景结果 |
+
+### G.7 语义地图边界与最终判定
+
+Phase G 不修改 2.5D region ValueMap。最终机制按下列条件选择：
+
+1. 十场景 SR 不低于 P0，SPL 不出现系统性下降；
+2. FP、真目标覆盖前错误停止、入记忆 FP 和首次错误锁定减少；
+3. covered-low 衰减没有造成不可接受的 FN 增长，收益跨多个场景成立；
+4. occ 同时具备候选层、记忆层和导航层证据；
+5. P2 不优于 P1则保留简单 penalty；P1 不优于 P0则关闭 S；H 与 conflict 不进入最终候选机制。
 
 
 ## 0. S4 微调收敛
@@ -111,7 +169,7 @@ S4 最终权重确定为 **VLVM V1**，即历史 R1v1 E3。权重已由 `data/ts
 
 当前问题拆成两条相互独立、按顺序推进的路线：
 
-1. **机制层：固定模型与原始门限后只优化 S。** 使用 VLVM V1，Presence Gate、GD 和 S 冲突门关闭，固定 `sigma_tar=0.60`；先优化现有乘法 penalty，再比较“S 主导仲裁”。
+1. **机制层：固定模型后只优化 S。** 使用 VLVM V1，Presence Gate、GD 关闭；`sigma_tar=0.60` 是历史 no-S 粗网格工作点，P1 先搜索 `t_S`，再比较“S 主导仲裁”。H penalty 与 S conflict gate 已放弃，不再作为变量。
 2. **模型层：直接训练候选置信度的排序能力** 以相同 scanrefer checkpoint 为初始化，做逐级解冻消融；主目标是正确候选压过在线硬假阳，而不是继续优先优化框或中间特征。Presence gate 只作为视图级 target-absent 拒绝器，不代替候选级区分损失。
 
 明确现有前提：
@@ -122,85 +180,7 @@ S4 最终权重确定为 **VLVM V1**，即历史 R1v1 E3。权重已由 `data/ts
 - 当前 active S 来源是 VLFM 风格的 **2.5D region ValueMap**。保留的 surface 版本仍把 3D 表面点落入 2D $(x,y)$ 桶，并非真正保留完整 3D 语义场。现阶段没有证据支持重建价值地图。
 
 
-## 2. S-penalty 路线修订
-
-### 当前机制的真实行为
-
-当前流程是：
-
-$$
-c \ge \sigma_{tar}
-\rightarrow \text{occ gate}
-\rightarrow c' = c\cdot w_S(S)
-\rightarrow c' \ge \sigma_{tar}
-\rightarrow \text{memory}
-$$
-
-其中：
-- $S\ge t_S$ 时 $w_S=1$；
-- $0<S<t_S$ 时 $w_S=\max(floor,S/t_S)$；
-- 未覆盖 $S\le0$ 或 `None` 时 $w_S=uncovered\_w=1$，即免罚；
-- 进入记忆后，导航目标在可锁候选中按**离机器人最近**选择，置信度与 S 不参与最终候选排序。
-
-* 当前 S 只负责“拒绝谁”，不负责“多个已准入目标中选谁”。高分 FP 一旦通过，最近目标规则仍可能优先导航到它。
-
-* TSP3D 服务端与 policy 都会在 S 查询前按原始 $\sigma_{tar}$ 过滤。
-
-* 当前 $w_S\le1$ 时没有逻辑错误；但若新机制允许高 S 提升低 $c$ 候选，则这些候选在计算 S 前已经消失。
-
-### 第一阶段：只调参数，不改公式
-
-控制变量固定为：模型使用 VLVM V1、Presence Gate 关闭、GD 关闭、occ 开启且参数不变、2.5D region map 不变、memory-life 不变，raw `sigma_tar=0.60` 全程固定。
-
-1. **固定 raw $\sigma_{tar}=0.60$：** 直接复用 VLVM V1 已完成的四场景 no-S 标定，不再进行 sigma grid 或窄搜索。
-2. **只调 S：** 先调 $t_S$，再调 floor，最后调查询半径；避免多参数全排列掩盖因果。
-3. **建议初始窄范围：** $t_S\in\{0.10,0.12,0.15,0.18\}$，$floor\in\{0.3,0.5,0.7\}$，$radius\in\{0.3,0.5,0.7\}\,m$。`uncovered_w` 首轮固定 1.0，防止把尚未建图误当成低语义证据。
-4. **先离线 replay，再跑导航：** 从已有 detection log 计算每组的准入 TP/FP、召回、precision 与 episode 级首次错误锁定；只把 Pareto 档送入四场景 SR/Oracle/SPL。
-
-这一阶段回答的是“S 能否在不改框架的情况下过滤 FP”，不回答“S 能否主导候选选择”。
-
-### 第二阶段：从 penalty 改为语义仲裁
-
-更清晰的机制应拆成四步：
-
-1. **候选生成门：** 用较低的 $\sigma_{prop}$ 保留可能被 S 验证的 TSP3D 候选；occ gate 继续一票否决空腔框。
-2. **证据标准化：** 分别把 $c$ 和 covered-S 映射到各自验证集上的可比较尺度。S 原值不是概率，不应直接解释为正确率。
-3. **质量融合：**
-
-   $$
-   q=\sigma\left(\alpha\,\operatorname{logit}(\hat c)
-   +\beta\,\operatorname{logit}(\hat S)+b\right),\quad \beta>\alpha
-   $$
-
-   其中 $\hat c$、$\hat S$ 是验证集标定后的分数。若只做无学习版本，可用 $q=\hat c^{\alpha}\hat S^{\beta}$。
-
-4. **记忆仲裁：**$q\ge\tau_{admit}$ 才能进入记忆；多个候选并存时，先按 $q$ 选质量带，再在近似同分候选中用距离决定，不能继续完全按最近目标选择。**质量优先、距离次级**：纯 S 排序会把用于探索的区域级语义先验误当成实例检测分数；纯距离又会放大最近 FP。可采用：先保留 $q\ge q_{max}-\delta$ 的质量带，再从带内选最近候选。
-
-### 未覆盖不是低 S
-
-必须保留三个状态：
-
-| 状态 | 语义 | 建议行为 |
-| :--- | :--- | :--- |
-| covered-high | 有地图证据且 S 高 | 允许提升排序优先级 |
-| covered-low | 有地图证据但 S 低 | 明确惩罚或拒绝 |
-| uncovered | 该位置尚无可靠语义观测 | 不当作反证；保留 TSP3D 最低证据门槛，但不可无条件压过 covered-high |
-
-如果把 uncovered 直接当 $S=0$，探索早期召回会显著受损；如果继续完全免罚且按最近选择，它又会成为 FP 绕过 S 的通道。因此 uncovered 应当是单独分支，而不是一个数值。
-
-### 暂不修改语义价值地图
-
-VLFM 的 ValueMap 本来用于为 frontier 提供语言相关探索价值，而非提供实例级检测概率；其成功依赖 RGB/VLM 语义与几何 frontier 的组合。[VLFM 原论文]支持把它作为探索先验，但不支持直接把单点最大值解释为目标存在概率。
-
-当前不改 2.5D region map，原因有三点：
-
-- 既往实验已显示 region 版本优于 surface 路径；
-- 当前 S 查询采用半径内最大值，地图构建误差与融合误差尚未和仲裁公式误差分离；
-- 项目中的探索/导航图已经定稿，直接重建语义地图会同时改变探索覆盖和检测准入，无法归因。
-
-只有当固定候选集的离线统计表明 S-only 区分度跨场景不稳定，且错误主要来自地图峰值污染/错位时，才进入地图候补实验。候补也应先做轻量可靠性层，而不是恢复“全 3D”路线：为 S 同时记录覆盖次数、观测新鲜度、视角/距离质量；用多次观测的稳健聚合替代单次 max；按目标框投影区域查询而非只查一个近表面点。
-
-## 3. 模型微调路线修订
+## 2. 模型微调路线修订
 
 ### 解冻层数实验的正确基线
 
@@ -241,7 +221,7 @@ VLFM 的 ValueMap 本来用于为 frontier 提供语言相关探索价值，而�
 R1v2 的设计、实验、结果分析及后续全局候选排序升级已迁移至 [VLVM-S5.md](VLVM-S5.md)，当前暂停继续升级。
 
 
-## 4. 统一评测指标
+## 3. 统一评测指标
 
 ### 指标定义
 
@@ -314,13 +294,13 @@ R1v2 的设计、实验、结果分析及后续全局候选排序升级已迁移
 SR、Oracle、SPL 之外必须保留 fp/fn/nv、首次错误锁定时间、真目标覆盖前错误停止数。只看 SR 无法区分“模型没看见”“看见但没检出”和“被近处 FP 抢先”。
 
 
-## 5. 实验顺序与判定门
+## 4. 实验顺序与判定门
 
-### 5.1 总体顺序
+### 4.1 总体顺序
 
 本轮固定采用以下顺序：
 
-逐级解冻消融 → R1v1 / 历史 R2 结论冻结 → R3-G0/G1/G3/F1 对照完成 → 最终权重锁定为 VLVM V1 → 复用已确定的 `sigma_tar=0.60` → 直接优化 S-penalty。
+逐级解冻消融 → R1v1 / 历史 R2 结论冻结 → R3-G0/G1/G3/F1 对照完成 → 最终权重锁定为 VLVM V1 → 以历史 `sigma_tar=0.60` 启动 S-penalty → 锁定机制 → 在同一场景集细搜 `sigma_tar × t_S`。
 
 核心原则：
 
@@ -330,15 +310,15 @@ SR、Oracle、SPL 之外必须保留 fp/fn/nv、首次错误锁定时间、真�
 4. **续训 LR 不回升。** 核心参数保持 R1v1 E3 checkpoint 的末端 LR；G1 新增 Gate 使用独立参数组，在 E4 warmup、E5 cosine。
 5. **G3 即 F0。** 从 R1v1 E3 冻结全部核心，只训练 `presence_gate.*`；G3 与 F0 不重复训练或续训。
 6. **F1 与 G3/F0 严格配对。** 两者都从 R1v1 E3 新建 Gate optimizer，固定训练 3 epoch；F1 唯一变化是 5% target-absent hard-data-v2 `replace-source`，每轮总步数仍为 23,031。
-7. **S-penalty 进入当前主线。** 最终 checkpoint 与 raw `sigma_tar=0.60` 均已锁定；不再训练模型或搜索 sigma，只优化 S 参数与仲裁方式。
+7. **S-penalty 进入当前主线。** 最终 checkpoint 与历史 no-S 工作点 `sigma_tar=0.60` 已锁定；不再训练模型。机制确定后仍需在同一三场景集细搜 `sigma_tar × t_S`，`sigma_prop` 只保证候选池完整，不作为第三个主网格维度。
 
-### 5.2 全阶段固定控制变量
+### 4.2 全阶段固定控制变量
 
 | 项目 | 固定设置 |
 | :--- | :--- |
 | 初始化权重 | G0/G1/G3/F1 历史实验均从现已命名为 `data/vlvm_v1/vlvm_v1.pth` 的 R1v1 E3 开始；G0/G1 恢复核心 optimizer/global step，G3/F1 以相同 seed 新建 Gate optimizer |
 | 语义机制 | `enable_s_penalty=False` |
-| S 冲突门 | 关闭 |
+| S 冲突门 | 放弃并保持关闭 |
 | 在线 2D 检测源 | 关闭 |
 | 微调 gate | G0 关闭；G1 联合运行 `base + rank_cross + gate`，Gate 输入 detach；G3/F1 冻结核心，训练前向与反向只消费 `gate` 并更新 `presence_gate.*` |
 | occ geometry | 开启，参数保持不变 |
@@ -352,9 +332,9 @@ SR、Oracle、SPL 之外必须保留 fp/fn/nv、首次错误锁定时间、真�
 | 冻结行为 | 冻结模块 `requires_grad=False` 且保持 `eval()` |
 | 最终 no-S 导航锚点 | VLVM V1（R1v1 E3）：$\sigma_{tar}=0.60$ |
 
-VLVM V1 的 `sigma_tar=0.60` 已由四场景 no-S grid 确定：平均 SR 36.61%、Oracle 54.55%、SPL 0.1607。该工作点直接作为 S-penalty 优化的固定 raw 门限，不再重复标定；Presence Gate 保持关闭，避免同时改变候选分布。
+VLVM V1 的 `sigma_tar=0.60` 已由四场景 no-S grid 确定：平均 SR 36.61%、Oracle 54.55%、SPL 0.1607。它作为 Phase G 机制开发的初始工作点；最终机制确定后，`sigma_tar` 将与 `t_S` 在同一三场景集重新细化标定。Presence Gate 保持关闭。
 
-### 5.3 Phase A：冻结基线与评测口径
+### 4.3 Phase A：冻结基线与评测口径
 
 先冻结两个参照，不再修改：
 
@@ -374,7 +354,7 @@ VLVM V1 的 `sigma_tar=0.60` 已由四场景 no-S grid 确定：平均 SR 36.61%
 
 判定目的：B0 定义“未微调起点”，B1 定义“定位提升但区分度仍不足”的现有上限。后续档位必须同时与二者比较。
 
-### 5.4 Phase B：逐级解冻消融
+### 4.4 Phase B：逐级解冻消融
 
 这一阶段只改变可训练层，不加入 Presence gate、pairwise loss 或新的 hard-negative pool，以单独确定“解冻到哪里”。
 
@@ -405,7 +385,7 @@ E3 晋级条件：
 
 输出：只保留 Pareto 前两档进入 Phase C；其余档位停止，不跑导航。
 
-### 5.5 Phase C：R1v1 与 R2 候选区分度微调
+### 4.5 Phase C：R1v1 与 R2 候选区分度微调
 
 #### R1v1 损失定义
 
@@ -452,7 +432,7 @@ R2 整体未超过 R1v1，仅在个别 epoch 的局部指标上改善，因此�
 
 R1v2 及后续 Rank/Gate 重构不再属于当前 S4 微调主线，统一见 [VLVM-S5.md](VLVM-S5.md)。
 
-### 5.6 Phase D：R1v1 E3 / ScanRefer 无 S 导航对照
+### 4.6 Phase D：R1v1 E3 / ScanRefer 无 S 导航对照
 
 目的：确认 R1v1 E3 的离线提升能否转化为导航收益，并用 ScanRefer 在完全相同的 3D-native 框架下建立原始权重参照。
 
@@ -495,7 +475,7 @@ R1v2 及后续 Rank/Gate 重构不再属于当前 S4 微调主线，统一见 [V
 4. 不接受只靠一个场景大幅提升、其余场景普遍退化的档位；
 5. R1v1 E3 已证明跨 query Top-1 ranking 的离线提升能够转化为导航收益；Phase E 先以 G0/G1 同轮次结果和 G3 独立结果锁定 Gate 路线，最终只对入选权重进行 no-S 导航复核。
 
-### 5.7 Phase E：R3 收敛、联合 Gate 与独立 Gate
+### 4.7 Phase E：R3 收敛、联合 Gate 与独立 Gate
 
 #### E1：三条分支与执行顺序
 
@@ -586,7 +566,7 @@ Phase E 最终必须分别给出三个结论：
 
 G3/F0 与 F1 完成后，联合 G1 结果锁定 Gate 是否启用，并独立判断 hard-data-v2 是否保留。
 
-### 5.8 Phase F：hard-negative replay
+### 4.8 Phase F：hard-negative replay
 
 #### F1：取消纯 R1v1 + hard-v2 续训
 
@@ -642,7 +622,7 @@ F0 不再是从已入选 Gate checkpoint 继续训练的额外控制臂；G3 本
 
 旧 `R1v2 + Gate + hard E1` 仅作为可行性旁证：它相对旧 R1v2 E1 的 hit@0.25 `+4.60 pp`、AUROC `+0.0306`、AUPRC `+0.0806`、pair accuracy `+0.0419`，但当时同时加入 $L_{gate}$、Gate veto 与 Gate hard data，不能把收益单独归因于 hard data。Phase F 的 F0/F1 配对用于补齐这一缺失对照。
 
-### 5.10 执行清单与实验预算
+### 4.9 执行清单与实验预算
 
 | 顺序 | 实验组 | 离线评测 | 四场景导航 | 输出 |
 | ---: | :--- | :---: | :---: | :--- |
@@ -653,8 +633,8 @@ F0 不再是从已入选 Gate checkpoint 继续训练的额外控制臂；G3 本
 | 4 | R3-G3/F0：R1v1 E3 → 冻结核心、Gate-only 3 epoch | 最终 Gate 档一次完整 E3；强制全开只做一致性检查 | 不跑 | 独立 Gate 权重、Gate dump 与校准表 |
 | 5 | F1：与 G3/F0 配对的 5% target-absent hard-v2 `replace-source` | 必须 | 不跑 | hard data v2 的单变量结论 |
 | 6 | G1、G3/F0、F1 训练方式与门控增益比较 | 必须 | 不跑 | 锁定 Gate 路线与 hard data 是否启用 |
-| 7 | 锁定 VLVM V1 / Gate 关闭 / `sigma_tar=0.60` | 已完成 | 复用四场景 no-S grid | S-penalty 固定基线 |
+| 7 | 锁定 VLVM V1 / Gate 关闭 / `sigma_tar=0.60` | 已完成 | 复用四场景 no-S grid | S-penalty 初始工作点 |
 | 8 | 最终 no-S 导航 | 已完成 | 复用固定四场景 | SR、Oracle、SPL、fp/fn/nv 与错误停靠 |
-| 9 | P0/P1/P2/P3 | 下一步 | 仅 Pareto 档 | 最终 S 机制 |
+| 9 | P0/P1/P2 + 最终 `sigma_tar × t_S` 细搜 | 进行中 | 固定同一三场景集 | 最终 S 机制与论文参数图 |
 
 G0/G1、G3/F0 与 F1 均已完成并保留历史结果。旧版脚本当时串行运行 `g3 f1`，两臂日志统一保存在 `ft_tsp3d/ft_log/s4_gate_only_2026-10-15/`；当前现役脚本不再包含这两个档位。

@@ -58,6 +58,16 @@ class TargetMemoryManager:
         self._surf: Dict[str, List[np.ndarray]] = {}
         self._ver: Dict[str, List[Tuple[Any, ...]]] = {}
         self._fb: Dict[str, List[Dict[str, Any]]] = {}
+        self._next_memory_id = 0
+
+    def reset_ids(self) -> None:
+        """Reset the episode-local stable memory-id sequence."""
+        self._next_memory_id = 0
+
+    def _alloc_memory_id(self) -> str:
+        memory_id = f"m{self._next_memory_id:06d}"
+        self._next_memory_id += 1
+        return memory_id
 
     def bind(
         self,
@@ -86,6 +96,7 @@ class TargetMemoryManager:
         src: Optional[str] = None,
         new_suspicious: bool = False,
         gd_conf: float = 0.0,
+        candidate_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         In-place write / EMA-merge of one admitted detection.
@@ -144,10 +155,12 @@ class TargetMemoryManager:
             self._surf[target_class] = [s_np]
             self._ver[target_class] = [(1, r_xy.copy(), float(robot_yaw), float(confidence))]
             state = {"suspicious": suspicious, "near_miss": 0, "src": _src_tag(src),
-                     "gd_conf": 0.0}
+                     "gd_conf": 0.0, "memory_id": self._alloc_memory_id(),
+                     "last_candidate_id": candidate_id}
             self._fb[target_class] = [state]
             return {"merged": False, "src": _src_tag(src), "num_obs": 1,
                     "suspicious": bool(suspicious), "suspicion_cleared": False,
+                    "memory_id": state["memory_id"], "candidate_id": candidate_id,
                     **_m_a(state)}
 
         # Keep the side lists in sync
@@ -156,8 +169,12 @@ class TargetMemoryManager:
         if target_class not in self._ver:
             self._ver[target_class] = [(1, r_xy.copy(), float(robot_yaw), float(confidence)) for _ in recs]
         if target_class not in self._fb:
-            self._fb[target_class] = [{"suspicious": False, "near_miss": 0, "src": TSP3D_SRC,
-                                      "gd_conf": 0.0} for _ in recs]
+            self._fb[target_class] = [
+                {"suspicious": False, "near_miss": 0, "src": TSP3D_SRC,
+                 "gd_conf": 0.0, "memory_id": self._alloc_memory_id(),
+                 "last_candidate_id": None}
+                for _ in recs
+            ]
 
         dists = np.linalg.norm(np.asarray(recs, dtype=np.float64) - c_np, axis=1)
         closest_idx = int(np.argmin(dists))
@@ -177,6 +194,7 @@ class TargetMemoryManager:
             prev_src = prev_state.get("src")
             merged_src = merge_src_tag(prev_src, src)
             prev_state["src"] = merged_src
+            prev_state["last_candidate_id"] = candidate_id
             cleared = False
             if merged_src == BOTH_SRC:
                 # Both models corroborate the same entry -> normal target, no suspicion.
@@ -185,16 +203,20 @@ class TargetMemoryManager:
             return {"merged": True, "src": merged_src, "num_obs": int(v_old[0]) + 1,
                     "suspicious": bool(prev_state.get("suspicious")),
                     "suspicion_cleared": cleared,
+                    "memory_id": prev_state.get("memory_id"),
+                    "candidate_id": candidate_id,
                     **_m_a(prev_state)}
         else:
             recs.append(c_np)
             self._surf[target_class].append(s_np)
             self._ver[target_class].append((1, r_xy.copy(), float(robot_yaw), float(confidence)))
             state = {"suspicious": suspicious, "near_miss": 0, "src": _src_tag(src),
-                     "gd_conf": 0.0}
+                     "gd_conf": 0.0, "memory_id": self._alloc_memory_id(),
+                     "last_candidate_id": candidate_id}
             self._fb[target_class].append(state)
             return {"merged": False, "src": _src_tag(src), "num_obs": 1,
                     "suspicious": bool(suspicious), "suspicion_cleared": False,
+                    "memory_id": state["memory_id"], "candidate_id": candidate_id,
                     **_m_a(state)}
 
     def state_of(self, centroid: np.ndarray, tol: float = 0.3) -> Dict[str, Any]:
@@ -261,22 +283,9 @@ class TargetMemoryManager:
             "gd_conf": float(state.get("gd_conf", 0.0) or 0.0),
             "conf": float(conf),
             "near_miss": int(near_miss),
+            "memory_id": state.get("memory_id"),
+            "candidate_id": state.get("last_candidate_id"),
         }
-
-    @staticmethod
-    def _log_deletion(rec: Dict[str, Any]) -> None:
-        """Print one deletion together with its accounting fields (one line, grep-able)."""
-        head, c = rec["reason"], np.round(np.asarray(rec["centroid"], dtype=np.float64), 3)
-        tail = (
-            f"suspicious={rec['suspicious']}, near_miss={rec['near_miss']}, "
-            f"src={rec['src']}, n_obs={rec['num_obs']}, "
-            f"conf={rec['conf']:.2f}, gd_conf={float(rec.get('gd_conf', 0.0) or 0.0):.2f}, "
-            f"reason={head}"
-        )
-        print(
-            f"[AntiHallucination] Deleted {rec['target_class']} centroid "
-            f"{c} ({tail}) -> fallback to explore"
-        )
 
     # per-step lifecycle
     def step(
@@ -316,8 +325,12 @@ class TargetMemoryManager:
             f_states = self._fb.get(target_class, [])
             if len(f_states) != len(centroids):
                 # Defensive: keep fallback state in sync with centroids.
-                f_states = [{"suspicious": False, "near_miss": 0, "src": TSP3D_SRC,
-                             "gd_conf": 0.0} for _ in centroids]
+                f_states = [
+                    {"suspicious": False, "near_miss": 0, "src": TSP3D_SRC,
+                     "gd_conf": 0.0, "memory_id": self._alloc_memory_id(),
+                     "last_candidate_id": None}
+                    for _ in centroids
+                ]
                 self._fb[target_class] = f_states
 
             keep_c: List[np.ndarray] = []
@@ -367,7 +380,6 @@ class TargetMemoryManager:
                                 "hysteresis_exceeded", int(f_states[idx]["near_miss"]),
                             )
                             deleted.append(rec)
-                            self._log_deletion(rec)
                             continue
 
                 keep_c.append(c_np)

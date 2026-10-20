@@ -26,6 +26,7 @@ from habitat_baselines.utils.common import (
 )
 from habitat_baselines.utils.info_dict import extract_scalars_from_info as extract_scalars_from_info_habitat
 from omegaconf import OmegaConf
+from vlfm.tsp3d_models.fussion_utils.s_penalty import S_MIN, S_QUERY_RADIUS_M
 
 try:
     import psutil
@@ -153,7 +154,7 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
                 f"({prec:5.1f}%) | {d['fp']:>4} | {d['adm']:>4}"
             )
 
-    # Gate rejection reasons (S-based admission + conflict gate).
+    # S-based admission rejection reasons.
     rej: Dict[str, int] = {}
     for s in stats:
         for k, v in (s.get("rejects") or {}).items():
@@ -184,8 +185,8 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
     _dist("maxscore (fp)", fp_scores)
 
     # --- 09-17 量测补强（零行为）：S × maxscore 联合分布 -----------------------
-    # S = 语义场值（检测框近表面点，半径 s_penalty_radius_m）；None/≤0 = 无覆盖（w_S=1 免罚）。
-    # 用途：为 σ_tar / s_penalty_thresh / floor 定档提供数据（此前 S 已采集但未被聚合打印）。
+    # S = 语义场值（检测框近表面点，固定半径 0.5m）；None/≤0 = 无覆盖（w_S=1 免罚）。
+    # 用途：为 sigma_tar / s_penalty_thresh 定档提供数据（此前 S 已采集但未被聚合打印）。
     s_vals_all = [v for s in stats for v in s.get("s_vals", [])]
     s_covered = [float(v) for v in s_vals_all if v is not None and float(v) > 0.0]
     s_tp = [
@@ -243,71 +244,22 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
         _joint_table()
 
 
-def _print_memory_metrics(episode_records: List[Dict[str, Any]]) -> None:
-    """
-    Per-entry tp / fp of the memorized candidates.
-
-    Splits by proposer tag (`tsp3d` / `gd` / `both`) and reports the suspicious subset
-    (deletion-budget / lock-right : lock-wrong inputs).
-
-    The `gd_conf` column is the mean raw GD sigmoid over the entries of 
-    that tag that actually carry a GD score (a `tsp3d`-only entry has none), 
-    and the `gd-conf separability` line compares the tp group with the fp group 
-    — that gap is the judgement gate of the confidence direction.
-    """
-    stats = [r["mem_stats"] for r in episode_records if r.get("mem_stats")]
-    if not stats:
-        return
-
-    def _gconf_mean(key: str):
-        n = sum(s.get(key, {}).get("n", 0) for s in stats)
-        if not n:
-            return float("nan"), 0
-        v = sum(
-            s.get(key, {}).get("gd_conf", 0.0) * s.get(key, {}).get("n", 0)
-            for s in stats
-        )
-        return v / n, n
-    total = sum(s["total"] for s in stats)
-    tp = sum(s["tp"] for s in stats)
-    print("=" * 66)
-    print("=== Memory-entry metrics (vs GT target bbox) ===")
-    print(
-        f"entries: {total}  tp={tp} ({tp / max(1, total) * 100:.1f}%)  "
-        f"fp={total - tp}  episodes={len(stats)}"
-    )
-    print(
-        f"{'src':<8}{'entries':>9}{'tp':>7}{'fp':>7}{'tp%':>8}"
-        f"{'n_obs':>8}{'gd_conf':>9}"
-    )
-    for src in sorted({k for s in stats for k in s["by_src"]}):
-        n = sum(s["by_src"].get(src, {}).get("n", 0) for s in stats)
-        if n == 0:
-            continue
-        t = sum(s["by_src"].get(src, {}).get("tp", 0) for s in stats)
-        with_n = [s for s in stats if s["by_src"].get(src, {}).get("n", 0) > 0]
-        nobs = np.mean([s["by_src"][src]["num_obs"] for s in with_n])
-        gcn = sum(s["by_src"][src].get("gd_conf_n", 0) for s in with_n)
-        gcs = sum(
-            s["by_src"][src].get("gd_conf", 0.0)
-            * s["by_src"][src].get("gd_conf_n", 0)
-            for s in with_n
-        )
-        gconf = (gcs / gcn) if gcn else float("nan")
-        print(
-            f"{src:<8}{n:>9}{t:>7}{n - t:>7}{t / n * 100:>7.1f}%"
-            f"{nobs:>8.2f}{gconf:>9.2f}"
-        )
-    sus_n = sum(s["suspicious"]["n"] for s in stats)
-    sus_tp = sum(s["suspicious"]["tp"] for s in stats)
-    print(f"suspicious entries: {sus_n}  tp={sus_tp}  fp={sus_n - sus_tp}")
-    tp_mean, tp_gn = _gconf_mean("gd_conf_tp")
-    fp_mean, fp_gn = _gconf_mean("gd_conf_fp")
-    gap = f"{tp_mean - fp_mean:+.3f}" if (tp_gn and fp_gn) else "n/a"
-    print(
-        "gd-conf separability (entries carrying a GD score): "
-        f"tp n={tp_gn} mean={tp_mean:.3f} | fp n={fp_gn} mean={fp_mean:.3f} | gap={gap}"
-    )
+def _s4_sp1_cfg_snapshot(policy: Any) -> Dict[str, Any]:
+    """S-penalty config snapshot written into the SP1 detection jsonl episode header."""
+    cfg = getattr(policy, "_s_penalty_cfg", None)
+    t_s = getattr(cfg, "thresh", None)
+    derived_min_w = None if t_s is None else min(1.0, S_MIN / max(float(t_s), 1e-6))
+    return {
+        "enable_s_penalty": bool(getattr(cfg, "enable", False)),
+        "t_S": t_s,
+        "s_min": S_MIN,
+        "derived_min_w": derived_min_w,
+        "radius_m": S_QUERY_RADIUS_M,
+        "uncovered_w": getattr(cfg, "uncovered_w", None),
+        "s_penalty_use_surface": bool(getattr(policy, "_s_penalty_use_surface", False)),
+        "sigma_tar": getattr(policy, "_sigma_tar", None),
+        "sigma_prop": getattr(policy, "_sigma_prop", None),
+    }
 
 
 def _print_eval_breakdown(episode_records: List[Dict[str, Any]]) -> None:
@@ -376,7 +328,6 @@ def _print_eval_breakdown(episode_records: List[Dict[str, Any]]) -> None:
     _print_failure_cross_tab(episode_records)
     _print_oracle_subset(episode_records)
     _print_detection_metrics(episode_records)
-    _print_memory_metrics(episode_records)
     print("=" * 66)
 
 
@@ -445,7 +396,11 @@ class VLVMTrainer(PPOTrainer):
         if config.habitat_baselines.verbose:
             logger.info(f"env config: {OmegaConf.to_yaml(config)}")
 
-        self._init_envs(config, is_eval=True)
+        # Habitat-Baselines shuffles ``content_scenes`` in place while building
+        # vector environments. Hydra marks the composed config read-only, so a
+        # multi-scene SP1 run otherwise fails before the first episode.
+        with read_write(config):
+            self._init_envs(config, is_eval=True)
 
         self._agent = self._create_agent(None)
         action_shape, discrete_actions = get_action_space_info(self._agent.policy_action_space)
@@ -688,23 +643,60 @@ class VLVMTrainer(PPOTrainer):
                     except Exception:
                         detect_stats = None
 
-                    # Per-entry tp / fp of the final memory (episode-end snapshot).
-                    # Read straight from the policy: it only clears its memory on the next `act()`, 
-                    # so the finished episode's entries are still live here.
-                    mem_stats = None
+                    # SP1: per-detection jsonl (raw S-penalty inputs + TP label), written
+                    # only when `det_log_dir` is set. Diagnostics only - the admission
+                    # path and the in-memory episode stats are untouched.
                     try:
-                        from vlfm.utils.episode_stats_logger import aggregate_memory_stats
+                        policy = self._agent.actor_critic
+                        det_log_dir = getattr(policy, "_det_log_dir", None)
+                        det_logs_for_dump = getattr(policy, "_detect_logs", None) or []
+                        if det_log_dir:
+                            from vlfm.utils.episode_stats_logger import (
+                                dump_detection_logs,
+                                dump_phase_g_logs,
+                            )
 
-                        stats_logger = getattr(
-                            self._agent.actor_critic, "_stats", None
+                            os.makedirs(str(det_log_dir), exist_ok=True)
+                            det_log_path = os.path.join(
+                                str(det_log_dir), "s4_sp1_detections.jsonl"
+                            )
+                            dump_detection_logs(
+                                det_log_path,
+                                scene_id=current_episodes_info[i].scene_id,
+                                episode_id=current_episodes_info[i].episode_id,
+                                target_object=str(
+                                    infos[i].get("target_object", "unknown")
+                                ),
+                                infos=infos[i],
+                                detect_logs=det_logs_for_dump,
+                                cfg_snapshot=_s4_sp1_cfg_snapshot(policy),
+                                success=int(episode_stats["success"]),
+                                oracle_success=compute_oracle_success(infos[i]),
+                                failure_cause=failure_cause,
+                            )
+                            dump_phase_g_logs(
+                                str(det_log_dir),
+                                scene_id=current_episodes_info[i].scene_id,
+                                episode_id=current_episodes_info[i].episode_id,
+                                target_object=str(
+                                    infos[i].get("target_object", "unknown")
+                                ),
+                                infos=infos[i],
+                                candidate_logs=getattr(policy, "_candidate_logs", None) or [],
+                                memory_event_logs=getattr(policy, "_memory_event_logs", None) or [],
+                                nav_goal_logs=getattr(policy, "_nav_goal_logs", None) or [],
+                                cfg_snapshot=_s4_sp1_cfg_snapshot(policy),
+                                episode_stats=episode_stats,
+                                success=int(episode_stats["success"]),
+                                oracle_success=compute_oracle_success(infos[i]),
+                                failure_cause=failure_cause,
+                            )
+                    except Exception as e:
+                        print(
+                            f"[SP1] dump_detection_logs raised "
+                            f"{type(e).__name__}: {e}",
+                            flush=True,
                         )
-                        snapshot_fn = getattr(
-                            stats_logger, "memory_entries_snapshot", None
-                        )
-                        entries = snapshot_fn() if callable(snapshot_fn) else None
-                        mem_stats = aggregate_memory_stats(infos[i], entries) or None
-                    except Exception:
-                        mem_stats = None
 
                     episode_records.append(
                         {
@@ -716,7 +708,6 @@ class VLVMTrainer(PPOTrainer):
                             "oracle_success": compute_oracle_success(infos[i]),
                             "failure_cause": failure_cause,
                             "detect_stats": detect_stats,
-                            "mem_stats": mem_stats,
                             "spl": float(episode_stats.get("spl", 0.0)),
                             "soft_spl": float(episode_stats.get("soft_spl", 0.0)),
                             "steps_count": float(

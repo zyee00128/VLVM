@@ -25,8 +25,12 @@ from vlfm.tsp3d_models.fussion_utils.scan_behavior import (
     _act_world_scan,
 )
 from vlfm.tsp3d_models.fussion_utils.s_penalty import (
+    S_QUERY_RADIUS_M,
     SPenaltyConfig, 
     apply_s_penalty, 
+    compute_w_s,
+    near_surface_point,
+    query_point_distance,
     query_semantic_at,
 )
 from vlfm.tsp3d_models.fussion_utils.target_memory_manager import MemoryManagerConfig, TargetMemoryManager
@@ -85,6 +89,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             free_threshold: float = 0.0,
             sigma_sce: float = 0.15,
             sigma_tar: float = 0.60,
+            sigma_prop: Optional[float] = None,
             tau: float = 0.15,
             near_field_dist: float = 1.0,
             near_field_sigma_scale: float = 0.8,
@@ -130,10 +135,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             fb_suspicious_conf: float = 0.75,
             enable_s_penalty: bool = True,
             s_penalty_thresh: float = 0.15,
-            s_penalty_floor: float = 0.3,
-            s_penalty_radius_m: float = 0.5,
             s_penalty_uncovered_w: float = 1.0,
-            sx_conflict_gate: bool = True,
+            det_log_dir: Optional[str] = None,
             # geometric admission module
             enable_occ_consistency: bool = True,
             occ_min_voxels: int = 8,
@@ -183,7 +186,16 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._log_odds_free = log_odds_free
         self._occ_threshold = occ_threshold
         self._free_threshold = free_threshold
-        self._sigma_tar = sigma_tar
+        # Keep proposal supply separate from policy admission.  ``sigma_tar``
+        # remains the locked P0/P1 raw/admission line; ``sigma_prop`` only
+        # controls what the TSP3D service returns.  None preserves the legacy
+        # one-threshold behaviour exactly.
+        self._sigma_tar = float(sigma_tar)
+        self._sigma_prop = (
+            self._sigma_tar if sigma_prop is None else float(sigma_prop)
+        )
+        if not 0.0 <= self._sigma_prop <= 1.0:
+            raise ValueError(f"sigma_prop must be in [0, 1], got {self._sigma_prop}")
         self._sigma_sce = sigma_sce
         self._tau = tau
         self._near_field_dist = near_field_dist
@@ -206,6 +218,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._target_verify_state: Dict[str, List[Tuple[int, np.ndarray, float, float]]] = {}
         self._target_fallback_state: Dict[str, List[Dict[str, Any]]] = {}
         self._last_target_coord: Union[None, np.ndarray] = None
+        self._last_target_centroid: Union[None, np.ndarray] = None
+        self._candidate_seq = 0
+        self._candidate_logs: List[Dict[str, Any]] = []
+        self._memory_event_logs: List[Dict[str, Any]] = []
+        self._nav_goal_logs: List[Dict[str, Any]] = []
 
         # Mechanism initialisation
         self._init_spatial_representations(
@@ -274,12 +291,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._init_s_penalty(
             enable_s_penalty=enable_s_penalty,
             s_penalty_thresh=s_penalty_thresh,
-            s_penalty_floor=s_penalty_floor,
-            s_penalty_radius_m=s_penalty_radius_m,
             s_penalty_uncovered_w=s_penalty_uncovered_w,
             s_penalty_use_surface=s_penalty_use_surface,
             goal_use_surface=goal_use_surface,
-            sx_conflict_gate=sx_conflict_gate,
+            det_log_dir=det_log_dir,
         )
         self._init_geom_gate(
             enable_occ_consistency=enable_occ_consistency,
@@ -300,6 +315,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             gd_skip_classes=gd_skip_classes,
             lock_min_obs=lock_min_obs,
         )
+        # 通用前置量测器
+        self._stats = VlvmStatsLogger(self, enabled=enable_stats)
 
         # 3D visual grounding and vision-language evaluation clients
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
@@ -309,18 +326,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         self._det_seed = int(det_seed)
         self._rng_step = 0            # monotonic numpy-RNG seed counter (never reset)
-        # General-purpose pre-flight stats logger
-        self._stats = VlvmStatsLogger(self, enabled=enable_stats)
 
     def _reset(self) -> None:
         """Reset memories, step counters, pointnav model, and 3D occupancy map."""
         if self._gd_proposer is not None and self._gd_proposer.cfg.enabled:
-            s = self._gd_proposer.summary()
-            print(f"[GD2] episode summary: frames={s['frames']} boxes_above_thr={s['boxes_above_thr']} "
-                  f"proposals={s['proposals']} both={self._gd_stats['both']} gd={self._gd_stats['gd']} "
-                  f"gd_rejected={self._gd_stats['gd_rejected']} both_cleared={self._gd_stats['both_cleared']} "
-                  f"tsp3d_new={self._gd_stats['tsp3d_new']} "
-                  f"rejects={s['rejects']}")
             self._gd_proposer.reset()
             self._gd_stats = {
                 "both": 0, "gd": 0, "gd_rejected": 0, "both_cleared": 0, "tsp3d_new": 0,
@@ -336,7 +345,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._target_verify_state.clear()
         self._target_fallback_state.clear()
         self._stats.episode_summary()
+        self._memory_manager.reset_ids()
         self._last_target_coord = None
+        self._last_target_centroid = None
         self._geom_gate_engine.reset()
         self._scan_in_progress = False
         self._last_pending = []
@@ -350,6 +361,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._obstacle_map3d.reset()
         self._preprocessor.reset()
         self._detect_logs = []
+        self._candidate_seq = 0
+        self._candidate_logs = []
+        self._memory_event_logs = []
+        self._nav_goal_logs = []
         self._lock_step = -1
         self._stats.reset()
         self._did_reset = True
@@ -563,26 +578,25 @@ class TSP3DObjectNavPolicy(BasePolicy):
         *,
         enable_s_penalty: bool,
         s_penalty_thresh: float,
-        s_penalty_floor: float,
-        s_penalty_radius_m: float,
         s_penalty_uncovered_w: float,
         s_penalty_use_surface: bool,
         goal_use_surface: bool,
-        sx_conflict_gate: bool = True,
+        det_log_dir: Optional[str] = None,
     ) -> None:
         """
         S-penalty: c' = c * w_S (semantic field), plus the surface-point goal option.
+
+        ``det_log_dir`` (when set) only turns on the SP1 per-detection jsonl dump; it
+        changes no admission behaviour.
         """
         self._s_penalty_cfg = SPenaltyConfig(
             enable=enable_s_penalty,
             thresh=s_penalty_thresh,
-            floor=s_penalty_floor,
-            radius_m=s_penalty_radius_m,
             uncovered_w=s_penalty_uncovered_w,
         )
         self._s_penalty_use_surface = s_penalty_use_surface
         self._goal_use_surface = goal_use_surface
-        self._sx_conflict_gate = bool(sx_conflict_gate)
+        self._det_log_dir = None if det_log_dir in (None, "", "null") else str(det_log_dir)
 
     def _init_geom_gate(
         self,
@@ -771,14 +785,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 self._gd_stats["both"] += 1
                 if res.get("suspicion_cleared"):
                     self._gd_stats["both_cleared"] += 1
-                print(f"[GD2] both -> corroborate {classes} at "
-                      f"{np.round(np.asarray(centroid_np, dtype=np.float64)[:3], 2)} "
-                      f"(tsp3d={float(conf_amp):.2f} gd={float(proposal.conf):.2f} "
-                      f"c''={float(conf_use):.2f} "
-                      f"n_obs={res.get('num_obs')} src={res.get('src')} "
-                      f"suspicious={res.get('suspicious')} cleared={bool(res.get('suspicion_cleared'))} "
-                      f"robot={np.round(np.asarray(robot_xyz, dtype=np.float64)[:2], 2)} "
-                      f"yaw={float(robot_yaw):.2f}) -> normal path")
                 continue
 
             if not admit_as_suspicious(vote):
@@ -787,11 +793,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
             cls = proposal.canon if proposal.canon in target_classes else target_classes[0]
             if not self._gd_geom_admit(proposal, cls, pcd_world, robot_xyz):
                 self._gd_stats["gd_rejected"] += 1
-                print(f"[GD2] gd -> REJECTED by geom gate '{cls}' at "
-                      f"{np.round(np.asarray(proposal.centroid, dtype=np.float64)[:3], 2)}")
                 continue
 
-            res = self._memory_manager.accumulate(
+            self._memory_manager.accumulate(
                 cls, np.asarray(proposal.centroid, dtype=np.float64),
                 confidence=self._sigma_tar,
                 near_surface=np.asarray(proposal.surface, dtype=np.float64),
@@ -800,12 +804,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 gd_conf=float(proposal.conf),
             )
             self._gd_stats["gd"] += 1
-            print(f"[GD2] gd -> single vote '{cls}' at "
-                  f"{np.round(np.asarray(proposal.centroid, dtype=np.float64)[:3], 2)} "
-                  f"(gd={float(proposal.conf):.2f} n_obs={res.get('num_obs')} "
-                  f"src={res.get('src')} suspicious={res.get('suspicious')} "
-                  f"robot={np.round(np.asarray(robot_xyz, dtype=np.float64)[:2], 2)} "
-                  f"yaw={float(robot_yaw):.2f}) -> pending")
 
     # ==========================================================================
     # === Input & Mapping Module ===
@@ -859,7 +857,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
         raw_preds, diagnostics = self._tsp3d_client.predict(
             pcd=aligned_pcd,
             text=target_query,
-            sigma_tar=self._sigma_tar,
+            # The wire API retains the historical name ``sigma_tar``; at the
+            # policy boundary this value has proposal-only semantics.
+            sigma_tar=self._sigma_prop,
             sigma_sce=dynamic_sigma_sce,
             tau=self._tau,
             use_vlfm_nlp=self._nlp_mode,
@@ -928,8 +928,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
         valid_goals: List[np.ndarray] = []
         valid_obs: List[int] = []
         valid_src: List[str] = []
-        # Raw GD sigmoid per candidate entry (0.0 = no GD vote).
         valid_gconf: List[float] = []
+        valid_memory_ids: List[Optional[str]] = []
+        valid_candidate_ids: List[Optional[str]] = []
+        valid_scores: List[float] = []
         target_classes = self._target_object.split("|")
         for cls in target_classes:
             if cls in self._target_3d_memory and len(self._target_3d_memory[cls]) > 0:
@@ -955,6 +957,9 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     valid_obs.append(obs)
                     valid_src.append(src)
                     valid_gconf.append(float(st.get("gd_conf", 0.0) or 0.0))
+                    valid_memory_ids.append(st.get("memory_id"))
+                    valid_candidate_ids.append(st.get("last_candidate_id"))
+                    valid_scores.append(float(v[3]) if i < len(verify_list) and len(v) > 3 else 0.0)
         if len(valid_centroids) == 0:
             return None
 
@@ -963,6 +968,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
         dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
         chosen_idx = int(np.argmin(dists_2d))
         chosen_2d = valid_goals[chosen_idx][:2].copy()
+        self._last_target_centroid = np.asarray(
+            valid_centroids[chosen_idx], dtype=np.float64
+        ).reshape(-1)[:2].copy()
+        switch_reason = "initial"
         if self._last_target_coord is None:
             self._last_target_coord = chosen_2d
         else:
@@ -970,12 +979,27 @@ class TSP3DObjectNavPolicy(BasePolicy):
             delta_dist = np.linalg.norm(chosen_2d - self._last_target_coord)
             dist_to_new = float(np.linalg.norm(valid_centroids[chosen_idx][:2] - robot_xy))
             if delta_dist < 0.1:
-                pass  # <0.1m from current target: keep
+                switch_reason = "held_near"
             elif delta_dist < 0.5 and dist_to_new > 2.0:
-                pass  # <0.5m and robot >2m away: keep
+                switch_reason = "held_far"
             else:
                 self._last_target_coord = chosen_2d
+                switch_reason = "switched"
 
+        self._nav_goal_logs.append(
+            {
+                "step": int(self._num_steps),
+                "memory_id": valid_memory_ids[chosen_idx],
+                "candidate_id": valid_candidate_ids[chosen_idx],
+                "centroid": np.asarray(valid_centroids[chosen_idx], dtype=np.float64).tolist(),
+                "goal": np.asarray(self._last_target_coord, dtype=np.float64).tolist(),
+                "quality_score": float(valid_scores[chosen_idx]),
+                "distance": float(dists_2d[chosen_idx]),
+                "num_obs": int(valid_obs[chosen_idx]),
+                "src": str(valid_src[chosen_idx]),
+                "switch_reason": switch_reason,
+            }
+        )
         self._stats.note_pick(
             valid_centroids, valid_obs, valid_src, chosen_idx, position,
             valid_gconf=valid_gconf,
@@ -1070,13 +1094,74 @@ class TSP3DObjectNavPolicy(BasePolicy):
             fy=fy,
             tf_camera_to_episodic=tf_camera_to_episodic
         )
-        detections.filter_by_conf(self._sigma_tar)
+        # Service-side filtering already applies sigma_prop.  Repeating it here
+        # protects compatibility with older/mocked servers without imposing the
+        # independent P0/P1 admission line before S can be logged.
+        detections.filter_by_conf(self._sigma_prop)
         detections.filter_by_class(target_classes, use_vlfm_nlp=self._nlp_mode)
         # Skip memory accumulation during initialization turning (repeated surfaces pollute memory).
         if not self._done_initializing:
             return detections
 
+        # Phase-G candidate contract: create one stable record before occ so
+        # rejected candidates remain available for causal gate analysis.
+        candidate_records: List[Dict[str, Any]] = []
+        for centroid, conf, box in zip(
+            detections.centroids, detections.logits, detections.boxes
+        ):
+            centroid_np = centroid.detach().cpu().numpy()
+            box_np = box.detach().cpu().numpy()
+            conf_f = float(conf.detach().cpu().item())
+            candidate_id = f"c{self._candidate_seq:06d}"
+            self._candidate_seq += 1
+            s_pt = centroid_np
+            s_pt_source = "centroid"
+            if self._s_penalty_use_surface:
+                near_pt = near_surface_point(box_np, robot_xyz)
+                if near_pt is not None:
+                    s_pt = near_pt
+                    s_pt_source = "surface"
+            s_value = self._query_semantic_at(
+                float(s_pt[0]), float(s_pt[1]), S_QUERY_RADIUS_M
+            )
+            w_s, _ = compute_w_s(s_value, self._s_penalty_cfg)
+            if s_value is None or float(s_value) <= 0.0:
+                branch = "uncovered"
+            elif float(s_value) >= float(self._s_penalty_cfg.thresh):
+                branch = "covered-high"
+            else:
+                branch = "covered-low"
+            candidate_records.append(
+                {
+                    "candidate_id": candidate_id,
+                    "step": int(self._num_steps),
+                    "target_class": target_classes[0] if target_classes else "unknown",
+                    "conf": conf_f,
+                    "pass_prop_045": bool(conf_f >= 0.45),
+                    "pass_prop_050": bool(conf_f >= 0.50),
+                    "pass_prop_055": bool(conf_f >= 0.55),
+                    "pass_prop_060": bool(conf_f >= 0.60),
+                    "sigma_prop_floor": float(self._sigma_prop),
+                    "sigma_tar_admit": float(self._sigma_tar),
+                    "box": box_np.tolist(),
+                    "centroid": centroid_np.tolist(),
+                    "surface": np.asarray(s_pt, dtype=np.float64).reshape(-1)[:3].tolist(),
+                    "distance": query_point_distance(s_pt, robot_xyz),
+                    "s": s_value,
+                    "s_pt": np.asarray(s_pt, dtype=np.float64).reshape(-1)[:3].tolist(),
+                    "s_pt_source": s_pt_source,
+                    "w_s": float(w_s),
+                    "conf_amp": conf_f * float(w_s),
+                    "branch": branch,
+                    "s_stage_seen": False,
+                    "admitted": False,
+                    "reject": None,
+                }
+            )
+        self._candidate_logs.extend(candidate_records)
+
         # REJECTED (empty-air) -> dropped before S-penalty
+        post_occ_records: List[Dict[str, Any]] = []
         if self._geom_gate_engine.enabled:
             detections = apply_geom_gate(
                 detections, pcd_world,
@@ -1084,7 +1169,22 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 obstacle_map_3d=self._obstacle_map3d,
                 step=self._num_steps,
                 robot_xyz=robot_xyz,
+                per_det_meta=candidate_records,
+                meta_out=post_occ_records,
             )
+            for record in candidate_records:
+                if not record.get("occ_passed", False):
+                    record["reject"] = "occ"
+        else:
+            post_occ_records = list(candidate_records)
+            for record in post_occ_records:
+                record.update(
+                    {
+                        "occ_passed": True,
+                        "occ_status": "gate_off",
+                        "occ_reason": "gate_off",
+                    }
+                )
         # S-penalty gate cross-validation -> write passed detections to memory.
         admitted_meta: List[Any] = []
         pending = apply_s_penalty(
@@ -1092,13 +1192,15 @@ class TSP3DObjectNavPolicy(BasePolicy):
             query_semantic=self._query_semantic_at,
             cfg=self._s_penalty_cfg,
             sigma_tar=self._sigma_tar,
+            sigma_prop=self._sigma_prop,
             use_surface=self._s_penalty_use_surface,
             goal_use_surface=self._goal_use_surface,
             nlp_mode=self._nlp_mode,
             out_log=self._detect_logs,
-            per_det_meta=None,
+            per_det_meta=post_occ_records,
             meta_out=admitted_meta,
-            conflict_gate=bool(self._sx_conflict_gate),
+            step=self._num_steps,
+            candidate_records=post_occ_records,
         )
         # Kept for the scan-end direction decision (c' ranking); see `scan_behavior`.
         self._last_pending = list(pending)
@@ -1108,21 +1210,34 @@ class TSP3DObjectNavPolicy(BasePolicy):
         # entry starts suspicious and a same-frame `both` vote clears the flag again.
         # With GD off there is no second vote at all.
         _gd_on = self._gd_proposer is not None and self._gd_proposer.cfg.enabled
-        for (conf_amp, centroid_np, near_surface, active_classes), susp in zip(
+        for (conf_amp, centroid_np, near_surface, active_classes), candidate_meta in zip(
             pending, admitted_meta
         ):
             for cls in active_classes:
                 res = self._memory_manager.accumulate(
                     cls, centroid_np, confidence=conf_amp, near_surface=near_surface,
                     robot_xyz=robot_xyz, robot_yaw=robot_yaw, max_depth=max_depth,
-                    suspicious_override=bool(susp) if susp is not None else None,
+                    suspicious_override=None,
                     new_suspicious=_gd_on,
+                    candidate_id=(candidate_meta or {}).get("candidate_id"),
+                )
+                self._memory_event_logs.append(
+                    {
+                        "event": "merge" if res.get("merged") else "new",
+                        "step": int(self._num_steps),
+                        "memory_id": res.get("memory_id"),
+                        "candidate_id": (candidate_meta or {}).get("candidate_id"),
+                        "target_class": str(cls),
+                        "centroid": np.asarray(centroid_np, dtype=np.float64).tolist(),
+                        "surface": None if near_surface is None else np.asarray(near_surface, dtype=np.float64).tolist(),
+                        "confidence": float(conf_amp),
+                        "num_obs": int(res.get("num_obs", 1)),
+                        "src": str(res.get("src") or "tsp3d"),
+                        "suspicious": bool(res.get("suspicious", False)),
+                    }
                 )
                 if _gd_on and not res.get("merged", False):
                     self._gd_stats["tsp3d_new"] += 1
-                    print(f"[TSP3D] new entry '{cls}' at "
-                          f"{np.round(np.asarray(centroid_np, dtype=np.float64)[:3], 2)} "
-                          f"-> suspicious (single-side, c'={float(conf_amp):.2f})")
         # GD auxiliary mechanism: same-frame second proposer + two-vote
         self._gd_apply(
             image_rgb, tf_camera_to_episodic, max_depth, fx, fy,
@@ -1138,15 +1253,32 @@ class TSP3DObjectNavPolicy(BasePolicy):
         # `lock_exempt_identity`: match on the pursued entry's centroid instead of the nav goal (0.5 m).
         _exempt_ref = _nav_goal
         if self._lock_exempt_identity:
-            _pxy_ref = (self._stats.last_meta or {}).get("xy")
+            _pxy_ref = self._last_target_centroid
             if _pxy_ref is not None:
                 _exempt_ref = _pxy_ref
-        self._memory_manager.step(
+        deleted = self._memory_manager.step(
             camera_pos, camera_yaw, cone_fov,
             robot_xyz=robot_xyz,
             nav_goal_xy=_exempt_ref,
             exempt_nav_goal=bool(self._lock_exempt),
         )
+        for record in deleted:
+            self._memory_event_logs.append(
+                {
+                    "event": "delete",
+                    "step": int(self._num_steps),
+                    "memory_id": record.get("memory_id"),
+                    "candidate_id": record.get("candidate_id"),
+                    "target_class": record.get("target_class"),
+                    "centroid": np.asarray(record.get("centroid", []), dtype=np.float64).tolist(),
+                    "confidence": float(record.get("conf", 0.0)),
+                    "num_obs": int(record.get("num_obs", 1)),
+                    "src": str(record.get("src") or "tsp3d"),
+                    "suspicious": bool(record.get("suspicious", False)),
+                    "delete_reason": record.get("reason"),
+                    "near_miss": int(record.get("near_miss", 0)),
+                }
+            )
 
         return detections
 
@@ -1353,7 +1485,8 @@ class VLVMConfig:
     query_z_max: float = 1.50         # Upper bound of the fixed query height band (m)
 
     # Phase 5a: TSP3D Perception & Visual Grounding
-    sigma_tar: float = 0.60             # VLVM V1 fixed target-confidence threshold for S-penalty optimization.
+    sigma_tar: float = 0.60             # P0/P1 fixed raw/admission threshold (c_base); no longer controls service proposal supply when sigma_prop is set.
+    sigma_prop: Optional[float] = None   # TSP3D service return threshold; None inherits sigma_tar for exact legacy behaviour.
     sigma_sce: float = 0.15             # TGP scene voxel retention threshold; higher = more aggressive pruning (fewer hallucinations, may miss targets).
     tau: float = 0.15                   # Soft-pruning temperature; higher = smoother/looser pruning, lower = harder thresholding.
     near_field_dist: float = 1.0        # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
@@ -1398,11 +1531,8 @@ class VLVMConfig:
 
     # Phase 7: S-penalty (semantic-field cross-validation)
     enable_s_penalty: bool = True           # Master switch: c' = c * w_S(S) — multiply TSP3D confidence by a semantic-field weight (BLIP2 ITM, zero extra queries) to amplify TP/FP discrimination.
-    s_penalty_thresh: float = 0.15          # S below this (ITM raw cosine scale ~0.10-0.15; measured min 0.084) -> apply penalty (w_S = floor).
-    s_penalty_floor: float = 0.3            # Lower bound of the dynamic penalty weight w_S = max(floor, S/thresh) when S < thresh (non-zero -> keep recall; S->0 -> floor).
-    s_penalty_radius_m: float = 0.5         # S query radius (m) around the detection point.
+    s_penalty_thresh: float = 0.15          # Only searched P1 parameter; covered w_S=min(1,max(S,0.1)/thresh).
     s_penalty_uncovered_w: float = 1.0      # weight when S=None/<=0 (no coverage): 1.0 = free pass (A1), <1.0 = mild penalty on unverifiable detections.
-    sx_conflict_gate: bool = True        # Conflict gate: reject detections with conf>=0.80 ∧ 0<S<thresh at the write entry.
     # Phase 7b: geometric admission module (occupancy-consistency gate)
     enable_occ_consistency: bool = True     # box must have occupied-voxel support in the 3D grid
     occ_min_voxels: int = 8                 # occ gate: min occupied voxels supporting the box
@@ -1412,6 +1542,7 @@ class VLVMConfig:
     ema_weight_old: float = 0.8             # cross-view EMA smoothing (old * w + new * (1 - w))
     s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
+    det_log_dir: Optional[str] = None       # SP1 per-detection jsonl directory; None = off (logging only, no behaviour change).
     
     # Phase 7d: new GD auxiliary mechanism — independent proposer + frame-level vote
     gdp_enable: bool = True              # master switch: run the GD proposal source on the current frame
@@ -1429,8 +1560,7 @@ class VLVMConfig:
     lock_exempt_identity: bool = True    # Exemption reference: True = pursued entry centroid (identity); False = nav-goal near-surface point.
     gd_skip_classes: str = ""            # object goals that skip the GD source (e.g. "couch")
 
-    enable_stats: bool = True     # Pre-flight stats logger ([NAV]/[STOP] prints + per-episode summary; zero behavior).
-
+    enable_stats: bool = True     # 通用前置量测开关（[NAV]/[STOP] 打印与逐集摘要；零行为）
 
 cs = ConfigStore.instance()
 cs.store(group="policy", name="vlvm_config_base", node=VLVMConfig())

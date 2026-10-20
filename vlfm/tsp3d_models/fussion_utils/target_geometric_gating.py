@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 # Basic geometry / 3D box helpers
@@ -170,6 +170,8 @@ def apply_geom_gate(
     obstacle_map_3d: Any,
     step: int,
     robot_xyz: Optional[np.ndarray] = None,
+    per_det_meta: Optional[List[Any]] = None,
+    meta_out: Optional[List[Any]] = None,
 ):
     """Geometric admission on the current candidates.
 
@@ -179,11 +181,13 @@ def apply_geom_gate(
     n = detections.num_detections
     if n == 0:
         return detections
+    if per_det_meta is not None:
+        assert len(per_det_meta) == n, "per_det_meta length mismatch"
     boxes_np = detections.boxes.detach().cpu().numpy()
     logits_np = detections.logits.detach().cpu().numpy()
     keep = np.ones(n, dtype=bool)
     for i in range(n):
-        status, _cluster, _diag = engine.process_detection(
+        status, _cluster, diag = engine.process_detection(
             target_class=detections.phrases[i],
             box_corners=boxes_np[i],
             current_frame_pcd=pcd_world,
@@ -193,6 +197,22 @@ def apply_geom_gate(
             robot_xyz=robot_xyz,
         )
         keep[i] = status != "REJECTED"
+        if per_det_meta is not None and isinstance(per_det_meta[i], dict):
+            occ_diag = ((diag or {}).get("diagnostics") or {}).get("occ_diag") or {}
+            per_det_meta[i].update(
+                {
+                    "occ_passed": bool(keep[i]),
+                    "occ_status": str((diag or {}).get("status", status)),
+                    "occ_rejected_at": (diag or {}).get("rejected_at"),
+                    "occ_reason": occ_diag.get("reason"),
+                    "occ_num_occ": occ_diag.get("num_occ"),
+                    "occ_num_explored": occ_diag.get("num_explored"),
+                    "occ_ratio": occ_diag.get("occ_ratio"),
+                    "occ_free_ratio": occ_diag.get("free_ratio"),
+                }
+            )
+        if keep[i] and meta_out is not None:
+            meta_out.append(per_det_meta[i] if per_det_meta is not None else None)
     if not keep.all():
         detections.filter_by_mask(keep)
     return detections

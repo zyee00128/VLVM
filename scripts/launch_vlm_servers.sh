@@ -46,21 +46,25 @@ BERT_ENV=""
 [ -n "$LAVIS_BERT_DIR" ] && BERT_ENV="LAVIS_BERT_MODEL_PATH='${LAVIS_BERT_DIR}' "
 [ -n "$LAVIS_BERT_DIR" ] && echo ">> LAVIS BERT dir   : $LAVIS_BERT_DIR"
 
-session_name=vlm_servers_${RANDOM}
+session_name="${VLM_SESSION_NAME:-vlm_servers_${RANDOM}}"
+if tmux has-session -t "$session_name" 2>/dev/null; then
+  echo "错误: tmux 会话已存在: $session_name"
+  exit 1
+fi
 
 # Create a detached tmux session
-tmux new-session -d -s ${session_name}
+tmux new-session -d -s "$session_name"
 
 # Split the window vertically (3 panes: tsp3d | blip2itm | grounding-dino)
-tmux split-window -h -t ${session_name}:0
-tmux split-window -h -t ${session_name}:0
+tmux split-window -h -t "${session_name}:0"
+tmux split-window -h -t "${session_name}:0"
 
 # Run commands in each pane.
-tmux send-keys -t ${session_name}:0.0 \
+tmux send-keys -t "${session_name}:0.0" \
   "cd '${PROJECT_ROOT}' && HF_ENDPOINT='${HF_ENDPOINT}' TSP3D_DATA_PATH='${TSP3D_DATA_PATH}' TSP3D_CHECKPOINT='${TSP3D_CHECKPOINT}' ${VLVM_PYTHON} -m vlfm.vlm.tsp3d --port ${TSP3D_PORT}" C-m
-tmux send-keys -t ${session_name}:0.1 \
+tmux send-keys -t "${session_name}:0.1" \
   "cd '${PROJECT_ROOT}' && HF_ENDPOINT='${HF_ENDPOINT}' ${BERT_ENV}${VLVM_PYTHON} -m vlfm.vlm.blip2itm --port ${BLIP2ITM_PORT}" C-m
-tmux send-keys -t ${session_name}:0.2 \
+tmux send-keys -t "${session_name}:0.2" \
   "cd '${PROJECT_ROOT}' && ${VLVM_PYTHON} -m vlfm.vlm.grounding_dino --port ${GROUNDING_DINO_PORT}" C-m
 
 # --- 就绪等待：轮询三个端口，避免"脚本返回成功但服务仍在加载/已崩"的静默失败 ---

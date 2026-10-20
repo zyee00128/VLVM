@@ -148,7 +148,7 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
             return np.ones((om.size, om.size), np.float32)
         n = cz1 - cz0
         free = ~om._map[:, :, cz0:cz1] & om.explored_area[:, :, cz0:cz1]
-        return np.minimum(free.sum(axis=2).astype(np.float32) / n, 1.0)
+        return np.minimum(free.sum(axis=2).astype(np.float32) / n, self._h_norm_max)
 
     def _compute_h1(self) -> Union[np.ndarray, None]:
         """
@@ -156,7 +156,6 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         computed directly on the reconstructed 3D obstacle map.
         """
         return self._free_layers_2d(self._h_z_min, self._h_z_max)
-
 
     def _update_value_map_impl(self, cosines: List[List[float]]) -> None:
         raise NotImplementedError
@@ -287,7 +286,6 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
                 if curr_value + 0.01 > self._last_value:
                     # The last point pursued is still in the list of frontiers 
                     # and its value is not much worse than self._last_value
-                    print("Sticking to last point.")
                     os.environ["DEBUG_INFO"] += "Sticking to last point. "
                     best_frontier_idx = curr_index
 
@@ -297,13 +295,11 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
             for idx, frontier in enumerate(sorted_pts):
                 cyclic = self._acyclic_enforcer.check_cyclic(robot_xy, frontier, top_two_values)
                 if cyclic:
-                    print("Suppressed cyclic frontier.")
                     continue
                 best_frontier_idx = idx
                 break
 
         if best_frontier_idx is None:
-            print("All frontiers are cyclic. Just choosing the closest one.")
             os.environ["DEBUG_INFO"] += "All frontiers are cyclic. "
             best_frontier_idx = max(
                 range(len(frontiers)),
@@ -322,11 +318,9 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
     def _explore(self, observations: Union[Dict[str, Tensor], "TensorDict"]) -> Tensor:
         frontiers = self._observations_cache["frontier_sensor"]
         if np.array_equal(frontiers, np.zeros((1, 2))) or len(frontiers) == 0:
-            print("No frontiers found during exploration, stopping.")
             return self._stop_action
         best_frontier, best_value = self._get_best_frontier(observations, frontiers)
         os.environ["DEBUG_INFO"] = f"Best value: {best_value*100:.2f}%"
-        print(f"Best value: {best_value*100:.2f}%")
         pointnav_action = self._pointnav(best_frontier, stop=False)
 
         return pointnav_action

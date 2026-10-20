@@ -107,6 +107,7 @@ habitat_baselines:
       query_z_max: 1.50
       # TSP3D query
       sigma_tar: 0.60
+      sigma_prop: null  # Service return threshold; null inherits sigma_tar. Set independently only for Phase-G proposal-pool experiments.
       sigma_sce: 0.15
       tau: 0.15
       near_field_dist: 1.0
@@ -149,10 +150,8 @@ habitat_baselines:
       # S-penalty
       enable_s_penalty: True
       s_penalty_thresh: 0.15
-      s_penalty_floor: 0.3
-      s_penalty_radius_m: 0.5
       s_penalty_uncovered_w: 1.0         # Weight for no coverage (S<=0/None): 1.0 = free pass; <1.0 = mild penalty.
-      sx_conflict_gate: True
+      det_log_dir: null                  # SP1 per-detection jsonl output directory; null = off (diagnostics only).
       # geometric admission module (occupancy-consistency gate)
       enable_occ_consistency: True
       occ_min_voxels: 8
@@ -161,7 +160,7 @@ habitat_baselines:
       merge_dist_thresh: 0.5
       ema_weight_old: 0.8
       lock_exempt: True
-      lock_exempt_identity: True 
+      lock_exempt_identity: True
       # near-surface point
       s_penalty_use_surface: True
       goal_use_surface: True
@@ -178,8 +177,8 @@ habitat_baselines:
       gdp_vocab: []                 # GD caption/alias class list; empty = auto by dataset (HM3D 6 / MP3D 21).
       lock_min_obs: 2
       gd_skip_classes: ""           # GD class whitelist (these target classes skip the GD source).
-      
-      enable_stats: True            # Pre-flight stats logger ([NAV]/[STOP] prints + per-episode summary; zero behavior).
+
+      enable_stats: True
 
     ppo:
       clip_param: 0.2

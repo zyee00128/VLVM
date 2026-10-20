@@ -1,7 +1,8 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
+import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -190,84 +191,6 @@ def _point_in_target_bbox(
         return False
 
 
-def aggregate_memory_stats(
-    infos: Dict[str, Any], entries: Any = None
-) -> Dict[str, Any]:
-    """
-    Per-entry tp / fp labels of the episode-end memory.
-
-    Entries are read from the stats logger snapshot (`policy._stats.memory_entries_snapshot()`) or, 
-    as a fallback, from ``infos["memory_entries"]``. 
-    Every entry is labelled against the static GT target bbox 
-    with the same transform as ``was_false_positive``; 
-    results are split by proposer tag (`src`) and by the suspicious subset, 
-    which is what the "deleted tp share" and "lock-right : lock-wrong" judgements need.
-
-    `gd_conf_*` slots carry the same splits for the raw GD sigmoid.
-    Only entries with `gd_conf > 0` (entries that ever carried a GD vote) enter those means 
-    — a `tsp3d`-only entry writes no GD score and would otherwise dilute the average with zeros. 
-    `gd_conf_tp` vs `gd_conf_fp` is the separability read-out the confidence direction needs 
-    (a flat pair = GD score cannot rank tp over fp).
-    """
-    if entries is None:
-        entries = infos.get("memory_entries")
-    if isinstance(entries, dict):
-        entries = list(entries.values())
-    entries = list(entries or [])
-    if not entries:
-        return {}
-    try:
-        dilated_mask = cv2.dilate(
-            infos["top_down_map"]["target_bboxes_mask"], np.ones((10, 10))
-        )
-    except Exception:
-        dilated_mask = None
-
-    def _gslot() -> Dict[str, float]:
-        # n = entries, gd_conf_n = entries WITH a GD score, gd_conf = sum over those.
-        return {"n": 0, "tp": 0, "num_obs": 0.0,
-                "gd_conf": 0.0, "gd_conf_n": 0.0}
-
-    out: Dict[str, Any] = {
-        "total": 0, "tp": 0, "by_src": {},
-        "suspicious": {"n": 0, "tp": 0},
-        "gd_conf_tp": _gslot(), "gd_conf_fp": _gslot(),
-    }
-    for entry in entries:
-        try:
-            cxy = np.array(
-                [float(entry.get("x", 0.0)), float(entry.get("y", 0.0))], dtype=np.float64
-            )
-        except Exception:
-            continue
-        is_tp = _point_in_target_bbox(infos, cxy, dilated_mask)
-        out["total"] += 1
-        out["tp"] += int(is_tp)
-        gconf = float(entry.get("gd_conf", 0.0) or 0.0)
-        src = str(entry.get("src") or "tsp3d")
-        slot = out["by_src"].setdefault(src, _gslot())
-        slot["n"] += 1
-        slot["tp"] += int(is_tp)
-        slot["num_obs"] += float(entry.get("num_obs", 0.0))
-        if gconf > 0.0:
-            slot["gd_conf"] += gconf
-            slot["gd_conf_n"] += 1
-        # tp / fp split of the GD score itself.
-        if gconf > 0.0:
-            grp = out["gd_conf_tp"] if is_tp else out["gd_conf_fp"]
-            grp["n"] += 1
-            grp["gd_conf"] += gconf
-        if entry.get("suspicious"):
-            out["suspicious"]["n"] += 1
-            out["suspicious"]["tp"] += int(is_tp)
-    for slot in out["by_src"].values():
-        slot["num_obs"] /= max(1, slot["n"])
-        slot["gd_conf"] /= max(1.0, slot["gd_conf_n"])
-    for key in ("gd_conf_tp", "gd_conf_fp"):
-        out[key]["gd_conf"] /= max(1.0, out[key]["n"])
-    return out
-
-
 def aggregate_detect_stats(
     infos: Dict[str, Any], detect_logs: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
@@ -308,4 +231,227 @@ def aggregate_detect_stats(
         "admitted": [bool(d.get("admitted", False)) for d in detect_logs],
         "s_vals": [d.get("s", None) for d in detect_logs],
         "rejects": rejects,
+    }
+
+
+def _as_opt_float(value: Any) -> Optional[float]:
+    """Best-effort float conversion for jsonl dumping (None stays None)."""
+    try:
+        return None if value is None else float(value)
+    except Exception:
+        return None
+
+
+def dump_detection_logs(
+    path: str,
+    *,
+    scene_id: str,
+    episode_id: int,
+    target_object: str,
+    infos: Dict[str, Any],
+    detect_logs: List[Dict[str, Any]],
+    cfg_snapshot: Dict[str, Any],
+    success: int,
+    oracle_success: int,
+    failure_cause: str,
+) -> int:
+    """SP1 per-detection jsonl dump (append; one file spans the whole eval run).
+
+    Layout: one ``{"kind": "ep"}`` header per episode (scene / episode / target /
+    outcome / the S-penalty config in force), then one ``{"kind": "det"}`` line per
+    detection carrying the raw S-penalty inputs and the decision branch. TP is decided
+    here with the same dilated target-mask test as ``aggregate_detect_stats``, so
+    ``ft_tsp3d/eval_tools/s_evidence.py`` can recompute S-only / fused statistics offline.
+
+    Only ``t_S`` is searched and can be re-derived offline from the logged raw ``s``.
+    ``s_min=0.1`` and query ``radius_m=0.5`` are fixed implementation constants.
+
+    Returns the number of detection lines written.
+    """
+    scene = os.path.basename(str(scene_id)).split(".")[0]
+    try:
+        dilated_mask = cv2.dilate(
+            infos["top_down_map"]["target_bboxes_mask"], np.ones((10, 10))
+        )
+    except Exception:
+        dilated_mask = None
+
+    target = str(target_object or "unknown")
+    n_written = 0
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "kind": "ep",
+                    "scene": scene,
+                    "episode_id": int(episode_id),
+                    "target_object": target,
+                    "success": int(success),
+                    "oracle_success": int(oracle_success),
+                    "failure_cause": str(failure_cause),
+                    "n_det": len(detect_logs),
+                    "cfg": cfg_snapshot,
+                }
+            )
+            + "\n"
+        )
+        for idx, det in enumerate(detect_logs):
+            centroid = np.asarray(det.get("centroid", []), dtype=np.float64).reshape(-1)
+            tp = _point_in_target_bbox(infos, centroid[:2], dilated_mask)
+            fh.write(
+                json.dumps(
+                    {
+                        "kind": "det",
+                        "scene": scene,
+                        "episode_id": int(episode_id),
+                        "target_object": target,
+                        "success": int(success),
+                        "oracle_success": int(oracle_success),
+                        "failure_cause": str(failure_cause),
+                        "idx": int(idx),
+                        "tp": bool(tp),
+                        "step": det.get("step"),
+                        "conf": _as_opt_float(det.get("conf")),
+                        "pass_prop_045": bool(det.get("pass_prop_045", False)),
+                        "pass_prop_050": bool(det.get("pass_prop_050", False)),
+                        "pass_prop_055": bool(det.get("pass_prop_055", False)),
+                        "pass_prop_060": bool(det.get("pass_prop_060", False)),
+                        "sigma_prop_floor": _as_opt_float(det.get("sigma_prop_floor")),
+                        "sigma_tar_admit": _as_opt_float(det.get("sigma_tar_admit")),
+                        "conf_amp": _as_opt_float(det.get("conf_amp")),
+                        "s": _as_opt_float(det.get("s")),
+                        "s_pt": det.get("s_pt"),
+                        "s_pt_source": det.get("s_pt_source"),
+                        "w_s": _as_opt_float(det.get("w_s")),
+                        "branch": det.get("branch"),
+                        "dist": _as_opt_float(det.get("dist")),
+                        "admitted": bool(det.get("admitted", False)),
+                        "reject": det.get("reject"),
+                        "use_surface": det.get("use_surface"),
+                    }
+                )
+                + "\n"
+            )
+            n_written += 1
+    return n_written
+
+
+def _jsonable(value: Any) -> Any:
+    """Convert numpy-heavy diagnostic records to JSON-safe builtin values."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def dump_phase_g_logs(
+    directory: str,
+    *,
+    scene_id: str,
+    episode_id: int,
+    target_object: str,
+    infos: Dict[str, Any],
+    candidate_logs: List[Dict[str, Any]],
+    memory_event_logs: List[Dict[str, Any]],
+    nav_goal_logs: List[Dict[str, Any]],
+    cfg_snapshot: Dict[str, Any],
+    episode_stats: Dict[str, Any],
+    success: int,
+    oracle_success: int,
+    failure_cause: str,
+) -> Dict[str, int]:
+    """Write the four-layer Phase-G contract without changing policy behavior."""
+    os.makedirs(directory, exist_ok=True)
+    scene = os.path.basename(str(scene_id)).split(".")[0]
+    episode = int(episode_id)
+    prefix = f"{scene}:{episode}"
+    try:
+        dilated_mask = cv2.dilate(
+            infos["top_down_map"]["target_bboxes_mask"], np.ones((10, 10))
+        )
+    except Exception:
+        dilated_mask = None
+
+    def _uid(local_id: Any, tag: str) -> Optional[str]:
+        return None if local_id in (None, "") else f"{prefix}:{tag}:{local_id}"
+
+    def _tp(record: Dict[str, Any]) -> bool:
+        point = record.get("centroid")
+        if point is None:
+            point = record.get("goal")
+        point_array = np.asarray([] if point is None else point)
+        return _point_in_target_bbox(infos, point_array[:2], dilated_mask)
+
+    common = {
+        "scene": scene,
+        "episode_id": episode,
+        "target_object": str(target_object or "unknown"),
+        "success": int(success),
+        "oracle_success": int(oracle_success),
+        "failure_cause": str(failure_cause),
+    }
+
+    outputs: Dict[str, List[Dict[str, Any]]] = {
+        "candidates.jsonl": [],
+        "memory_events.jsonl": [],
+        "nav_goals.jsonl": [],
+    }
+    for record in candidate_logs:
+        row = {**common, "kind": "candidate", **_jsonable(record)}
+        row["candidate_uid"] = _uid(row.get("candidate_id"), "candidate")
+        row["tp"] = bool(_tp(row))
+        outputs["candidates.jsonl"].append(row)
+    for record in memory_event_logs:
+        row = {**common, "kind": "memory_event", **_jsonable(record)}
+        row["candidate_uid"] = _uid(row.get("candidate_id"), "candidate")
+        row["memory_uid"] = _uid(row.get("memory_id"), "memory")
+        row["tp"] = bool(_tp(row))
+        outputs["memory_events.jsonl"].append(row)
+    labelled_nav: List[Dict[str, Any]] = []
+    for record in nav_goal_logs:
+        row = {**common, "kind": "nav_goal", **_jsonable(record)}
+        row["candidate_uid"] = _uid(row.get("candidate_id"), "candidate")
+        row["memory_uid"] = _uid(row.get("memory_id"), "memory")
+        row["tp"] = bool(_tp(row))
+        labelled_nav.append(row)
+    outputs["nav_goals.jsonl"] = labelled_nav
+
+    for filename, rows in outputs.items():
+        if not rows:
+            continue
+        with open(os.path.join(directory, filename), "a", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    first_wrong = next((row for row in labelled_nav if not row.get("tp")), None)
+    episode_row = {
+        **common,
+        "kind": "episode",
+        "cfg": _jsonable(cfg_snapshot),
+        "reward": _as_opt_float(episode_stats.get("reward")),
+        "spl": _as_opt_float(episode_stats.get("spl")),
+        "soft_spl": _as_opt_float(episode_stats.get("soft_spl")),
+        "steps_count": _as_opt_float(episode_stats.get("steps_count")),
+        "n_candidates": len(candidate_logs),
+        "n_memory_events": len(memory_event_logs),
+        "n_nav_goals": len(nav_goal_logs),
+        "first_wrong_lock_step": None if first_wrong is None else first_wrong.get("step"),
+        "first_wrong_memory_uid": None if first_wrong is None else first_wrong.get("memory_uid"),
+        "wrong_stop_before_target_coverage": bool(
+            str(failure_cause) == "false_positive" and not int(oracle_success)
+        ),
+    }
+    with open(os.path.join(directory, "episodes.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(episode_row, ensure_ascii=False) + "\n")
+
+    return {
+        "candidates": len(candidate_logs),
+        "memory_events": len(memory_event_logs),
+        "nav_goals": len(nav_goal_logs),
+        "episodes": 1,
     }
