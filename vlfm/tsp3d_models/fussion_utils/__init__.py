@@ -8,7 +8,7 @@ Modules:
   pipeline       : unified TSP3DInputPreprocessor (camera / world / panoramic / none)
   s_penalty      : semantic-field cross-validation (c' = c * w_S)
   target_geometric_gating : occupancy-consistency admission gate
-  target_memory_manager   : target lifecycle (merge / fallback)
+  target_memory_manager   : target lifecycle (merge / fallback / provisional gate)
 """
 
 from .world_map import WorldLocalMap

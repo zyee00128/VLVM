@@ -1,205 +1,293 @@
-# Project VLVM Stage5：Rank V2 与 Gate 重构
+# VLVM Stage 5：机制调整
 
-## 阶段定位
+> 定位：S4 已冻结 TSP3D V1 与 S-penalty v1；S5 处理十场景 SR 从 40.20% 继续提升的系统性瓶颈。60% 作为目标上界，其中约 47 集依赖第二来源复评，本轮不承诺。  
+> 约束：TSP3D 仍是主模型；2.5D ValueMap、探索/导航框架不改；GD 暂不定稿。
 
-S5 以 S4 最终权重 VLVM V1（原 R1v1 E3）及 G0、G1、G3/F0、F1 历史结果为基础重新设计 Rank 与 Gate。已有 Gate 结果只作为机制边界和训练方式对照，不直接延续为 S5 的最终 Gate 方案。
+## 1. S4 最终选择（冻结）
 
-| S5 内容 | 定位 |
+| 项 | 定稿 |
 | :--- | :--- |
-| 历史 R1v2 | 保留原始设计、训练结果与失败原因，作为 Rank V2 重构的反例 |
-| Rank V2 | 从单 query 内部排序升级为同一 view 内跨 query、跨 bbox 的全局候选排序 |
-| Gate V2 | 不在 VLVM V1 上继续追加旧 Gate；从 ScanRefer 起点重新进行 Rank V2 + Gate 联合微调 |
-| Epoch 收敛 | 分别研究 base + Rank V2 的核心收敛，以及冻结核心后的 Gate-only 收敛 |
+| 模型 | VLVM V1，`data/vlvm_v1/vlvm_v1.pth` |
+| S-penalty | v1：`w_S = 1`（uncovered）或 `min(1, max(S,0.1)/t_S)`；`c' = c · w_S` |
+| 参数 | `t_S=0.14`、`s_min=0.1`、`radius=0.5 m`、`uncovered_w=1.0` |
+| 准入 | `sigma_tar=0.60`；`sigma_prop=0.45` 只决定候选池，不改变准入集 |
+| 关闭项 | H penalty、S conflict gate、`floor` 搜索、P2/S-v2 主线 初步实验无优势，归档保留，不进入主线和后续调参 |
+| P1 基线 | 990 集 SR 40.20%（398/990）、Oracle 54.04%、SPL 0.1586、steps 200.76 |
 
-## 历史 R1v2 记录
-### 1. 状态
+## 2. 当前问题与 60% 可达性
 
-| 项目 | 状态 |
+分析范围：19,412 条候选、990 集、2,289 条 memory event、9,063 条 nav goal。
+
+### 2.1 准入漏斗
+
+| 阶段 | 候选 | TP | precision | 说明 |
+| :--- | ---: | ---: | ---: | :--- |
+| pre-occ | 19,412 | 5,916 | 30.48% | 原始候选 |
+| post-occ | 17,417 | 5,448 | 31.28% | TP 保留 92.09% |
+| raw `c≥0.60` | 3,732 | 2,381 | 63.80% | 未加 S |
+| S-penalty admitted | 2,244 | 1,638 | **72.99%** | 高置信 TP 保留 68.8% |
+| episode 有准入 TP | — | — | — | 399/990（40.3%） |
+
+S-penalty 在高置信线上剔除 743 TP / 745 FP，precision +9.19 pp。它不是主要漏斗；`sigma_tar=0.60` 与候选置信分布才是。
+
+### 2.2 Episode 分组
+
+| 分组 | 集数 | SR | wrong lock | wrong stop | nav goal TP 占比 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| 有准入 TP、无准入 FP | 308 | 92.86% | 0.0% | 2.3% | 100.00%（3,786/3,786） |
+| 有准入 TP、也有准入 FP | 91 | 65.93% | 63.7% | 12.1% | 50.03%（915/1,829） |
+| 只有准入 FP | 166 | 18.07% | 100.0% | 61.4% | 0.00%（0/3,448） |
+| 无任何准入候选 | 425 | 5.18% | 0.0% | 0.0% | — |
+
+**无准入 TP 的 591 集**
+
+| 子类 | 集数 | 当前 success | 关键事实 |
+| :--- | ---: | ---: | :--- |
+| 高置信 TP 被 S 拦截 | 26 | 7（26.9%） | 被拒 TP 的 S 均值 0.1107，conf 均值 0.666 |
+| 有 TP，但最高 conf 在 0.5–0.6 | 146 | 24（16.4%） | conf 中位数 0.555；TP 的 S 中位数 0.205，S 未惩罚 |
+| 完全无 TP | 419 | 21（5.0%） | 其中 195 集为 likely-infeasible |
+
+146 集中有 38 集落在“只有准入 FP”组、108 集落在“无任何准入候选”组。它们不是排序问题，而是中置信正确目标无法被确认与准入。
+
+### 2.3 导航目标层
+
+| 事实 | 数值 |
 | :--- | :--- |
-| R1v2：$L_{cross}+L_{intra}$ | 已完成 E1–E3 训练与 E3 全量评测 |
-| R1v2 结论 | 仅增强同一正 query 内高分候选的头部排序；整体识别、定位和高召回区分能力退化 |
-| 主线状态 | Rank 实验暂停；训练代码已回退到 R1v1 $L_{cross}$ |
-| 后续升级 | 同一 view 内聚合不同 query 的全部 bbox 候选做全局排序，保留 R1v1 pairwise softplus 形式 |
-| 未定义项 | 正负配对、query 间分数归一化、hardest-negative 规则和 loss 归一化后续单独讨论 |
+| nav goal 总数 / TP | 9,063 / 4,701（51.87%） |
+| 候选准入 precision | 72.99% |
+| 有准入 TP 的集中，最高分准入候选为 TP | 370/399（92.7%） |
+| TP+FP 共存组：TP 分数更高（62 集） | wrong lock 64.5%，SR 64.5% |
+| TP+FP 共存组：FP 分数更高（29 集） | wrong lock 62.1%，SR 69.0% |
 
-### 2. view、query 与 bbox 层级
+导航选择当前是**纯最近质心**（`argmin(dists_2d)`），`quality_score` 只记录、不参与选择。因此候选层的 73% precision 在目标层退化为 51.87%；FP 是否存在于记忆里，比 TP/FP 的分数高低更能决定结果。
 
-当前采样粒度是 view。一个 view 包含多个 query record，但每次模型前向只输入同一份 view 点云和一个 query；一个训练 step 对该 view 的各 query 分别前向，再聚合损失。
+注：2.2/2.5/2.6 中的“TP+FP 共存组”指该 episode 同时有准入 TP 与准入 FP，与 GD 的 `both` 投票无关。P1 中 `gdp_enable=False`，memory `src` 全部为 `tsp3d`，不存在 `both` 投票事件。
 
-| 层级 | R1v2 行为 |
-| :--- | :--- |
-| view | 一个训练 step；各 query 共享同一份局部点云 |
-| query record | 每次前向只处理一个 query；训练集平均约 3.89 query/view |
-| delivery Top-1 | 在线交付候选；$L_{cross}$ 使用各 query 的 Top-1 |
-| training Top-R | R1v2 额外导出的训练候选；$L_{intra}$ 只在同一正 query 内配对 |
+### 2.4 fallback 与 GD 现状
 
-### 3. R1v2 设计
+| 事件 | 数量 | 说明 |
+| :--- | ---: | :--- |
+| memory new | 803 | 其中 795 条创建即 suspicious |
+| memory merge | 1,441 | suspicion 清除 0 次 |
+| memory delete | 45 | 全部 `hysteresis_exceeded`，全部为 suspicious |
+| memory src | 2,289 | 全部 `tsp3d`（GD 关闭） |
 
-R1v2 从 `tsp3d_scanrefer.pth` 独立初始化，保持 U1、数据、优化器、3 epoch 和 R1v1 $L_{cross}$ 不变，从 epoch 1 新增同 query Top-R 分支：
+fallback 目前只在近场连续 miss 时删除，删除量仅 45/803；GD 关闭导致没有任何第二票，suspicious 永远不会被清除。**当前 fallback 对持续 FP 轨道几乎不起作用，GD 也没有参与确认。**
 
-$$
-\mathcal L_{intra}=\operatorname{softplus}
-\left(m-z_{gt}^{(q)}+z_{hard\_wrong}^{(q)}\right),
-\qquad
-\mathcal L_{rank}=1.0\,\mathcal L_{cross}+1.0\,\mathcal L_{intra}.
-$$
+### 2.5 硬上限与分项预算
 
-`L_intra` 只在单个 `label=1` query 的 Top-R 候选内计算：选择 IoU 最大且达到 0.25 的候选作为正项，其余候选中 raw logit 最高者作为错误项。负 query 不构造 intra 正项。
+有 post-occ TP 的 episode 为 571 集，无 TP 但当前成功 21 集；即使 571 集全部成功，SR 也只有 **592/990 = 59.8%**。因此 60% 必须扩大检测覆盖，不能只靠准入、排序或 FP 治理。
 
-| 控制项 | R1v1 对照 | R1v2 |
+| 工作流 | 可回收集 | 当前 success | 目标 success | 增量 | 目标假设 |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| 目标选择质量化（TP+FP 共存组） | 91 | 60 | 85 | +25 | 达到 93% |
+| 中置信 TP 确认 | 146 | 24 | 124 | +100 | 达到 85% |
+| S 阻断 TP 确认 | 26 | 7 | 21 | +14 | 达到 81% |
+| 干净 TP 转化 | 308 | 286 | 296 | +10 | 达到 96% |
+| 前四类小计 | 571 | 377 | 526 | +149 | — |
+| 本轮定稿（含无 TP 现状 21） | 990 | 398 | 547 | +149 | **SR 55.3%** |
+| 第二来源召回（GD，待重新评估，不计入本轮） | 419（195 不可行） | 21 | 68 | +47 | 仅作 60% 待定项 |
+| 若第二来源通过 | 990 | 398 | 594 | +196 | 60.0%（待定） |
+
+- 本轮定稿上限为 **55.3%**；60% 依赖第二来源复评，不再作为本轮承诺。
+- 前四项必须同时成立；任何单独一项都不足以把 SR 推到 55% 以上。
+- 若不改目标选择，候选层 precision 无法传导到导航层，TP+FP 共存组的 25 集和仅 FP 组的恢复都无从兑现。
+
+### 2.6 问题 → 方向
+
+| 问题 | 关键证据 | 方向 | 阶段 |
+| :--- | :--- | :--- | :--- |
+| 1. 目标选择忽略质量 | nav goal TP 仅 51.87%；共存组中 SR 为 64.5%（TP 高分）/ 69.0%（FP 高分），无方向性差异 | `_get_target_object_location` 从 `argmin(dists_2d)` 改为按选定 $\sigma_c$、`num_obs`、距离排序；两态只决定删除，不参与选择 | S4 |
+| 2. 中置信 TP 未准入 | 146 集，TP conf 0.5–0.6，S 中位 0.205，当前成功 24 | provisional：$0.55\le\sigma_c<0.60$、$1.5\le dist\le4.0$ m、不看 $S$ | S2 |
+| 3. FP 轨道污染与停止无确认 | 166 集 FP-only，wrong lock 100%；91 集共存；120 集 wrong stop；22 集候选全干净仍 FP | provisional 提供待验证档，但 STOP 本轮不改 | S2 |
+| 4. S 拦截少量高置信 TP | 26 集，当前成功 7 | provisional 不按 $S$ 判态，$S$ 只作用于准入 | S2 |
+| 5. 无 TP 覆盖 | 419 集（195 集不可行），当前成功 21 | 第二来源召回方案待重新评估；本轮不定稿，60% 缺口暂挂 | — |
+| 6. occ 误删 `out_of_bounds` | 393 TP / 710 FP；17 集 TP 被删光 | `out_of_bounds` → `geom_unknown`；硬几何保留 reject | S1 |
+
+### 2.7 明确不做
+
+- 不再调 S-penalty 权重、`t_S`、`sigma_tar`，不恢复 v2。
+- 不通过全局降低准入线换召回。
+- 不让 GD 分数进入 TSP3D 置信度或 S 融合公式。
+
+## 3. 机制调整
+
+### 3.1 occ 拆分（S1）
+
+| occ 原因 | n | TP | FP | 处理 |
+| :--- | ---: | ---: | ---: | :--- |
+| `out_of_bounds` | 1,103 | 393 | 710 | `geom_unknown`：保留候选；$\sigma_c>0.60$ 时进入 `confirmed` |
+| `insufficient_occ_voxels` | 815 | 70 | 745 | 保留 reject |
+| `air_penetration` | 52 | 3 | 49 | 保留 reject |
+| `low_occupancy_ratio` | 25 | 2 | 23 | 保留 reject |
+
+- 现状：统一 reject 损失 468 TP；17 集 TP 被删光，全部由 `out_of_bounds` 造成。
+- 调整：状态拆为 `geom_reject` 与 `geom_unknown`；前者继续拦截，后者在 occ 阶段只打标不拦截，后续仍受 s-penalty 准入约束。
+- `geom_unknown` 保留 `geom_status` 标签；S1 阶段不设 provisional 上限：$\sigma_c>0.60$ 直接进入 `confirmed`，$\sigma_c\le0.60$ 不写入 memory。
+- unknown 不再额外要求 covered；uncovered 按 S-penalty 的 `uncovered_w=1` 处理，与 S1 口径一致。
+- 本轮 fallback 只保留 `confirmed` / `stable` 两态；状态只影响 delete，不影响停止。
+- 日志保留 `occ_reason`，新增 `geom_status`；验收看 TP 被删 episode、FP 增量、SR。
+
+### 3.2 fallback 三态（S2 重启，S3 跳过）
+
+现状：803 new 中 795 suspicious；1,441 merge 中 0 次清除；45 delete（30 TP / 15 FP）。问题不是阈值不够低，而是 `suspicious` 同时承担“低置信”“远距离”“待验证”三种语义。
+
+三态初始在 new 时确定；S2 之后只降不升，S3 允许 merge 重判。`stable` 只能由 `confirmed` / `provisional` 降转产生，不能在 new 直接创建。`s_min=0.1` 只约束 S-penalty 准入，不参与 `provisional` 的 new 判定。
+
+写入顺序：每个检测先做 merge 判定（同类最近质心距离 `<0.5 m`）；不满足才 new 并按 new 条件定状态。
+
+**S1 / S2 / S3 的差异**
+
+| 维度 | S1 | S2 | S3 |
+| :--- | :--- | :--- | :--- |
+| 改动层 | 仅 occ 准入：`out_of_bounds` → `geom_unknown`，硬几何仍 reject | new 状态判定 + 准入/删除规则 | 仅 merge 状态判定；new 与 S2 相同 |
+| new 状态 | 无三态；unknown 沿用原 fallback（suspicious / non-suspicious） | 引入三态：$\sigma_c\ge0.60$ 为 `confirmed`；$0.55\le\sigma_c<0.60$ 且 $1.5\le dist\le4.0$ m 为 `provisional`，不看 $S$；`geom_unknown` 最高 `provisional` | 与 S2 相同 |
+| `geom_unknown` | 保留候选，无状态上限 | 需满足 provisional 条件且 $\sigma_c\ge0.55$；最高 `provisional` | 同 S2；merge 重判仍封顶 `provisional` |
+| 准入边界 | 仍 $\sigma_c\ge0.60$ 的 memory gate | 0.55–0.60 的 `provisional` 需新增 0.55 gate，或把准入下限降到 0.55 | 与 S2 相同 |
+| 状态迁移 | 无三态迁移；原 binary 逻辑 | 只降不升 | 可升可降 |
+| 升级触发 | 无三态升级 | 无 | merge 重判达标，且连续 2 帧一致 |
+| 降级触发 | 无三态降级；原 fallback 只在 `near_miss` 删除 | 仅 `near_miss` 达标 | `near_miss` 达标，或 merge 重判为 `stable` |
+| merge 对状态 | 不改 | 不改状态 | 按选定口径重判 |
+| 分数用途 | 无 5 列记录；`quality_score` 仍为历史 max | 记录 max / 最新 / EMA×3 共 5 列；new 用当前帧 $\sigma_c$ 定态，存储口径不参与行为 | 选定 1 列参与 merge 重判 |
+| `stable` 回升 | 无 `stable` 概念 | 不允许 | 允许；`geom_unknown` 最高只到 `provisional` |
+| 删除规则 | 原 binary：suspicious 2 次 / 非 suspicious 5 次删除 | `confirmed` 3 次 / `provisional` 2 次 → `stable`；`stable` 2 次删除 | 与 S2 相同 |
+| 导航影响 | 不变 | 无；状态只影响 delete | 无新增；目标选择留给 S4 |
+| 目的 | 恢复 occ 误删的 unknown 候选 | 验证三态与删除阈值，离线选定口径 | 验证 merge 重判是否值得 |
+
+注：S1 实测仅改 occ 准入，未启用三态；`geom_unknown` 接入 `provisional` 及状态上限在 S2 生效。
+
+| 状态 | new 条件 | 来源 |
 | :--- | :--- | :--- |
-| 初始化 | `tsp3d_scanrefer.pth` | `tsp3d_scanrefer.pth` |
-| 解冻边界 | U1 | U1 |
-| epoch / seed | 3 / 0 | 3 / 0 |
-| 基础学习率 | G1 `1e-4` / G2 `5e-5` / G3 `1e-5` | 相同 |
-| weight decay / clip | `1e-4` / `0.1` | 相同 |
-| rank margin / IoU 门 | `0.2` / `0.25` | 相同 |
-| rank loss | $L_{cross}$ | $L_{cross}+L_{intra}$ |
-| rank 权重 | `1.0` | `1.0 + 1.0` |
-| 每轮训练步数 | 23,031 | 23,031 |
+| `confirmed` | $\sigma_c\ge0.60$ 且非 `geom_unknown` | new |
+| `provisional` | $0.55\le\sigma_c<0.60$ 且 $1.5\ \mathrm{m}\le dist\le4.0\ \mathrm{m}$，不看 $S$；`geom_unknown` 同条件且 $\sigma_c\ge0.55$ | new |
+| `stable` | — | **仅由 confirmed / provisional 降转** |
 
-### 4. R1v2 E3 结果
+`geom_unknown` 不是绕过 $\sigma_c$ 的独立入口：进入 `provisional` 仍要求 $\sigma_c\ge0.55$ 且 $1.5\le dist\le4.0$ m；$\sigma_c<0.55$、$dist<1.5$ m、$dist>4.0$ m 均不进入 `provisional`。`provisional` 不看 $S$；S-penalty 只作用于 $\sigma_c$ 计算与准入，不参与 new 状态判定。它保留 `geom_status` 标签，但只改变状态上限（最高 `provisional`）。停止校验不读该标签，后续只按生命周期状态执行。
 
-| 档位 | 可训练参数 | Epoch | cls_base | bg | L1 | GIoU | rank_cross | rank_intra |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| R1v1 | 4,795,908 | 1 | 0.1337 | 0.0817 | 2.7453 | 1.1003 | 0.9416 | — |
-| R1v1 | 4,795,908 | 2 | 0.1495 | 0.0736 | 2.7409 | 1.0915 | 0.9780 | — |
-| R1v1 | 4,795,908 | 3 | 0.1463 | 0.0636 | 2.6290 | 1.0663 | 0.9285 | — |
-| R1v2 | 4,795,908 | 1 | 0.1888 | 0.0513 | 3.0239 | 1.1534 | 0.4011 | 0.8725 |
-| R1v2 | 4,795,908 | 2 | 0.1931 | 0.0526 | 2.8904 | 1.1162 | 0.3962 | 0.8629 |
-| R1v2 | 4,795,908 | 3 | 0.2007 | 0.0390 | 2.8513 | 1.1108 | 0.3678 | 0.8606 |
+**merge（复用当前行为）**
 
-全量 E3 使用 14 个 val 场景、2,638 个 view、2,590 个正查询和 2,638 个负查询；`sigma_tar=0`，共 5,228 次调用，`failures=0`。
+merge 门槛：同类轨道质心距离 `< merge_dist_thresh = 0.5 m`；否则新建轨道。
 
-| 指标组 | 指标 | R1v1 E3 | R1v2 E3 | R1v2 − R1v1 |
-| :--- | :--- | ---: | ---: | ---: |
-| 定位 | hit@0.25 | 33.63% | 27.30% | -6.33pp |
-| 定位 | hit@0.50 | 14.59% | 12.74% | -1.85pp |
-| 定位 | mean IoU | 0.1957 | 0.1553 | -0.0404 |
-| 排序 | AUROC | 0.8363 | 0.8372 | +0.0009 |
-| 排序 | AUPRC | 0.4511 | 0.5063 | +0.0552 |
-| 排序 | pair acc | 0.9127 | 0.9109 | -0.0018 |
-| 高召回拒识 | FPR@TPR90 / FPR@TPR95 | 0.4232 / 0.5901 | 0.5452 / 0.7297 | +0.1220 / +0.1396 |
-| 高召回拒识 | Precision@R90 / R95 | 0.2983 / 0.2436 | 0.2054 / 0.1692 | -0.0929 / -0.0744 |
-| 分数 | 正确均值 / 错误均值 / gap | 0.5198 / 0.3137 / 0.2061 | 0.5767 / 0.2859 / 0.2908 | +0.0569 / -0.0278 / +0.0847 |
-| 校准 | ECE-15 / Brier / NLL | 0.1814 / 0.1428 / 0.4552 | 0.1900 / 0.1245 / 0.4145 | +0.0086 / -0.0183 / -0.0407 |
-
-**5.1 六类别 hit@0.25**
-
-| 权重 | bed | chair | couch | potted plant | toilet | tv |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| R1v1 E3 | 49.18% | 28.42% | 41.71% | 16.67% | 41.67% | 14.89% |
-| R1v2 E3 | 38.25% | 27.04% | 31.05% | 0.60% | 39.58% | 12.94% |
-| 变化 | -10.93pp | -1.38pp | -10.66pp | -16.07pp | -2.09pp | -1.95pp |
-
-**5.2 命中迁移**
-
-| R1v1 / R1v2 hit@0.25 状态 | 数量 |
-| :--- | ---: |
-| 两者均命中 | 619 |
-| 仅 R1v1 命中 | 252 |
-| 仅 R1v2 命中 | 88 |
-| 两者均 miss | 1,631 |
-
-| 类别 | R1v2 相对 R1v1 的命中数变化 |
-| :--- | ---: |
-| bed | -60 |
-| chair | -13 |
-| couch | -56 |
-| potted plant | -27 |
-| toilet | -2 |
-| tv | -6 |
-
-**5.3 分数分布**
-
-| 类别 | R1v1 mean / p10 / p50 / p90 / ≥0.70 | R1v2 mean / p10 / p50 / p90 / ≥0.70 |
-| :--- | :--- | :--- |
-| hit | 0.5198 / 0.3170 / 0.5557 / 0.6510 / 3.6% | 0.5767 / 0.2313 / 0.6400 / 0.8266 / 43.1% |
-| miss | 0.3986 / 0.1939 / 0.3871 / 0.6238 / 3.0% | 0.3454 / 0.1372 / 0.2843 / 0.7005 / 10.1% |
-| absent | 0.2584 / 0.1188 / 0.2435 / 0.4218 / 0.08% | 0.2435 / 0.1337 / 0.2249 / 0.3717 / 0.45% |
-
-| 补充指标 | R1v1 E3 | R1v2 E3 |
-| :--- | ---: | ---: |
-| hit score sd | 0.1342 | 0.2248 |
-| Cohen's d（概率） | 1.4356 | 1.4833 |
-| R90 阈值 | 0.31695 | 0.22988 |
-| R95 阈值 | 0.25537 | 0.18382 |
-| 视图级排序违例率 | 8.73% | 8.91% |
-
-**结果分析**
-
-R1v2 把高分命中进一步推高，因此 AUPRC、gap、Brier 和 NLL 改善；但 hit 分布明显变宽，p10 从 0.3170 降至 0.2313。为覆盖 90%/95% 真阳性，阈值必须显著下移，导致 FPR 上升、Precision 下降。
-
-同视图 pair acc 基本持平，六类 hit@0.25 全部退化，potted plant 从 16.67% 降至 0.60%。这说明 $L_{intra}$ 的收益局限在同一正 query 内部的高分候选，没有提升正确目标、错误定位和 target-absent 之间的整体区分能力。R1v2 不能替代 R1v1 E3 作为 no-S 锚点。
-
-
-
-## S5 Rank V2 方向
-
-S5 不继续对单个正 query 内部的 Top-R 做局部补丁，而是将同一 view 中所有 query 产生的全部 bbox 聚合为统一候选池，直接学习跨 query、跨 bbox 的全局排序。损失形式暂时保留 R1v1 的 pairwise softplus：
-
-$$
-\mathcal L_{rank}^{global}=\operatorname{softplus}
-\left(m-z_{pos}+z_{hard\_neg}\right).
-$$
-
-| 设计项 | S5 当前方向 / 待确定内容 |
+| 字段 | merge 行为 |
 | :--- | :--- |
-| 排序范围 | 同一 view 内聚合所有 query 的全部 bbox，不再局限于单个正 query 的 Top-R |
-| 正候选 | 以达到 IoU 门的正确定位为基础；每个 GT 只取最佳 bbox，还是保留多个达标 bbox仍需确定 |
-| 负候选 | 同时覆盖 target-absent、正 query 错框和其他 query 错框 |
-| hardest negative | 比较 view 全局最高负 logit 与按负样本类型分层选择两种规则 |
-| 分数可比性 | 检查不同 query 的 logit 尺度；必要时增加 view 内归一化，但不以压缩分数动态范围为代价 |
-| loss 归一化 | 比较按 view、正候选数和有效 pair 数归一化，避免 query 数量改变单个 view 的梯度权重 |
-| 主指标约束 | Rank 改善必须同时满足 hit@0.25、hit@0.50、mean IoU 不发生系统性退化 |
-| 计算预算 | 确定全部 bbox 导出、候选池构建与流式重放的显存和时间上限 |
+| 质心 | `centroid_new = 0.8 × centroid_old + 0.2 × centroid_detection`（`ema_weight_old=0.8`） |
+| `num_obs` | `+1` |
+| 置信度 | S2：同时记录 max / 最新 / EMA，行为不依赖；S3：使用 S2 选定口径 |
+| `near_miss` | 清零 |
+| 生命周期状态 | S2 不变；S3 允许 merge 按选定分数重判（见 S1–S3 差异表） |
+| `src` | 按 `merge_src_tag(old, new)` 合并；GD 关闭时仍为 `tsp3d` |
+| surface | 不更新，保留首次写入的 near-surface 点 |
+| `last_candidate_id` | 更新为本次候选 |
 
-Rank V2 的目标不是继续拉大少量高分命中的分数，而是改善正确目标、错误定位与 target-absent 之间的全局次序。历史 R1v2 已证明 AUPRC、gap 或校准改善不能替代定位和高召回拒识指标。
+- S2 在 new 之后不按存储口径升级/降级，也不从 stable 回升；S3 例外。
+- S2 中 max / 最新 / EMA×3 共 5 列分数只记录，不改变 fallback 与导航行为；离线比较后再选定口径。
+- S3 用选定口径做 merge 重判；这是唯一允许状态升级的阶段。
 
-## S5 Gate V2 方向
+**S3 的 merge 重判规则**
 
-### 重新开始联合微调
-
-S5 Gate 不继续在 VLVM V1 上追加现有 Gate 模块，而是从 `tsp3d_scanrefer.pth` 重新初始化一轮完整训练，在 epoch 1 即同时引入 Rank V2 与 Gate。这里的“从头开始”指从 ScanRefer 预训练权重开始新的项目微调，不是随机初始化 TSP3D。
-
-新的联合训练必须区别于 G1：G1 使用 `detach_inputs=True`，Gate loss 只训练 `presence_gate.*`，不构成 Gate 对共享表征的真正联合优化。S5 需要明确 Gate 梯度进入哪些共享层、梯度权重和启用时机，并保留不让 Gate 破坏定位能力的约束。TSP3D 仍是主模型，Gate 只负责 target-present / target-absent 的存在性判断和 veto。
-
-### Gate 优化方向
-
-| 方向 | S5 设计重点 |
+| 用于重判的 $\sigma_c$（S2 选定口径） | 重判状态 |
 | :--- | :--- |
-| 优化目标 | 在固定 `recall_open≥0.99` 下提高 target-absent intercept，而不是只追求 Gate AUROC/AUPRC |
-| 正样本保护 | 将 false-close、hit@0.25、hit@0.50 和 mean IoU 作为硬约束，防止分数治理收益掩盖定位损失 |
-| Rank V2 协同 | Rank V2 负责 view 内候选次序，Gate 负责 query 是否存在；联合训练但保持任务边界清晰 |
-| Gate 输入 | 在 TSP3D 3D 特征基础上评估 Top-1 分数、Top-1/Top-2 margin、候选分数离散度和跨 query 上下文 |
-| 负样本 | F1 hard-v2 作为历史数据基线，后续加入冻结/在线核心产生的高置信 target-absent、类别混淆和近邻误检 |
-| 数据课程 | 从普通负样本过渡到 hard negative，控制 replace-source 比例，避免早期困难负样本主导训练 |
-| 损失形式 | 比较二分类损失、同 view 正负 pairwise 排序和显式召回约束；损失统一由训练 pipeline 消费 |
-| 梯度治理 | 记录 Gate 与定位、Rank V2 梯度的冲突，限制 Gate 进入共享层的范围和权重 |
-| 标定 | 每个 epoch 在固定召回约束下独立标定阈值，不使用测试结果反向选择训练参数 |
-| 消融口径 | 同一 checkpoint 同时报告 `threshold=0` 的 core 与标定阈值下的 gate，单独计算 Gate 净贡献 |
+| $\sigma_c\ge0.60$ 且非 `geom_unknown` | `confirmed` |
+| $0.55\le\sigma_c<0.60$ 且 $1.5\le dist\le4.0$ m（不看 $S$）；`geom_unknown` 同条件且 $\sigma_c\ge0.55$ | `provisional` |
+| 其他 | `stable`（仅当当前为 confirmed/provisional） |
 
-当前结果只支持“旧 Gate 作用存在但有限，冻结核心的独立训练更稳健”，不能证明独立训练是 Gate 的理论最优解。S5 的联合微调用于验证共享表征是否能提供当前冻结特征中缺失的存在性信息；如果联合训练仍以定位退化换取小幅拒识收益，则不保留该 Gate 路线。
+- 连续 2 帧证据一致才生效，避免单帧抖动。
+- S3 是本轮唯一允许状态升级的阶段；S2 仍然只降不升。
+- `geom_unknown` 即使 $\sigma_c\ge0.60$ 也只升到 `provisional`；该上限在 merge 重判中同样生效。
+- 若 S2 选定 max（单调不减），S3 实际只升不降；此时跳过 S3，或规定状态重判固定用最新/EMA，max 只供 S4。
 
-## Epoch 的两种收敛路线
+**delete：只看 near_miss，只有 stable 会删除**
 
-### 路线 A：base + Rank V2 核心收敛
+| 当前状态 | near_miss 触发 | 动作 |
+| :--- | ---: | :--- |
+| `confirmed` | ≥3 | → `stable`，near_miss 清零 |
+| `provisional` | ≥2 | → `stable`，near_miss 清零 |
+| `stable` | ≥2 | **delete** |
+| `stable` | <2 | 保持 stable |
 
-从 `tsp3d_scanrefer.pth` 开始新的 base + Rank V2 训练，使用完整学习率周期扩展 epoch，并保存每轮 checkpoint。该路线寻找的是验证集上的更优收敛点，不宣称能够证明或获得理论全局最优。checkpoint 选择首先约束 hit@0.25、hit@0.50 和 mean IoU，再比较 AUROC、AUPRC、FPR@TPR90/95、pair acc 与校准。
+- `confirmed` / `provisional` 永不直接 delete；只有 `stable` 会 delete。
+- near_miss 只在近场 FOV 锥内累加；当前 nav goal 0.5 m 内豁免；merge 会清零。
+- `fb_suspicious_conf=0.75` 退出定稿：它高于 $\sigma_c$ 的 p99=0.7044，几乎把全部轨道判成 suspicious；新状态不再由单一 confidence 阈值决定。
+- 本轮 STOP 不改，也不读取状态；停止校验与 GD 一起留到最后。
+- 验收：三态分布不再出现 99% suspicious；delete 中 TP 不增加；confirmed/provisional 无直接删除。
 
-G0 从 R1v1 E3 尾端 `LR=1e-6` 继续训练 E4/E5，只能说明当前低学习率续训发生回退，不能代替从 ScanRefer 使用完整调度进行更大 epoch 的收敛实验。
+### 3.2.1 S4-1 两态口径（历史，provisional 关闭）
 
-### 路线 B：Gate-only 独立收敛
+仅用于 S4-1；S2 重启后按 3.2 的更新条件（$0.55\le\sigma_c<0.60$、$1.5\le dist\le4.0$ m、不看 $S$）。
 
-在路线 A 选出的核心候选 checkpoint 上冻结全部核心参数，只训练 Gate，直到 Gate validation 指标和固定召回阈值稳定。该路线用于测量给定核心表征下 Gate 的能力上限，并与从 ScanRefer 开始的 Rank V2 + Gate 联合训练形成严格对照。
-
-| 对照 | 目的 |
+| 项 | 当前定稿 |
 | :--- | :--- |
-| base + Rank V2 core | 确定不含 Gate veto 的核心定位与排序上限 |
-| 同一 core + Gate-only | 测量冻结表征下 Gate 的净贡献与独立收敛边界 |
-| ScanRefer → base + Rank V2 + Gate 联合训练 | 测量 Gate 参与共享表征优化后的完整路线收益 |
-| 联合 checkpoint 的 `core` / `gate` | 分离核心训练轨迹变化与 Gate veto 的即时作用 |
+| 状态 | 仅 `confirmed` / `stable`；不启用 `provisional` |
+| new | $\sigma_c>0.60$ 进入 `confirmed`；$\sigma_c\le0.60$ 不写入 memory |
+| `geom_unknown` | $\sigma_c>0.60$ 直接进入 `confirmed`；不再设 provisional 上限，也不再额外要求 covered |
+| merge | 不改状态；只更新质心、`num_obs`、五列 $\sigma_c$，并清零 `near_miss` |
+| 降转/删除 | `confirmed` 累计 3 次 `near_miss` → `stable`；`stable` 累计 2 次 → delete |
+| STOP | 不读状态；仍为到目标 0.90 m 内停止 |
+| 跳过 | S2 三态、S3 merge 重判均不执行；不新增 provisional 行为 |
 
-两条收敛路线必须使用匹配的数据顺序、训练预算和评测集。最终路线判断同时比较完整训练路线和固定 checkpoint 的 Gate 净作用，不能把更强的初始化核心误判为 Gate 机制收益。
+### 3.3 $\sigma_c$ 记录口径（S4-1 / S4-2）
 
-以上内容为 S5 设计记录，当前不实现、不启动实验。
+- 现状：$\sigma_c$ 在每次检测时用当时 $c$、$S$ 计算一次；memory 存 `max(old_conf, new_conf)`；$S$ 不再重查；`quality_score` 用这个历史最大值，但当前选择不使用。
+- 问题：单帧高 $\sigma_c$ 永久抬高轨道，后续低 S/低 c 不会降低；FP 轨道会被历史峰值保护。
+- 五种记录值如下；`current` 指当前帧检测的 $\sigma_c=c_{frame}\cdot w_S(S_{frame})$，不重查历史 S。
+
+| 列名 | 定义 | new 初始化 | merge 更新 | 特性 |
+| :--- | :--- | :--- | :--- | :--- |
+| `sigma_c_max` | 历史最大 $\sigma_c$ | `current` | $\max(old,current)$ | 单调不减，保留峰值 |
+| `sigma_c_latest` | 最近一帧 $\sigma_c$ | `current` | `current` | 可降，对单帧 S 敏感 |
+| `sigma_c_ema_03` | $\alpha=0.3$ 的 EMA | `current` | $0.3\cdot current+0.7\cdot old$ | 最平滑，最稳 |
+| `sigma_c_ema_05` | $\alpha=0.5$ 的 EMA | `current` | $0.5\cdot current+0.5\cdot old$ | 中等平滑 |
+| `sigma_c_ema_08` | $\alpha=0.8$ 的 EMA | `current` | $0.8\cdot current+0.2\cdot old$ | 最接近最新帧 |
+
+- 五种值随 `new` / `merge` memory event 一起记录；S2/S3 跳过后仍需保留，供 S4-2 使用，不改变 fallback 行为。
+- EMA 的 $\alpha$ 为新样本权重；三档在实验前固定，避免补跑。
+- **S4-1**：继续读 `verify_state[3]` 的历史最大 $c'$，即旧口径；B 方案用它排序。
+- **S4-2**：从五列（`sigma_c_max` / `latest` / `ema_03` / `ema_05` / `ema_08`）选一列，替换 B 方案的 `valid_scores` 来源。
+- 五列必须在 provisional 关闭时也落盘；否则 S4-2 无法回放或在线读取。
+- 验收：同一轨迹可复现 5 列分数；S4-2 能读取选定列。
+
+### 3.4 目标选择（S4）
+
+- 现状：`_get_target_object_location` 用 `argmin(dists_2d)`，`quality_score/num_obs/src` 只记录。
+- 两档：
+
+| 方案 | 规则 |
+| :--- | :--- |
+| A 基线 | 纯最近质心（当前 `argmin(dists_2d)`） |
+| B 分数+观测 | 先按 `num_obs` 分组，再按 $\sigma_c$ 分档，档内选最近 |
+
+**S4-B 具体排序**
+
+| 步骤 | 规则 |
+| :--- | :--- |
+| 1. `num_obs` | 优先 `num_obs>=2`；仅当没有 `num_obs>=2` 时退回 `num_obs=1` |
+| 2. $\sigma_c$ 档 | 最高非空档：$\ge0.70$ / $0.65$–$0.70$ / $0.60$–$0.65$ / $<0.60$ |
+| 3. 距离 | 档内 `argmin(dists_2d)`；保留 0.1 m / 0.5 m distance-latch |
+
+- **S4-B 不读取 `confirmed` / `stable`**；两态只决定 delete，不参与选择。
+- A 仅作为最近邻参考，不单独跑；S4-1/S4-2 均使用 B。
+- S4-1 的 $\sigma_c$ 用旧口径：`verify_state[3]` 的历史最大 $c'$。
+- S4-2 只替换 $\sigma_c$ 来源：从五种记忆值中选一列，接入 B 方案排序。
+- $\sigma_c$ 计算改变只作用于 **nav goal 排序**：改变谁被选中；不改变 new 准入线、不改变 `near_miss`/stable、不改变 0.90 m STOP 半径。STOP 的间接变化仅来自所选目标不同。
+- 保留 0.1 m / 0.5 m distance-latch，避免频繁切换。
+- 验收：nav goal TP 占比（当前 51.87%）≥65%，SR 不下降。
+
+### 3.5 GD 状态
+
+GD 暂不进入本轮定稿，fallback 和 $\sigma_c$ 都不依赖 `both` / `gd`。GD 的触发方式、确认语义与是否保留需重新评估后另开实验，不在本文展开。
+
+## 4. 实验顺序与判定门
+
+排序原则：先固定准入与两态，再只改目标选择；S4-1 与 S4-2 之间只改变 $\sigma_c$ 计算一个变量。GD 不在本轮顺序内。
+
+| 阶段 | 单一改动 | 口径 | 判定门 | 状态 |
+| :--- | :--- | :--- | :--- | :--- |
+| S0 | 数据与离线重放：occ reason 拆分、$\sigma_c$ 分布、fallback 状态分布 | P1 990 集日志，不跑仿真 | 固定后续阶段的阈值与上界 | 已完成 |
+| S1 | occ 拆分：`out_of_bounds` 改为 `geom_unknown`（不 reject）；其他 occ reason 保留 reject | 三场景 × 99 | SR 不低于 P1 G4（39.06%）；TP 被删 episode 下降；FP 增量 ≤1 pp | 已完成 |
+| S2 | 重启 provisional：new 条件 $0.55\le\sigma_c<0.60$、$1.5\le dist\le4.0$ m、不看 $S$；三态 `confirmed` / `provisional` / `stable`；准入下限随 provisional 降到 0.55 | 三场景 × 99 | 每集记录数上升；nav goal TP 占比 ≥65%；SR 不低于 S4-1；delete 中 TP 不增加 | 已完成（SR 40.74%，见 `S5s2.md`） |
+| S3 | 跳过：不做 merge 重判与状态升级 | — | — | 跳过 |
+| S4-1 | 两态 + unknown $>0.6$ → `confirmed`；S4-B 使用旧 $\sigma_c$：`verify_state[3]` 历史最大 $c'$ | 三场景 × 99 | 作为 S4-2 的 baseline；SR 不低于 S1 | 已完成（SR 38.38%，见 `S5s4.md`） |
+| S4-2 | 五列改为离线定列（候选级分布选口径），不单独跑导航；运行时验证并入 S2 之后 | 离线 + 三场景 × 99 | 对比 S4-1；nav goal TP 占比 ≥65%；SR 不低于 S4-1 | 离线定列 |
+| S5 | 十场景验证（不含 GD） | 990 集 | 本轮定稿目标 ≥55.3%；60% 待第二来源复评 | 待跑 |
+
+S0/S1/S2/S4-1 已完成；S3 跳过；S4-2 改为离线定列；S5 待跑。GD 不在本轮顺序内，待重新评估后另开实验。

@@ -181,7 +181,6 @@ class TSPHead(nn.Module):
             coordinate_manager=x.coordinate_manager,
         )
 
-
     @staticmethod
     def _lateral_features_at(source, target):
         """
@@ -230,7 +229,6 @@ class TSPHead(nn.Module):
             out_idx = out_idx.to(device=target.F.device, dtype=torch.long)
             aligned = aligned.index_copy(0, out_idx, source.F[in_idx])
         return aligned
-
 
     def _base_ft_forward(self, backbone_feats, text_feats, text_padding_mask):
         """
@@ -792,3 +790,4 @@ class TSPHead(nn.Module):
         return self.forward_test(x, text_feats, text_attention_mask, img_metas, pc, gt_bboxes,
                                  sigma_sce, tau, gate_logits=gate_logits,
                                  gate_threshold=gate_threshold)
+)

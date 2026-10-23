@@ -33,7 +33,12 @@ from vlfm.tsp3d_models.fussion_utils.s_penalty import (
     query_point_distance,
     query_semantic_at,
 )
-from vlfm.tsp3d_models.fussion_utils.target_memory_manager import MemoryManagerConfig, TargetMemoryManager
+from vlfm.tsp3d_models.fussion_utils.target_memory_manager import (
+    MemoryManagerConfig,
+    ProvisionalGate,
+    ProvisionalGateConfig,
+    TargetMemoryManager,
+)
 from vlfm.utils.vlvm_stats_logger import VlvmStatsLogger
 from vlfm.tsp3d_models.fussion_utils.target_geometric_gating import (
     TargetGeometricGatingEngine,
@@ -144,6 +149,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
             # target-memory manager
             merge_dist_thresh: float = 0.5,
             ema_weight_old: float = 0.8,
+            enable_provisional_gate: bool = False,
+            provisional_sigma: float = 0.55,
+            provisional_min_dist: float = 1.5,
+            provisional_max_dist: float = 4.0,
+            provisional_s_min: float = 0.10,
+            enable_two_state: bool = False,
+            s4_sigma_source: str = "legacy",
             s_penalty_use_surface: bool = True,
             goal_use_surface: bool = True,
             # GD auxiliary mechanism: independent proposer + frame-level vote
@@ -198,6 +210,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
             raise ValueError(f"sigma_prop must be in [0, 1], got {self._sigma_prop}")
         self._sigma_sce = sigma_sce
         self._tau = tau
+        self._enable_two_state = bool(enable_two_state)
+        self._s4_sigma_source = str(s4_sigma_source)
+        if self._s4_sigma_source not in {
+            "legacy", "sigma_c_max", "sigma_c_latest",
+            "sigma_c_ema_03", "sigma_c_ema_05", "sigma_c_ema_08",
+        }:
+            raise ValueError(f"unsupported s4_sigma_source: {self._s4_sigma_source}")
         self._near_field_dist = near_field_dist
         self._near_field_sigma_scale = near_field_sigma_scale
         self._nlp_mode = use_vlfm_nlp
@@ -251,6 +270,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._init_memory_manager(
             merge_dist_thresh=merge_dist_thresh,
             ema_weight_old=ema_weight_old,
+            enable_lifecycle_states=enable_two_state or enable_provisional_gate,
             lock_exempt=lock_exempt,
             lock_exempt_identity=lock_exempt_identity,
         )
@@ -296,6 +316,14 @@ class TSP3DObjectNavPolicy(BasePolicy):
             goal_use_surface=goal_use_surface,
             det_log_dir=det_log_dir,
         )
+        self._provisional_gate = ProvisionalGate(ProvisionalGateConfig(
+            enabled=enable_provisional_gate,
+            confirmed_sigma=self._sigma_tar,
+            provisional_sigma=provisional_sigma,
+            provisional_min_dist=provisional_min_dist,
+            provisional_max_dist=provisional_max_dist,
+            s_min=provisional_s_min,
+        ))
         self._init_geom_gate(
             enable_occ_consistency=enable_occ_consistency,
             occ_min_voxels=occ_min_voxels,
@@ -436,6 +464,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
         *,
         merge_dist_thresh: float,
         ema_weight_old: float,
+        enable_lifecycle_states: bool = False,
         lock_exempt: bool = True,
         lock_exempt_identity: bool = True,
     ) -> None:
@@ -451,6 +480,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
             fb_suspicious_conf=self._fb_suspicious_conf,
             merge_dist_thresh=merge_dist_thresh,
             ema_weight_old=ema_weight_old,
+            enable_lifecycle_states=enable_lifecycle_states,
         ))
         self._memory_manager.bind(
             self._target_3d_memory, self._target_surface_memory,
@@ -919,10 +949,26 @@ class TSP3DObjectNavPolicy(BasePolicy):
             rgb, depth, fx, fy, tf, min_depth, max_depth
         )
 
+    @staticmethod
+    def _sigma_tier(score: float) -> int:
+        """S4-B reliability tier from sigma_c; higher is better."""
+        if score >= 0.70:
+            return 3
+        if score >= 0.65:
+            return 2
+        if score >= 0.60:
+            return 1
+        return 0
+
     def _get_target_object_location(self, position: np.ndarray) -> Union[None, np.ndarray]:
         """
         Navigation goal among the memorized target candidates.
-        Closest centroid with a distance-latch keeps goal switches stable.
+
+        S4-B ordering:
+          1. prefer entries with num_obs >= 2; fall back to num_obs == 1
+          2. within that group, use the highest non-empty sigma_c tier
+          3. within the tier, choose the nearest centroid
+        Lifecycle state is deliberately not read.
         """
         valid_centroids: List[np.ndarray] = []
         valid_goals: List[np.ndarray] = []
@@ -949,6 +995,14 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     if not is_lockable(src, obs, self._lock_min_obs, self._gd_weak_guard):
                         continue
 
+                    legacy_score = (
+                        float(v[3]) if i < len(verify_list) and len(v) > 3 else 0.0
+                    )
+                    if self._s4_sigma_source == "legacy":
+                        score = legacy_score
+                    else:
+                        score = float(st.get(self._s4_sigma_source, legacy_score) or 0.0)
+
                     valid_centroids.append(np.array(centroid))
                     if self._goal_use_surface and i < len(surf_list):
                         valid_goals.append(np.array(surf_list[i]))
@@ -959,14 +1013,32 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     valid_gconf.append(float(st.get("gd_conf", 0.0) or 0.0))
                     valid_memory_ids.append(st.get("memory_id"))
                     valid_candidate_ids.append(st.get("last_candidate_id"))
-                    valid_scores.append(float(v[3]) if i < len(verify_list) and len(v) > 3 else 0.0)
+                    valid_scores.append(score)
         if len(valid_centroids) == 0:
             return None
 
         robot_xy = np.asarray(position)[:2]
         centroids = np.array(valid_centroids)
         dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
-        chosen_idx = int(np.argmin(dists_2d))
+
+        # Step 1: observation-count group; fall back to obs=1 only when no multi-obs entry exists.
+        has_multi_obs = any(obs >= 2 for obs in valid_obs)
+        candidate_indices = [
+            i for i, obs in enumerate(valid_obs)
+            if (obs >= 2 if has_multi_obs else True)
+        ]
+
+        # Step 2: highest non-empty sigma tier within the selected num_obs group.
+        best_tier = max(self._sigma_tier(valid_scores[i]) for i in candidate_indices)
+        candidate_indices = [
+            i for i in candidate_indices
+            if self._sigma_tier(valid_scores[i]) == best_tier
+        ]
+
+        # Step 3: nearest centroid within the selected tier.
+        chosen_idx = candidate_indices[
+            int(np.argmin(dists_2d[candidate_indices]))
+        ]
         chosen_2d = valid_goals[chosen_idx][:2].copy()
         self._last_target_centroid = np.asarray(
             valid_centroids[chosen_idx], dtype=np.float64
@@ -994,6 +1066,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 "centroid": np.asarray(valid_centroids[chosen_idx], dtype=np.float64).tolist(),
                 "goal": np.asarray(self._last_target_coord, dtype=np.float64).tolist(),
                 "quality_score": float(valid_scores[chosen_idx]),
+                "sigma_source": self._s4_sigma_source,
+                "sigma_tier": int(self._sigma_tier(valid_scores[chosen_idx])),
                 "distance": float(dists_2d[chosen_idx]),
                 "num_obs": int(valid_obs[chosen_idx]),
                 "src": str(valid_src[chosen_idx]),
@@ -1152,6 +1226,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     "s_pt_source": s_pt_source,
                     "w_s": float(w_s),
                     "conf_amp": conf_f * float(w_s),
+                    "sigma_c": conf_f * float(w_s),
                     "branch": branch,
                     "s_stage_seen": False,
                     "admitted": False,
@@ -1183,11 +1258,13 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         "occ_passed": True,
                         "occ_status": "gate_off",
                         "occ_reason": "gate_off",
+                        "geom_status": "gate_off",
                     }
                 )
         # S-penalty gate cross-validation -> write passed detections to memory.
-        admitted_meta: List[Any] = []
-        pending = apply_s_penalty(
+        gate_enabled = self._provisional_gate.config.enabled
+        admitted_meta: Optional[List[Any]] = None if gate_enabled else []
+        s_penalty_pending = apply_s_penalty(
             detections, target_classes, robot_xyz,
             query_semantic=self._query_semantic_at,
             cfg=self._s_penalty_cfg,
@@ -1202,27 +1279,102 @@ class TSP3DObjectNavPolicy(BasePolicy):
             step=self._num_steps,
             candidate_records=post_occ_records,
         )
-        # Kept for the scan-end direction decision (c' ranking); see `scan_behavior`.
-        self._last_pending = list(pending)
-        self._stats.note_frame_admitted(pending)
-
-        # With the GD source on, a TSP3D-only write is "single-side" evidence: a NEW
-        # entry starts suspicious and a same-frame `both` vote clears the flag again.
-        # With GD off there is no second vote at all.
+        pending: List[Tuple[float, np.ndarray, Optional[np.ndarray], List[str]]] = []
         _gd_on = self._gd_proposer is not None and self._gd_proposer.cfg.enabled
-        for (conf_amp, centroid_np, near_surface, active_classes), candidate_meta in zip(
-            pending, admitted_meta
-        ):
-            for cls in active_classes:
-                res = self._memory_manager.accumulate(
-                    cls, centroid_np, confidence=conf_amp, near_surface=near_surface,
-                    robot_xyz=robot_xyz, robot_yaw=robot_yaw, max_depth=max_depth,
-                    suspicious_override=None,
-                    new_suspicious=_gd_on,
-                    candidate_id=(candidate_meta or {}).get("candidate_id"),
+        if gate_enabled:
+            # S5-S2 ordering is intentional: every post-occ candidate first
+            # gets a chance to merge; only an unmatched candidate is governed
+            # by the independent NEW-memory provisional gate.
+            for centroid, box, candidate_meta in zip(
+                detections.centroids, detections.boxes, post_occ_records
+            ):
+                centroid_np = centroid.detach().cpu().numpy()
+                box_np = box.detach().cpu().numpy() if torch.is_tensor(box) else np.asarray(box)
+                sigma_c = float(candidate_meta.get("sigma_c", candidate_meta.get("conf_amp", 0.0)))
+                active_classes = target_classes if self._nlp_mode else ([target_classes[0]] if target_classes else [])
+                near_surface = None
+                if self._goal_use_surface:
+                    near_surface = near_surface_point(box_np, robot_xyz)
+                gate_fields = self._provisional_gate.describe(candidate_meta)
+                gate_state = gate_fields["provisional_gate_state"]
+                candidate_meta.update(gate_fields)
+                wrote = False
+                merged = False
+                lifecycle_states: List[str] = []
+                for cls in active_classes:
+                    res = self._memory_manager.accumulate(
+                        cls, centroid_np, confidence=sigma_c, sigma_c=sigma_c,
+                        near_surface=near_surface, robot_xyz=robot_xyz,
+                        robot_yaw=robot_yaw, max_depth=max_depth,
+                        suspicious_override=None, new_suspicious=False,
+                        candidate_id=candidate_meta.get("candidate_id"),
+                        new_lifecycle_state=gate_state,
+                    )
+                    if not res.get("written", False):
+                        continue
+                    wrote = True
+                    merged = merged or bool(res.get("merged", False))
+                    lifecycle_states.append(str(res.get("lifecycle_state") or "confirmed"))
+                    self._memory_event_logs.append({
+                        "event": "merge" if res.get("merged") else "new",
+                        "step": int(self._num_steps),
+                        "memory_id": res.get("memory_id"),
+                        "candidate_id": candidate_meta.get("candidate_id"),
+                        "target_class": str(cls),
+                        "centroid": np.asarray(centroid_np, dtype=np.float64).tolist(),
+                        "surface": None if near_surface is None else np.asarray(near_surface, dtype=np.float64).tolist(),
+                        "confidence": sigma_c,
+                        "sigma_c": sigma_c,
+                        "num_obs": int(res.get("num_obs", 1)),
+                        "src": str(res.get("src") or "tsp3d"),
+                        "suspicious": bool(res.get("suspicious", False)),
+                        "lifecycle_state": res.get("lifecycle_state"),
+                        **{key: res.get(key) for key in (
+                            "sigma_c_max", "sigma_c_latest", "sigma_c_ema_03",
+                            "sigma_c_ema_05", "sigma_c_ema_08",
+                        )},
+                    })
+                candidate_meta["memory_written"] = wrote
+                candidate_meta["memory_merged"] = merged
+                candidate_meta["memory_lifecycle_states"] = lifecycle_states
+                candidate_meta["admitted"] = wrote
+                candidate_meta["reject"] = None if wrote else "provisional_gate"
+                candidate_meta["provisional_gate_outcome"] = (
+                    "merge_existing" if merged else (gate_state or "rejected")
                 )
-                self._memory_event_logs.append(
-                    {
+                if wrote:
+                    pending.append((sigma_c, centroid_np, near_surface, active_classes))
+
+            by_candidate = {
+                row.get("candidate_id"): row for row in post_occ_records
+                if row.get("candidate_id") is not None
+            }
+            for row in self._detect_logs:
+                source = by_candidate.get(row.get("candidate_id"))
+                if source is not None:
+                    row.update({key: source.get(key) for key in (
+                        "admitted", "reject", "memory_written", "memory_merged",
+                        "memory_lifecycle_states", "provisional_gate_enabled",
+                        "provisional_gate_state", "provisional_gate_passed",
+                        "provisional_gate_outcome",
+                        "provisional_sigma", "provisional_min_dist", "provisional_max_dist", "provisional_s_min",
+                    )})
+        else:
+            pending = list(s_penalty_pending)
+            # With the GD source on, a TSP3D-only write is single-side evidence.
+            for (conf_amp, centroid_np, near_surface, active_classes), candidate_meta in zip(
+                pending, admitted_meta or []
+            ):
+                for cls in active_classes:
+                    res = self._memory_manager.accumulate(
+                        cls, centroid_np, confidence=conf_amp, near_surface=near_surface,
+                        robot_xyz=robot_xyz, robot_yaw=robot_yaw, max_depth=max_depth,
+                        suspicious_override=None, new_suspicious=_gd_on,
+                        candidate_id=(candidate_meta or {}).get("candidate_id"),
+                        new_lifecycle_state=("confirmed" if self._enable_two_state else None),
+                        sigma_c=conf_amp,
+                    )
+                    self._memory_event_logs.append({
                         "event": "merge" if res.get("merged") else "new",
                         "step": int(self._num_steps),
                         "memory_id": res.get("memory_id"),
@@ -1231,13 +1383,22 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         "centroid": np.asarray(centroid_np, dtype=np.float64).tolist(),
                         "surface": None if near_surface is None else np.asarray(near_surface, dtype=np.float64).tolist(),
                         "confidence": float(conf_amp),
+                        "sigma_c": float(conf_amp),
                         "num_obs": int(res.get("num_obs", 1)),
                         "src": str(res.get("src") or "tsp3d"),
                         "suspicious": bool(res.get("suspicious", False)),
-                    }
-                )
-                if _gd_on and not res.get("merged", False):
-                    self._gd_stats["tsp3d_new"] += 1
+                        "lifecycle_state": res.get("lifecycle_state"),
+                        **{key: res.get(key) for key in (
+                            "sigma_c_max", "sigma_c_latest", "sigma_c_ema_03",
+                            "sigma_c_ema_05", "sigma_c_ema_08",
+                        )},
+                    })
+                    if _gd_on and not res.get("merged", False):
+                        self._gd_stats["tsp3d_new"] += 1
+
+        # Kept for the scan-end direction decision (c' ranking); see `scan_behavior`.
+        self._last_pending = list(pending)
+        self._stats.note_frame_admitted(pending)
         # GD auxiliary mechanism: same-frame second proposer + two-vote
         self._gd_apply(
             image_rgb, tf_camera_to_episodic, max_depth, fx, fy,
@@ -1256,16 +1417,16 @@ class TSP3DObjectNavPolicy(BasePolicy):
             _pxy_ref = self._last_target_centroid
             if _pxy_ref is not None:
                 _exempt_ref = _pxy_ref
-        deleted = self._memory_manager.step(
+        lifecycle_events = self._memory_manager.step(
             camera_pos, camera_yaw, cone_fov,
             robot_xyz=robot_xyz,
             nav_goal_xy=_exempt_ref,
             exempt_nav_goal=bool(self._lock_exempt),
         )
-        for record in deleted:
+        for record in lifecycle_events:
             self._memory_event_logs.append(
                 {
-                    "event": "delete",
+                    "event": str(record.get("event") or "delete"),
                     "step": int(self._num_steps),
                     "memory_id": record.get("memory_id"),
                     "candidate_id": record.get("candidate_id"),
@@ -1275,8 +1436,14 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     "num_obs": int(record.get("num_obs", 1)),
                     "src": str(record.get("src") or "tsp3d"),
                     "suspicious": bool(record.get("suspicious", False)),
+                    "from_state": record.get("from_state"),
+                    "lifecycle_state": record.get("lifecycle_state"),
                     "delete_reason": record.get("reason"),
                     "near_miss": int(record.get("near_miss", 0)),
+                    **{key: record.get(key) for key in (
+                        "sigma_c_max", "sigma_c_latest", "sigma_c_ema_03",
+                        "sigma_c_ema_05", "sigma_c_ema_08",
+                    )},
                 }
             )
 
@@ -1540,6 +1707,13 @@ class VLVMConfig:
     # Phase 7c: target-memory lifecycle
     merge_dist_thresh: float = 0.5          # cross-view EMA merge distance threshold (m)
     ema_weight_old: float = 0.8             # cross-view EMA smoothing (old * w + new * (1 - w))
+    enable_provisional_gate: bool = False   # S5-S2: independent gate for unmatched candidates and three-state lifecycle.
+    provisional_sigma: float = 0.55         # S5-S2 lower sigma_c line for a new provisional memory.
+    provisional_min_dist: float = 1.5       # S5-S2 provisional new-memory distance floor (m).
+    provisional_max_dist: float = 4.0       # S5-S2 provisional new-memory distance ceiling (m).
+    provisional_s_min: float = 0.10         # S5-S2 logging only: S no longer gates new entries.
+    enable_two_state: bool = False           # S5-S4: confirmed/stable lifecycle without provisional.
+    s4_sigma_source: str = "legacy"          # S4-B ranking score: legacy / sigma_c_max / sigma_c_latest / sigma_c_ema_03/05/08.
     s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
     det_log_dir: Optional[str] = None       # SP1 per-detection jsonl directory; None = off (logging only, no behaviour change).

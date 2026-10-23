@@ -249,6 +249,8 @@ def _s4_sp1_cfg_snapshot(policy: Any) -> Dict[str, Any]:
     cfg = getattr(policy, "_s_penalty_cfg", None)
     t_s = getattr(cfg, "thresh", None)
     derived_min_w = None if t_s is None else min(1.0, S_MIN / max(float(t_s), 1e-6))
+    provisional = getattr(policy, "_provisional_gate", None)
+    provisional_cfg = getattr(provisional, "config", None)
     return {
         "enable_s_penalty": bool(getattr(cfg, "enable", False)),
         "t_S": t_s,
@@ -259,6 +261,13 @@ def _s4_sp1_cfg_snapshot(policy: Any) -> Dict[str, Any]:
         "s_penalty_use_surface": bool(getattr(policy, "_s_penalty_use_surface", False)),
         "sigma_tar": getattr(policy, "_sigma_tar", None),
         "sigma_prop": getattr(policy, "_sigma_prop", None),
+        "enable_provisional_gate": bool(getattr(provisional_cfg, "enabled", False)),
+        "provisional_sigma": getattr(provisional_cfg, "provisional_sigma", None),
+        "provisional_min_dist": getattr(provisional_cfg, "provisional_min_dist", None),
+        "provisional_max_dist": getattr(provisional_cfg, "provisional_max_dist", None),
+        "provisional_s_min": getattr(provisional_cfg, "s_min", None),
+        "enable_two_state": bool(getattr(policy, "_enable_two_state", False)),
+        "s4_sigma_source": getattr(policy, "_s4_sigma_source", None),
     }
 
 

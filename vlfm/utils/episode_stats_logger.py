@@ -319,6 +319,7 @@ def dump_detection_logs(
                         "sigma_prop_floor": _as_opt_float(det.get("sigma_prop_floor")),
                         "sigma_tar_admit": _as_opt_float(det.get("sigma_tar_admit")),
                         "conf_amp": _as_opt_float(det.get("conf_amp")),
+                        "sigma_c": _as_opt_float(det.get("sigma_c", det.get("conf_amp"))),
                         "s": _as_opt_float(det.get("s")),
                         "s_pt": det.get("s_pt"),
                         "s_pt_source": det.get("s_pt_source"),
@@ -326,7 +327,15 @@ def dump_detection_logs(
                         "branch": det.get("branch"),
                         "dist": _as_opt_float(det.get("dist")),
                         "admitted": bool(det.get("admitted", False)),
+                        "s_penalty_admitted": bool(
+                            det.get("s_penalty_admitted", det.get("admitted", False))
+                        ),
+                        "s_stage_seen": bool(det.get("s_stage_seen", False)),
                         "reject": det.get("reject"),
+                        "provisional_gate_state": det.get("provisional_gate_state"),
+                        "provisional_gate_outcome": det.get("provisional_gate_outcome"),
+                        "memory_written": bool(det.get("memory_written", False)),
+                        "memory_merged": bool(det.get("memory_merged", False)),
                         "use_surface": det.get("use_surface"),
                     }
                 )

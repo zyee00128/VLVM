@@ -108,6 +108,15 @@ habitat_baselines:
       # TSP3D query
       sigma_tar: 0.60
       sigma_prop: null  # Service return threshold; null inherits sigma_tar. Set independently only for Phase-G proposal-pool experiments.
+      # S5-S2 independent NEW-memory gate (off outside the S2 launcher).
+      enable_provisional_gate: False
+      provisional_sigma: 0.55
+      provisional_min_dist: 1.5
+      provisional_max_dist: 4.0
+      provisional_s_min: 0.10  # retained for logging only; S does not gate new entries
+      # S5-S4: confirmed/stable only; S4-B sigma source.
+      enable_two_state: False
+      s4_sigma_source: legacy
       sigma_sce: 0.15
       tau: 0.15
       near_field_dist: 1.0

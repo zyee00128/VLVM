@@ -21,6 +21,68 @@ def merge_src_tag(old: Optional[str], new: Optional[str]) -> str:
     return BOTH_SRC
 
 
+CONFIRMED = "confirmed"
+PROVISIONAL = "provisional"
+STABLE = "stable"
+
+
+@dataclass(frozen=True)
+class ProvisionalGateConfig:
+    """Thresholds for creating a new target-memory entry."""
+
+    enabled: bool = False
+    confirmed_sigma: float = 0.60
+    provisional_sigma: float = 0.55
+    provisional_min_dist: float = 1.5
+    provisional_max_dist: float = 4.0
+    # Retained for config/log compatibility.  S no longer gates new entries.
+    s_min: float = 0.10
+
+
+class ProvisionalGate:
+    """Classify only unmatched candidates; merging is handled before this gate."""
+
+    def __init__(self, config: Optional[ProvisionalGateConfig] = None) -> None:
+        self.config = config or ProvisionalGateConfig()
+
+    def classify_new(self, candidate: Dict[str, Any]) -> Optional[str]:
+        if not self.config.enabled:
+            return CONFIRMED
+
+        sigma_c = float(candidate.get("sigma_c", candidate.get("conf_amp", 0.0)) or 0.0)
+        geom_status = str(candidate.get("geom_status") or "")
+
+        # geom_unknown is deliberately capped at provisional, even above the
+        # confirmed score line.  It still has to satisfy the provisional gate.
+        if sigma_c >= self.config.confirmed_sigma and geom_status != "geom_unknown":
+            return CONFIRMED
+
+        distance = candidate.get("distance")
+        if distance is None:
+            distance = candidate.get("dist")
+        in_band = (
+            distance is not None
+            and self.config.provisional_min_dist
+            <= float(distance)
+            <= self.config.provisional_max_dist
+        )
+        if sigma_c >= self.config.provisional_sigma and in_band:
+            return PROVISIONAL
+        return None
+
+    def describe(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        state = self.classify_new(candidate)
+        return {
+            "provisional_gate_enabled": bool(self.config.enabled),
+            "provisional_gate_state": state,
+            "provisional_gate_passed": state is not None,
+            "provisional_sigma": float(self.config.provisional_sigma),
+            "provisional_min_dist": float(self.config.provisional_min_dist),
+            "provisional_max_dist": float(self.config.provisional_max_dist),
+            "provisional_s_min": float(self.config.s_min),
+        }
+
+
 @dataclass
 class MemoryManagerConfig:
     """
@@ -31,6 +93,13 @@ class MemoryManagerConfig:
     # cross-view EMA merge (memory write)
     merge_dist_thresh: float = 0.5        # merge two observations of the same class within this distance (m)
     ema_weight_old: float = 0.8           # EMA smoothing: old * 0.8 + new * 0.2
+
+    # S5-S2 lifecycle.  When enabled, unmatched candidates may create a memory
+    # only when the independent provisional gate supplies an initial state.
+    enable_lifecycle_states: bool = False
+    confirmed_to_stable_misses: int = 3
+    provisional_to_stable_misses: int = 2
+    stable_delete_misses: int = 2
 
 
     # native anti-hallucination fallback (baseline mechanism)
@@ -69,6 +138,35 @@ class TargetMemoryManager:
         self._next_memory_id += 1
         return memory_id
 
+    @staticmethod
+    def _score_fields(state: Dict[str, Any]) -> Dict[str, float]:
+        return {
+            "sigma_c_max": float(state.get("sigma_c_max", 0.0)),
+            "sigma_c_latest": float(state.get("sigma_c_latest", 0.0)),
+            "sigma_c_ema_03": float(state.get("sigma_c_ema_03", 0.0)),
+            "sigma_c_ema_05": float(state.get("sigma_c_ema_05", 0.0)),
+            "sigma_c_ema_08": float(state.get("sigma_c_ema_08", 0.0)),
+        }
+
+    @staticmethod
+    def _update_scores(state: Dict[str, Any], sigma_c: float, *, new: bool) -> None:
+        value = float(sigma_c)
+        if new:
+            state.update(
+                sigma_c_max=value,
+                sigma_c_latest=value,
+                sigma_c_ema_03=value,
+                sigma_c_ema_05=value,
+                sigma_c_ema_08=value,
+            )
+            return
+        previous = float(state.get("sigma_c_latest", value))
+        state["sigma_c_max"] = max(float(state.get("sigma_c_max", previous)), value)
+        state["sigma_c_latest"] = value
+        for alpha, key in ((0.3, "sigma_c_ema_03"), (0.5, "sigma_c_ema_05"), (0.8, "sigma_c_ema_08")):
+            old = float(state.get(key, previous))
+            state[key] = alpha * value + (1.0 - alpha) * old
+
     def bind(
         self,
         target_3d_memory: Dict[str, List[np.ndarray]],
@@ -97,6 +195,8 @@ class TargetMemoryManager:
         new_suspicious: bool = False,
         gd_conf: float = 0.0,
         candidate_id: Optional[str] = None,
+        new_lifecycle_state: Optional[str] = None,
+        sigma_c: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         In-place write / EMA-merge of one admitted detection.
@@ -149,19 +249,28 @@ class TargetMemoryManager:
                 )
             return {"gd_conf": float(state.get("gd_conf", 0.0))}
 
+        score = float(confidence if sigma_c is None else sigma_c)
         recs = self._mem.get(target_class)
         if not recs:
+            if self.config.enable_lifecycle_states and new_lifecycle_state is None:
+                return {
+                    "written": False, "merged": False, "new_rejected": True,
+                    "candidate_id": candidate_id,
+                }
             self._mem[target_class] = [c_np]
             self._surf[target_class] = [s_np]
             self._ver[target_class] = [(1, r_xy.copy(), float(robot_yaw), float(confidence))]
             state = {"suspicious": suspicious, "near_miss": 0, "src": _src_tag(src),
                      "gd_conf": 0.0, "memory_id": self._alloc_memory_id(),
-                     "last_candidate_id": candidate_id}
+                     "last_candidate_id": candidate_id,
+                     "lifecycle_state": new_lifecycle_state or "confirmed"}
+            self._update_scores(state, score, new=True)
             self._fb[target_class] = [state]
-            return {"merged": False, "src": _src_tag(src), "num_obs": 1,
+            return {"written": True, "merged": False, "src": _src_tag(src), "num_obs": 1,
                     "suspicious": bool(suspicious), "suspicion_cleared": False,
                     "memory_id": state["memory_id"], "candidate_id": candidate_id,
-                    **_m_a(state)}
+                    "lifecycle_state": state["lifecycle_state"],
+                    **self._score_fields(state), **_m_a(state)}
 
         # Keep the side lists in sync
         if target_class not in self._surf:
@@ -172,7 +281,7 @@ class TargetMemoryManager:
             self._fb[target_class] = [
                 {"suspicious": False, "near_miss": 0, "src": TSP3D_SRC,
                  "gd_conf": 0.0, "memory_id": self._alloc_memory_id(),
-                 "last_candidate_id": None}
+                 "last_candidate_id": None, "lifecycle_state": "confirmed"}
                 for _ in recs
             ]
 
@@ -195,29 +304,41 @@ class TargetMemoryManager:
             merged_src = merge_src_tag(prev_src, src)
             prev_state["src"] = merged_src
             prev_state["last_candidate_id"] = candidate_id
+            # S5-S2: merge resets the miss budget and records scores, but never
+            # reclassifies the lifecycle state.
+            self._update_scores(prev_state, score, new=False)
             cleared = False
             if merged_src == BOTH_SRC:
                 # Both models corroborate the same entry -> normal target, no suspicion.
                 cleared = bool(prev_state.get("suspicious"))
                 prev_state["suspicious"] = False
-            return {"merged": True, "src": merged_src, "num_obs": int(v_old[0]) + 1,
+            return {"written": True, "merged": True, "src": merged_src, "num_obs": int(v_old[0]) + 1,
                     "suspicious": bool(prev_state.get("suspicious")),
                     "suspicion_cleared": cleared,
                     "memory_id": prev_state.get("memory_id"),
                     "candidate_id": candidate_id,
-                    **_m_a(prev_state)}
+                    "lifecycle_state": prev_state.get("lifecycle_state", "confirmed"),
+                    **self._score_fields(prev_state), **_m_a(prev_state)}
         else:
+            if self.config.enable_lifecycle_states and new_lifecycle_state is None:
+                return {
+                    "written": False, "merged": False, "new_rejected": True,
+                    "candidate_id": candidate_id,
+                }
             recs.append(c_np)
             self._surf[target_class].append(s_np)
             self._ver[target_class].append((1, r_xy.copy(), float(robot_yaw), float(confidence)))
             state = {"suspicious": suspicious, "near_miss": 0, "src": _src_tag(src),
                      "gd_conf": 0.0, "memory_id": self._alloc_memory_id(),
-                     "last_candidate_id": candidate_id}
+                     "last_candidate_id": candidate_id,
+                     "lifecycle_state": new_lifecycle_state or "confirmed"}
+            self._update_scores(state, score, new=True)
             self._fb[target_class].append(state)
-            return {"merged": False, "src": _src_tag(src), "num_obs": 1,
+            return {"written": True, "merged": False, "src": _src_tag(src), "num_obs": 1,
                     "suspicious": bool(suspicious), "suspicion_cleared": False,
                     "memory_id": state["memory_id"], "candidate_id": candidate_id,
-                    **_m_a(state)}
+                    "lifecycle_state": state["lifecycle_state"],
+                    **self._score_fields(state), **_m_a(state)}
 
     def state_of(self, centroid: np.ndarray, tol: float = 0.3) -> Dict[str, Any]:
         """
@@ -274,6 +395,7 @@ class TargetMemoryManager:
         except Exception:
             conf = 0.0
         return {
+            "event": "delete",
             "target_class": str(target_class),
             "centroid": np.asarray(centroid, dtype=np.float64).copy(),
             "reason": str(reason),
@@ -285,6 +407,8 @@ class TargetMemoryManager:
             "near_miss": int(near_miss),
             "memory_id": state.get("memory_id"),
             "candidate_id": state.get("last_candidate_id"),
+            "lifecycle_state": state.get("lifecycle_state", "confirmed"),
+            **TargetMemoryManager._score_fields(state),
         }
 
     # per-step lifecycle
@@ -308,7 +432,7 @@ class TargetMemoryManager:
 
         Returns per-deletion logs with `reason` in {"hysteresis_exceeded"}.
         """
-        deleted: List[Dict[str, Any]] = []
+        events: List[Dict[str, Any]] = []
         if robot_xyz is None:
             robot_xyz = np.asarray(camera_pos, dtype=np.float64)
         else:
@@ -328,7 +452,7 @@ class TargetMemoryManager:
                 f_states = [
                     {"suspicious": False, "near_miss": 0, "src": TSP3D_SRC,
                      "gd_conf": 0.0, "memory_id": self._alloc_memory_id(),
-                     "last_candidate_id": None}
+                     "last_candidate_id": None, "lifecycle_state": "confirmed"}
                     for _ in centroids
                 ]
                 self._fb[target_class] = f_states
@@ -369,18 +493,55 @@ class TargetMemoryManager:
                             continue
 
                         f_states[idx]["near_miss"] += 1
-                        thr = (
-                            int(self.config.fb_suspicious_hysteresis)
-                            if is_suspicious
-                            else int(self.config.fb_hysteresis)
-                        )
-                        if f_states[idx]["near_miss"] >= thr:
-                            rec = self._deletion_record(
-                                target_class, c_np, v_state, f_states[idx],
-                                "hysteresis_exceeded", int(f_states[idx]["near_miss"]),
+                        if self.config.enable_lifecycle_states:
+                            state = f_states[idx]
+                            lifecycle = str(state.get("lifecycle_state", "confirmed"))
+                            thresholds = {
+                                "confirmed": int(self.config.confirmed_to_stable_misses),
+                                "provisional": int(self.config.provisional_to_stable_misses),
+                                "stable": int(self.config.stable_delete_misses),
+                            }
+                            if state["near_miss"] >= thresholds.get(lifecycle, 2):
+                                if lifecycle in {"confirmed", "provisional"}:
+                                    misses = int(state["near_miss"])
+                                    state["lifecycle_state"] = "stable"
+                                    state["near_miss"] = 0
+                                    events.append({
+                                        "event": "transition",
+                                        "target_class": str(target_class),
+                                        "centroid": c_np.copy(),
+                                        "reason": "near_miss_downgrade",
+                                        "from_state": lifecycle,
+                                        "lifecycle_state": "stable",
+                                        "near_miss": misses,
+                                        "memory_id": state.get("memory_id"),
+                                        "candidate_id": state.get("last_candidate_id"),
+                                        "src": _src_tag(state.get("src")),
+                                        "num_obs": int(v_state[0]) if len(v_state) >= 1 else 1,
+                                        "conf": float(v_state[3]) if len(v_state) > 3 else 0.0,
+                                        "suspicious": bool(state.get("suspicious", False)),
+                                        **self._score_fields(state),
+                                    })
+                                else:
+                                    rec = self._deletion_record(
+                                        target_class, c_np, v_state, state,
+                                        "stable_hysteresis_exceeded", int(state["near_miss"]),
+                                    )
+                                    events.append(rec)
+                                    continue
+                        else:
+                            thr = (
+                                int(self.config.fb_suspicious_hysteresis)
+                                if is_suspicious
+                                else int(self.config.fb_hysteresis)
                             )
-                            deleted.append(rec)
-                            continue
+                            if f_states[idx]["near_miss"] >= thr:
+                                rec = self._deletion_record(
+                                    target_class, c_np, v_state, f_states[idx],
+                                    "hysteresis_exceeded", int(f_states[idx]["near_miss"]),
+                                )
+                                events.append(rec)
+                                continue
 
                 keep_c.append(c_np)
                 keep_s.append(surfaces[idx] if idx < len(surfaces) else c_np)
@@ -398,4 +559,4 @@ class TargetMemoryManager:
                 self._ver.pop(target_class, None)
                 self._fb.pop(target_class, None)
 
-        return deleted
+        return events

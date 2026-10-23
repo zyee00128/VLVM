@@ -44,7 +44,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from vlfm.s_penalty_constants import S_MIN, S_QUERY_RADIUS_M
+from vlfm.tsp3d_models.fussion_utils.s_penalty import S_MIN, S_QUERY_RADIUS_M
 
 DET_FILE = "s4_sp1_detections.jsonl"
 DIST_BANDS: Tuple[Tuple[float, float], ...] = ((0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 1e9))

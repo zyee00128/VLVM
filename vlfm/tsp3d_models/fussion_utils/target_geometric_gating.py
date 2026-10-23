@@ -36,7 +36,7 @@ class BoxOccupancyGate:
         obstacle_map_3d: Any,
     ) -> Tuple[bool, Dict[str, Any]]:
         if not self.cfg.enable:
-            return True, {"passed": True, "reason": "gate_off",
+            return True, {"passed": True, "geom_status": "gate_off", "reason": "gate_off",
                           "num_occ": 0, "num_explored": 0, "occ_ratio": 0.0}
         center, _, _ = decompose_box_8corners(box_corners)
 
@@ -57,7 +57,17 @@ class BoxOccupancyGate:
         cz_max = min(obstacle_map_3d._height_size - 1, max(grid_idx[0, 2], grid_idx[1, 2]))
 
         if px_min > px_max or py_min > py_max or cz_min > cz_max:
-            return False, {"reason": "out_of_bounds", "num_occ": 0}
+            # S5-S1: the accumulated occupancy grid has no evidence for this
+            # box.  This is unknown geometry, not negative geometry, so keep
+            # the candidate for the downstream S-penalty/fallback path.
+            return True, {
+                "passed": True,
+                "geom_status": "geom_unknown",
+                "reason": "out_of_bounds",
+                "num_occ": 0,
+                "num_explored": 0,
+                "occ_ratio": None,
+            }
 
         occ_subgrid = obstacle_map_3d._map[py_min:py_max + 1, px_min:px_max + 1, cz_min:cz_max + 1]
         explored_subgrid = obstacle_map_3d.explored_area[py_min:py_max + 1, px_min:px_max + 1, cz_min:cz_max + 1]
@@ -70,6 +80,7 @@ class BoxOccupancyGate:
         if num_occ < self.cfg.min_occupied_voxels:
             return False, {
                 "passed": False,
+                "geom_status": "geom_reject",
                 "reason": f"insufficient_occ_voxels ({num_occ} < {self.cfg.min_occupied_voxels})",
                 "num_occ": num_occ,
                 "num_explored": num_explored,
@@ -82,6 +93,7 @@ class BoxOccupancyGate:
             if free_ratio > self.cfg.free_ratio_rejection_thresh and num_occ < (self.cfg.min_occupied_voxels * 2):
                 return False, {
                     "passed": False,
+                    "geom_status": "geom_reject",
                     "reason": f"air_penetration_detected (free_ratio={free_ratio:.2f})",
                     "num_occ": num_occ,
                     "free_ratio": free_ratio,
@@ -92,6 +104,7 @@ class BoxOccupancyGate:
         if occ_ratio < self.cfg.min_occupancy_ratio:
             return False, {
                 "passed": False,
+                "geom_status": "geom_reject",
                 "reason": f"low_occupancy_ratio ({occ_ratio:.4f} < {self.cfg.min_occupancy_ratio})",
                 "num_occ": num_occ,
                 "occ_ratio": occ_ratio,
@@ -99,6 +112,7 @@ class BoxOccupancyGate:
 
         return True, {
             "passed": True,
+            "geom_status": "geom_confirmed",
             "reason": "pass",
             "num_occ": num_occ,
             "num_explored": num_explored,
@@ -138,7 +152,7 @@ class TargetGeometricGatingEngine:
         """
         Run one detection through the occupancy-consistency gate.
 
-        Returns status 'REJECTED' | 'HARD_CONFIRMED'
+        Returns status 'REJECTED' | 'GEOM_UNKNOWN' | 'HARD_CONFIRMED'
         'REJECTED' = empty-air box (no occupied-voxel support) 
         which the caller drops before the S-penalty gate.
         The remaining arguments are kept for call-site compatibility.
@@ -149,6 +163,7 @@ class TargetGeometricGatingEngine:
         occ_passed, occ_diag = self.occ_gate.evaluate(box_corners, obstacle_map_3d)
         diag_summary["occ_diag"] = occ_diag
 
+        geom_status = str(occ_diag.get("geom_status", "geom_confirmed"))
         if not occ_passed:
             return "REJECTED", None, {
                 "status": "REJECTED",
@@ -156,8 +171,9 @@ class TargetGeometricGatingEngine:
                 "diagnostics": diag_summary,
             }
 
-        return "HARD_CONFIRMED", None, {
-            "status": "HARD_CONFIRMED",
+        status = "GEOM_UNKNOWN" if geom_status == "geom_unknown" else "HARD_CONFIRMED"
+        return status, None, {
+            "status": status,
             "is_suspicious": False,
             "diagnostics": diag_summary,
         }
@@ -205,6 +221,7 @@ def apply_geom_gate(
                     "occ_status": str((diag or {}).get("status", status)),
                     "occ_rejected_at": (diag or {}).get("rejected_at"),
                     "occ_reason": occ_diag.get("reason"),
+                    "geom_status": occ_diag.get("geom_status"),
                     "occ_num_occ": occ_diag.get("num_occ"),
                     "occ_num_explored": occ_diag.get("num_explored"),
                     "occ_ratio": occ_diag.get("occ_ratio"),
