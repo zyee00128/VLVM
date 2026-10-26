@@ -790,4 +790,3 @@ class TSPHead(nn.Module):
         return self.forward_test(x, text_feats, text_attention_mask, img_metas, pc, gt_bboxes,
                                  sigma_sce, tau, gate_logits=gate_logits,
                                  gate_threshold=gate_threshold)
-)

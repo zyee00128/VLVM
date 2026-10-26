@@ -3,7 +3,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 # Fixed S-penalty constants (Phase G): S lower clamp and query radius.
-S_MIN = 0.1
+# Current three-scene logs have min covered S = 0.087629; 0.07 sits below
+# that and only prevents future near-zero values from collapsing w_S.
+S_MIN = 0.07
 S_QUERY_RADIUS_M = 0.5
 
 

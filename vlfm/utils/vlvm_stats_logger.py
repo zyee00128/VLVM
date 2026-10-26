@@ -17,17 +17,17 @@ class VlvmStatsLogger:
         self.enabled = bool(enabled)
         self.reset()
 
-    # ------------------------------------------------------------------ 每集状态
+    # 每集状态
     def reset(self) -> None:
         """清零全部每集状态（policy `_reset` 调用）。"""
         self.nav: Dict[str, int] = {}          # 停点 / 接近确认
-        self.pick: Dict[str, int] = {}         # 选点票型分布
+        self.pick: Dict[str, int] = {}         # 选点计数
         self._pick_key: Optional[tuple] = None
-        self._approach_key: Optional[tuple] = None
+        self._approach_key: Optional[int] = None
         self.frame_admitted: List[Tuple[str, np.ndarray]] = []   # 本帧 admitted 的 TSP3D 候选
-        self.last_meta: Dict[str, Any] = {}                      # src / n_obs / gd_conf / xy
+        self.last_meta: Dict[str, Any] = {}                      # n_obs / xy
 
-    # ------------------------------------------------------------ 帧级记账 / 打印
+    # 帧级记账 / 打印
     def note_frame_admitted(self, pending: List[Any]) -> None:
         """记录本帧 admitted 的 TSP3D 候选（cls, XY），供停点 / 接近段共位判定。"""
         if not self.enabled:
@@ -42,62 +42,40 @@ class VlvmStatsLogger:
         self,
         valid_centroids: List[np.ndarray],
         valid_obs: List[int],
-        valid_src: List[str],
         chosen_idx: int,
         position: np.ndarray,
-        valid_gconf: Optional[List[float]] = None,
     ) -> None:
-        """记录本帧锁定的导航条目 + 打印 `[NAV] pick`。
-
-        `last_meta` 恒记（`lock_exempt_identity` 的要决策输入）；打印按
-        (src, n_obs, 0.5 m 距离档) 去重，并把候选集按距离排序打印前 4 个
-        （`cands=[src:o<n_obs>:g<gd_conf>@<dist>*]`，`*` = 实际锁定的那个）。
-        """
-        src = str(valid_src[chosen_idx])
+        """记录本帧锁定的导航条目 + 打印 `[NAV] pick`。"""
         obs = int(valid_obs[chosen_idx])
         robot_xy = np.asarray(position, dtype=np.float64).reshape(-1)[:2]
-
-        def _gconf(j: int) -> float:
-            if valid_gconf is None or j >= len(valid_gconf):
-                return 0.0
-            return float(valid_gconf[j] or 0.0)
 
         def _dist(j: int) -> float:
             cen = np.asarray(valid_centroids[j], dtype=np.float64).reshape(-1)
             return float(np.linalg.norm(cen[:2] - robot_xy))
 
-        gconf = _gconf(chosen_idx)
         dist = _dist(chosen_idx)
         self.last_meta = {
-            "src": src,
             "n_obs": obs,
-            "gd_conf": gconf,
             "xy": np.asarray(valid_centroids[chosen_idx], dtype=np.float64).reshape(-1)[:2].copy(),
         }
         if not self.enabled:
             return
-        # 票型分布（不受打印去重影响）
         self.pick["n"] = int(self.pick.get("n", 0)) + 1
-        self.pick[src] = int(self.pick.get(src, 0)) + 1
-        key = (src, obs, round(dist / 0.5))
+        key = (obs, round(dist / 0.5))
         if key == self._pick_key:
             return
         self._pick_key = key
         cands = sorted(
-            (
-                (_dist(j), int(j), str(valid_src[j]), int(valid_obs[j]), _gconf(j))
-                for j in range(len(valid_centroids))
-            ),
+            ((_dist(j), int(j), int(valid_obs[j])) for j in range(len(valid_centroids))),
             key=lambda t: (t[0], t[1]),
         )
         brief = ", ".join(
-            f"{s}:o{o}:g{g:.2f}@{d:.1f}{'*' if j == chosen_idx else ''}"
-            for d, j, s, o, g in cands[:4]
+            f"o{o}@{d:.1f}{'*' if j == chosen_idx else ''}"
+            for d, j, o in cands[:4]
         )
         yaw = float(self.p._observations_cache.get("robot_heading", 0.0))
         print(
-            f"[NAV] pick src={src} n_obs={obs} gd_conf={gconf:.2f} "
-            f"dist={dist:.2f} "
+            f"[NAV] pick n_obs={obs} dist={dist:.2f} "
             f"robot={np.round(robot_xy, 2)} yaw={yaw:.2f} "
             f"n_cand={len(valid_centroids)} cands=[{brief}]"
         )
@@ -110,14 +88,14 @@ class VlvmStatsLogger:
         g = np.asarray(goal, dtype=np.float64).reshape(-1)[:2]
         robot = np.asarray(robot_xyz, dtype=np.float64).reshape(-1)[:2]
         dist = float(np.linalg.norm(g - robot))
-        dedup = (str(meta.get("src", "?")), int(round(dist / 0.5)))
+        dedup = int(round(dist / 0.5))
         if dedup == self._approach_key:
             return
         self._approach_key = dedup
         confirm = self._tsp3d_confirms(meta.get("xy"))
         key = "approach_confirm" if confirm else "approach_unconfirm"
         self.nav[key] = int(self.nav.get(key, 0)) + 1
-        print(f"[NAV] approach step={self.p._num_steps} src={meta.get('src', '?')} "
+        print(f"[NAV] approach step={self.p._num_steps} "
               f"n_obs={meta.get('n_obs', 1)} dist={dist:.2f} tsp3d_confirm={confirm}")
 
     def note_stop(self, allowed: bool = True) -> None:
@@ -134,13 +112,12 @@ class VlvmStatsLogger:
             self.nav[key] = int(self.nav.get(key, 0)) + 1
             if 0 <= steps_since_lock <= 5:
                 self.nav["stops_within5"] = int(self.nav.get("stops_within5", 0)) + 1
-        print(f"[STOP] step={self.p._num_steps} src={meta.get('src', '?')} "
+        print(f"[STOP] step={self.p._num_steps} "
               f"n_obs={meta.get('n_obs', 1)} "
-              f"gd_conf={float(meta.get('gd_conf', 0.0) or 0.0):.2f} "
               f"tsp3d_confirm={confirm} steps_since_lock={steps_since_lock} "
               f"stop_allowed={bool(allowed)}")
 
-    # ---------------------------------------------------------------- 每集汇总
+    # 每集汇总
     def episode_summary(self) -> None:
         """打印上一集的 `[NAV]` summary（policy `_reset` 调用）。"""
         if not self.enabled:
@@ -153,24 +130,23 @@ class VlvmStatsLogger:
                   f"stop_unconfirmed={nav.get('stop_unconfirmed', 0)} "
                   f"approach_confirmed={nav.get('approach_confirm', 0)} "
                   f"approach_unconfirmed={nav.get('approach_unconfirm', 0)} "
-                  f"picks={pick.get('n', 0)} pick_gd={pick.get('gd', 0)} "
-                  f"pick_both={pick.get('both', 0)} pick_tsp3d={pick.get('tsp3d', 0)}")
+                  f"picks={pick.get('n', 0)}")
 
-    # ---------------------------------------------------------------- 数据出口
+    # 数据出口
     def memory_entries_snapshot(self) -> Dict[str, Dict[str, Any]]:
         """当前记忆条目的紧凑快照（trainer 逐集读取，做条目级 tp / fp 标注）。
 
-        在集结束、下一次 `act()` 之前读取（此时 policy 尚未清记忆）。只放标量，键为
-        `"<class>[i]"`（不注入 `policy_info`：habitat 的 `extract_scalars_from_info`
-        会对非标量执行 `float()`）。`conf` = 条目 `c'`，`gd_conf` = 该条目历史上最强的
-        原始 GD sigmoid（量测），两者并列便于比较尺度。
+        在集结束、下一次 `act()` 之前读取（此时 policy 尚未清记忆）。
+        只放标量，键为 `"<class>[i]"`（不注入 `policy_info`：
+        habitat 的 `extract_scalars_from_info` 会对非标量执行 `float()`）。
+        `conf` = 条目 `c'`。
         """
         out: Dict[str, Dict[str, Any]] = {}
         if not self.enabled:
             return out
         mem = getattr(self.p, "_target_3d_memory", {}) or {}
         ver_all = getattr(self.p, "_target_verify_state", {}) or {}
-        states_all = getattr(self.p, "_target_fallback_state", {}) or {}
+        states_all = getattr(self.p, "_target_lifecycle_state", {}) or {}
         for cls, centroids in mem.items():
             ver = ver_all.get(cls, [])
             states = states_all.get(cls, [])
@@ -182,15 +158,12 @@ class VlvmStatsLogger:
                     "class": str(cls),
                     "x": float(c[0]),
                     "y": float(c[1]) if c.size > 1 else 0.0,
-                    "src": str(st.get("src") or "tsp3d"),
                     "num_obs": int(v[0]) if len(v) >= 1 else 1,
                     "conf": float(v[3]) if len(v) > 3 else 0.0,
-                    "gd_conf": float(st.get("gd_conf", 0.0) or 0.0),
-                    "suspicious": bool(st.get("suspicious", False)),
                 }
         return out
 
-    # ------------------------------------------------------------------ 内部
+    # 内部
     def _tsp3d_confirms(self, xy: Any, tol: float = 0.5) -> bool:
         """本帧 admitted 的 TSP3D 候选是否与 `xy` 共位（0.5 m）。"""
         if xy is None:

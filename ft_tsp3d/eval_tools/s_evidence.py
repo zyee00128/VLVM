@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""SP1 离线统计：S-penalty 逐检测记录的证据级判读
+"""离线统计：S-penalty 逐检测记录的证据级判读
 
 口径
 ----
 * 输入 = 导航评测落盘的 per-detection jsonl（`<det_log_dir>/s4_sp1_detections.jsonl`，
-  由 `vlfm/utils/episode_stats_logger.dump_detection_logs` 写出）。每条
-  `{"kind": "det"}` 记录携带 raw S-penalty 输入（`conf` / `s` / `w_s` / `branch` /
-  `dist` / `admitted`）与该检测的 TP 标签（`tp`：检测质心落在 GT 目标掩码
-  膨胀 10 px 内，与 `aggregate_detect_stats` 同一判据）。
+  由 `vlfm/utils/episode_stats_logger.dump_detection_logs` 写出）。
+  每条 `{"kind": "det"}` 记录携带 raw S-penalty 输入（`conf` / `s` / `w_s` / `branch` / `dist` / `admitted`）
+  与该检测的 TP 标签（`tp`：检测质心落在 GT 目标掩码膨胀 10 px 内，与 `aggregate_detect_stats` 同一判据）。
 * 样本 = 每一步写入前的全部 TSP3D 候选（含被拒检测）；`admitted=True` 是入记忆子集。
-* **未落盘层**：最终被选导航候选（nav goal）当前不进 jsonl；SP1 只报 candidate 层与
-  admitted 子集两层。
+* **未落盘层**：最终被选导航候选（nav goal）当前不进 jsonl；SP1 只报 candidate 层与 admitted 子集两层。
 * `covered` = 落盘时 `s` 有值且 `>0`；`uncovered` = `s is None` 或 `<=0`，单独成一路。
-* `branch` 依赖落盘时的 `t_S`。本工具用 `--t-s` 按固定 `s_min=0.1` 对 raw `s`
-  重算准入；S 查询半径固定为 0.5m，不参与搜索。
+* `branch` 依赖落盘时的 `t_S`。本工具用 `--t-s` 按当前 `S_MIN` 对 raw `s` 重算准入；S 查询半径固定为 0.5m，不参与搜索。
 
-统计输出（只输出统计量，SP2 的搜索范围由人工据此确认）
+统计输出
 ----
 * 覆盖率、TP/FP 构成；三路（covered-high / covered-low / uncovered）precision 与 TP recall；
 * raw `c`、融合 `c'`、S-only 的 AUROC/AUPRC，及 S-only 相对 raw `c` 的 AUPRC/AUROC 增量；

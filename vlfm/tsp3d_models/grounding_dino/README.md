@@ -1,5 +1,7 @@
 # `grounding_dino` —— GD 3D 提议源（GD proposal source）
 
+> **当前状态：已与 policy 分离。** `vlfm/policy/tsp3d_objectnav_policy.py` 不再导入或调用本目录；代码原样保留，等待重新设计。下文描述的是旧 GD 集成，不是当前 final policy 的行为。
+
 `vlfm/tsp3d_models/grounding_dino/` 把 GroundingDINO（2D 开放词检测）组织成**第二、独立的 3D 提议器**：每 `every_n` 帧消费一次原始观测（RGB + 目标文本 + 相机内外参），沿「2D 框 → 框内区域 → 深度反投 → 点簇 → 3D AABB」链产出 3D 候选；候选与 TSP3D 检测框做**帧级合票**后交给记忆系统。GD 点集**不注入**预热融合链，GD 框**不触发** TSP3D 再查询。
 
 

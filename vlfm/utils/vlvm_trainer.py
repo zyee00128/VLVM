@@ -184,9 +184,6 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
     _dist("maxscore (tp)", tp_scores)
     _dist("maxscore (fp)", fp_scores)
 
-    # --- 09-17 量测补强（零行为）：S × maxscore 联合分布 -----------------------
-    # S = 语义场值（检测框近表面点，固定半径 0.5m）；None/≤0 = 无覆盖（w_S=1 免罚）。
-    # 用途：为 sigma_tar / s_penalty_thresh 定档提供数据（此前 S 已采集但未被聚合打印）。
     s_vals_all = [v for s in stats for v in s.get("s_vals", [])]
     s_covered = [float(v) for v in s_vals_all if v is not None and float(v) > 0.0]
     s_tp = [
@@ -244,7 +241,7 @@ def _print_detection_metrics(episode_records: List[Dict[str, Any]]) -> None:
         _joint_table()
 
 
-def _s4_sp1_cfg_snapshot(policy: Any) -> Dict[str, Any]:
+def _sp_cfg_snapshot(policy: Any) -> Dict[str, Any]:
     """S-penalty config snapshot written into the SP1 detection jsonl episode header."""
     cfg = getattr(policy, "_s_penalty_cfg", None)
     t_s = getattr(cfg, "thresh", None)
@@ -266,8 +263,6 @@ def _s4_sp1_cfg_snapshot(policy: Any) -> Dict[str, Any]:
         "provisional_min_dist": getattr(provisional_cfg, "provisional_min_dist", None),
         "provisional_max_dist": getattr(provisional_cfg, "provisional_max_dist", None),
         "provisional_s_min": getattr(provisional_cfg, "s_min", None),
-        "enable_two_state": bool(getattr(policy, "_enable_two_state", False)),
-        "s4_sigma_source": getattr(policy, "_s4_sigma_source", None),
     }
 
 
@@ -364,8 +359,7 @@ class VLVMTrainer(PPOTrainer):
         if self._is_distributed:
             raise RuntimeError("Evaluation does not support distributed mode")
 
-        # Some configurations require not to load the checkpoint, 
-        # like when using a hierarchical policy
+        # Some configurations require not to load the checkpoint, like when using a hierarchical policy
         if self.config.habitat_baselines.eval.should_load_ckpt:
             # PyTorch >= 2.6 defaults `torch.load(weights_only=True)`; 
             # habitat's checkpoint loader does not pass `weights_only`, 
@@ -405,9 +399,7 @@ class VLVMTrainer(PPOTrainer):
         if config.habitat_baselines.verbose:
             logger.info(f"env config: {OmegaConf.to_yaml(config)}")
 
-        # Habitat-Baselines shuffles ``content_scenes`` in place while building
-        # vector environments. Hydra marks the composed config read-only, so a
-        # multi-scene SP1 run otherwise fails before the first episode.
+        # Habitat-Baselines shuffles ``content_scenes`` in place while building vector environments.
         with read_write(config):
             self._init_envs(config, is_eval=True)
 
@@ -517,8 +509,8 @@ class VLVMTrainer(PPOTrainer):
             t1 = time.perf_counter()
             policy_latency = t1 - t0
 
-            # NB: Move actions to CPU.  If CUDA tensors are sent in to env.step(), 
-            # that will create CUDA contexts in the subprocesses.
+            # NB: Move actions to CPU.
+            # If CUDA tensors are sent in to env.step(), that will create CUDA contexts in the subprocesses.
             if is_continuous_action_space(self._env_spec.action_space):
                 # Clipping actions to the specified limits
                 step_data = [
@@ -652,9 +644,8 @@ class VLVMTrainer(PPOTrainer):
                     except Exception:
                         detect_stats = None
 
-                    # SP1: per-detection jsonl (raw S-penalty inputs + TP label), written
-                    # only when `det_log_dir` is set. Diagnostics only - the admission
-                    # path and the in-memory episode stats are untouched.
+                    # Per-detection jsonl (raw S-penalty inputs + TP label), 
+                    # written only when `det_log_dir` is set. Diagnostics only.
                     try:
                         policy = self._agent.actor_critic
                         det_log_dir = getattr(policy, "_det_log_dir", None)
@@ -678,7 +669,7 @@ class VLVMTrainer(PPOTrainer):
                                 ),
                                 infos=infos[i],
                                 detect_logs=det_logs_for_dump,
-                                cfg_snapshot=_s4_sp1_cfg_snapshot(policy),
+                                cfg_snapshot=_sp_cfg_snapshot(policy),
                                 success=int(episode_stats["success"]),
                                 oracle_success=compute_oracle_success(infos[i]),
                                 failure_cause=failure_cause,
@@ -694,7 +685,9 @@ class VLVMTrainer(PPOTrainer):
                                 candidate_logs=getattr(policy, "_candidate_logs", None) or [],
                                 memory_event_logs=getattr(policy, "_memory_event_logs", None) or [],
                                 nav_goal_logs=getattr(policy, "_nav_goal_logs", None) or [],
-                                cfg_snapshot=_s4_sp1_cfg_snapshot(policy),
+                                track_frame_logs=getattr(policy, "_track_frame_logs", None) or [],
+                                gd_frame_logs=getattr(policy, "_gd_calib_logs", None) or [],
+                                cfg_snapshot=_sp_cfg_snapshot(policy),
                                 episode_stats=episode_stats,
                                 success=int(episode_stats["success"]),
                                 oracle_success=compute_oracle_success(infos[i]),

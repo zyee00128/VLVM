@@ -55,8 +55,6 @@ class TorchActionIDs:
     MOVE_FORWARD = torch.tensor([[1]], dtype=torch.long)
     TURN_LEFT = torch.tensor([[2]], dtype=torch.long)
     TURN_RIGHT = torch.tensor([[3]], dtype=torch.long)
-    # Scan-only wide-turn action (appended at the end of habitat.task.actions).
-    TURN_LEFT_WIDE = torch.tensor([[6]], dtype=torch.long)
 
 
 class Habitat3DMixin:
@@ -124,13 +122,6 @@ class Habitat3DMixin:
             kwargs["dataset_type"] = "mp3d"
         else:
             raise ValueError("Dataset type could not be inferred from habitat config")
-
-        # GD class list follows the dataset (HM3D 6 classes / MP3D 21 classes, kept separate); 
-        # an explicitly non-empty `gdp_vocab` from the YAML still wins.
-        if not kwargs.get("gdp_vocab"):
-            kwargs["gdp_vocab"] = (
-                list(MP3D_ID_TO_NAME) if kwargs["dataset_type"] == "mp3d" else list(HM3D_ID_TO_NAME)
-            )
 
         return cls(**kwargs)
 

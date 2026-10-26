@@ -192,7 +192,7 @@ class _BaseObstacleMap3D(BaseMap):
 
 
     # ------------------------------------------------------------------ #
-    # Dilation / structuring element                                      #
+    # Dilation / Structuring element                                      #
     # ------------------------------------------------------------------ #
     def _ensure_dilation_tools(self) -> None:
         """Lazily build the 3D cylinder kernel, cached disk/rz, and `_navigable_map`."""

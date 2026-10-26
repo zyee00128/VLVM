@@ -174,7 +174,6 @@ class TargetGeometricGatingEngine:
         status = "GEOM_UNKNOWN" if geom_status == "geom_unknown" else "HARD_CONFIRMED"
         return status, None, {
             "status": status,
-            "is_suspicious": False,
             "diagnostics": diag_summary,
         }
 

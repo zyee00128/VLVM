@@ -87,28 +87,3 @@ class PresenceGate(nn.Module):
             query, text_h, text_h, key_padding_mask=_none_if_empty(attn_mask),
             need_weights=False)
         return self.fuse(torch.cat([visual_h, masked_mean(text_h, text_padding_mask), attended.squeeze(1)], dim=-1)).squeeze(-1)
-
-
-def center_dim_to_corners(boxes: torch.Tensor) -> torch.Tensor:
-    """Convert ``(cx,cy,cz,dx,dy,dz)`` boxes to ``(x1,y1,z1,x2,y2,z2)``."""
-    if boxes.numel() == 0:
-        return boxes.reshape(-1, 6)
-    half = boxes[..., 3:6].clamp_min(1e-4) / 2.0
-    return torch.cat([boxes[..., :3] - half, boxes[..., :3] + half], dim=-1)
-
-
-def focal_binary_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 0.25,
-                      gamma: float = 2.0, reduction: str = "mean") -> torch.Tensor:
-    """Numerically stable sigmoid focal loss for arbitrary-shaped tensors."""
-    targets = targets.to(dtype=logits.dtype)
-    bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    p = torch.sigmoid(logits)
-    pt = p * targets + (1.0 - p) * (1.0 - targets)
-    at = alpha * targets + (1.0 - alpha) * (1.0 - targets)
-    out = at * (1.0 - pt).pow(gamma) * bce
-    if reduction == "sum":
-        return out.sum()
-    if reduction == "none":
-        return out
-    return out.mean() if out.numel() else logits.sum() * 0.0
-

@@ -28,10 +28,14 @@ class GdProposer:
         self.vocab = list(vocab) if vocab is not None else list(DEFAULT_VOCAB)
         self.alias_map = build_alias_map(self.vocab)
         self.stats = ProposalStats()
+        # Read-only trace of the last `propose()` call.  Calibration consumes it;
+        # it never changes the returned proposals or any decision.
+        self.last_trace: dict = {}
 
     def reset(self) -> None:
         self.stats.reset()
         self.detector.reset()
+        self.last_trace = {}
 
     # ---- per-frame entry point ----
     def propose(
@@ -51,30 +55,55 @@ class GdProposer:
         """
         if not self.cfg.enabled or rgb is None or depth_m is None:
             self.stats.bump("no_frame")
+            self.last_trace = {"ran": False, "reason": "no_frame"}
             return []
 
         caption = build_caption(target_classes, self.cfg.caption_style, vocab=self.vocab)
         det = self.detector.detect(rgb, caption)
         if det is None:                      # server down / disabled -> "not checked"
             self.stats.bump("no_gd")
+            self.last_trace = {"ran": False, "reason": "no_gd", "caption": caption}
             return []
         self.stats.frames += 1
 
         boxes_norm, scores, phrases = det
+        trace = {
+            "ran": True,
+            "caption": caption,
+            "raw_boxes": np.asarray(boxes_norm, dtype=np.float64).reshape(-1, 4).tolist(),
+            "raw_logits": np.asarray(scores, dtype=np.float64).reshape(-1).tolist(),
+            "raw_phrases": [str(p) for p in phrases],
+            "decisions": [],
+        }
+        self.last_trace = trace
         if len(boxes_norm) == 0:
+            trace["reason"] = "empty"
             return []
         
         boxes_px = boxes_norm * np.array([cam.width, cam.height, cam.width, cam.height], dtype=np.float64)
         picked: List[tuple] = []
         for i in range(len(boxes_px)):
             conf = float(scores[i]) if i < len(scores) else 0.0
+            phrase = phrases[i] if i < len(phrases) else ""
+            match = match_phrase(phrase, target_classes, self.alias_map)
+            decision = {
+                "index": int(i),
+                "conf": conf,
+                "phrase": str(phrase),
+                "canon": match.canon,
+                "is_target": bool(match.is_target),
+                "strength": float(match.strength),
+                "n_named": int(match.n_named),
+            }
             if conf < float(self.cfg.box_thr):
                 self.stats.bump("below_thr")
+                trace["decisions"].append({**decision, "accepted": False, "reason": "below_thr"})
                 continue
-            match = match_phrase(phrases[i] if i < len(phrases) else "", target_classes, self.alias_map)
             if not match.is_target:          # strict single-class rule (T1/T2)
                 self.stats.bump("other_class")
+                trace["decisions"].append({**decision, "accepted": False, "reason": "other_class"})
                 continue
+            trace["decisions"].append({**decision, "accepted": True, "reason": "picked"})
             picked.append((i, conf, match))
         self.stats.boxes_above_thr += len(picked)
 
@@ -84,6 +113,9 @@ class GdProposer:
             proposal = self._build(boxes_px[i], conf, phrases[i], match.canon, depth_m, cam, robot_xy, rng)
             if proposal is not None:
                 proposals.append(proposal)
+                trace.setdefault("built", []).append({"index": int(i), "proposal_idx": len(proposals) - 1, "n_points": int(proposal.n_points)})
+            else:
+                trace.setdefault("build_failed", []).append({"index": int(i), "conf": float(conf), "phrase": str(phrases[i])})
         self.stats.proposals += len(proposals)
         return proposals
 

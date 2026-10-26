@@ -4,6 +4,7 @@ data/
 # 模型 / 微调代码
 GroundingDINO/
 archive/
+_tools/
 
 # 实验日志 / TensorBoard
 lockfiles/
@@ -12,6 +13,8 @@ outputs/
 outputs_Stage1/
 outputs_Stage2/
 iteration/
+
+paper/
 
 # Python 缓存与构建产物 / 其他
 __pycache__/

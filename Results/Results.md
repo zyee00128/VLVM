@@ -11,9 +11,9 @@
 ## 微调后结果
 
 **微调 offline 结果对比**
-[VLVM-Finetuning](VLVM-S4-Exp0.md)
+[VLVM-Finetuning](VLVM-S4-Exv2.md)
 
-### vlvm p0、ft-vlvm v1、ft-vlvm base、vlvm scanrefer 四场景结果对比
+### ft-vlvm v1、ft-vlvm base、vlvm scanrefer 四场景结果对比
 
 | 项目 | vlvm base | vlvm v1 | vlvm ScanRefer |
 | :--- | :--- | :--- | :--- |
@@ -24,16 +24,21 @@
 | S-penalty / GD proposer | 关 / 关 | 关 / 关 | 关 / 关 |
 | 四场景工作点 | `sigma_tar=0.65` | `sigma_tar=0.60` | `sigma_tar=0.70` |
 
-`Raw VLVM ScanRefer` 完全开启了 `S-penalty` `GD proposer`，`vlvm p0` 在 `vlvm v1` 基础上增加了原版的 `S-penalty`，子机制 `conflict` 和 `GD proposer` 关闭。
+`Raw VLVM ScanRefer` 完全开启了 `S-penalty` `GD proposer`。
+
+`vlvm p0` 在 `vlvm v1` 基础上增加了原版的 `S-penalty`，子机制 `conflict` 和 `GD proposer` 关闭。
+
+`vlvm p1` 在 `vlvm p0` 基础上修改了原版的 `S-penalty` 中 $$\W_s$$ 的计算方式，直接删除子机制 `conflict`，`GD proposer` 仍然关闭。
 
 | model | SR ↑ | Oracle ↑ | SPL ↑ | SoftSPL ↑ | steps / episode ↓ |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| VLFM（2D 基线） | 45.71% (181/396) | 52.53% (208/396) | 0.2487 | 0.3020 | 174.7250 |
+| VLFM (2D 基线) | 45.71% (181/396) | 52.53% (208/396) | 0.2487 | 0.3020 | 174.7250 |
 | Raw VLVM ScanRefer | 44.44%（176/396） | 50.76%（201/396） | 0.1812 | 0.2477 | 143.4000 |
-| vlvm ScanRefer（`sigma_tar=0.70`） | 24.49% | 29.80% | 0.1255 | 0.2077 | 79.3359 |
-| vlvm base（`sigma_tar=0.65`） | 31.31% | 57.58% | 0.1275 | 0.2176 | 237.4343 |
-| vlvm v1（`sigma_tar=0.60`） | 36.61% | 54.55% | 0.1607 | 0.2622 | 188.7449 |
+| vlvm ScanRefer (`sigma_tar=0.70`) | 24.49% | 29.80% | 0.1255 | 0.2077 | 79.3359 |
+| vlvm base (`sigma_tar=0.65`) | 31.31% | 57.58% | 0.1275 | 0.2176 | 237.4343 |
+| vlvm v1 (`sigma_tar=0.60`) | 36.61% | 54.55% | 0.1607 | 0.2622 | 188.7449 |
 | vlvm p0 | 43.69%（173/396） | 63.13% (250/396) | 0.1737 | 0.2508 | 220.0750 |
+| vlvm p1 | 42.68%（169/396） | 61.87%（245/396） | 0.1689 | 0.2495 | 217.4975 |
 
 ### Grid Search
 
@@ -89,10 +94,10 @@
 
 | model / 配置 | SR ↑ | Oracle ↑ | SPL ↑ | SoftSPL ↑ | steps / episode ↓ |
 | :--- | ---: | ---: | ---: | ---: | ---: |
+| VLFM | **55.56% (165/297)** | 43.77% (130/297) | 0.3271 | 0.4014 | 115.8000 |
+| vlvm p0 | 37.71% (112/297) | 43.77% (130/297) | 0.1513 | 0.2267 | 182.6333 |
 | P1 G4 (`t_S=0.1400`) | **39.06% (116/297)** | 43.43% (129/297) | 0.1608 | 0.2369 | 172.5724 |
 | P1 G5 (`t_S=0.1500`) | 37.37% (111/297) | 43.77% (130/297) | 0.1508 | 0.2263 | 182.6061 |
-| vlvm p0 | 37.71% (112/297) | 43.77% (130/297) | 0.1513 | 0.2267 | 182.6333 |
-| VLFM | **55.56% (165/297)** | 43.77% (130/297) | 0.3271 | 0.4014 | 115.8000 |
 
 | P1 G4 (`t_S=0.1400`) | episodes | SR ↑ | Oracle ↑ | SPL ↑ | SoftSPL ↑ | steps / episode ↓ |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -110,7 +115,7 @@
 | vlvm p0 | 990 | 40.81%（404/990） | 54.85%（543/990） | 0.1586 | 0.2352 | 205.1929 |
 | vlvm P1 | 990 | 40.20%（398/990） | 54.04%（535/990） | 0.1586 | 0.2387 | 200.7616 |
 
-| 场景 | 指标 | vlvm p0 | vlvm P1 | VLFM | Raw VLVM ScanRefer | P0 − VLFM | P0 − ScanRefer |
+| 场景 | 指标 | vlvm p0 | vlvm P1 | VLFM | Raw VLVM ScanRefer | v2 − VLFM | v2 − ScanRefer |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `QaLdnwvtxbs` | SR ↑ | 64.60% | 66.67% | 88.90% | 65.70% | −24.30 pp | −1.10 pp |
 |  | Oracle ↑ | 70.70% | 69.70% | 72.70% | 63.60% | −2.00 pp | +7.10 pp |

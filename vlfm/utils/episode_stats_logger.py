@@ -264,7 +264,7 @@ def dump_detection_logs(
     ``ft_tsp3d/eval_tools/s_evidence.py`` can recompute S-only / fused statistics offline.
 
     Only ``t_S`` is searched and can be re-derived offline from the logged raw ``s``.
-    ``s_min=0.1`` and query ``radius_m=0.5`` are fixed implementation constants.
+    ``s_min=0.07`` and query ``radius_m=0.5`` are fixed implementation constants.
 
     Returns the number of detection lines written.
     """
@@ -373,6 +373,8 @@ def dump_phase_g_logs(
     success: int,
     oracle_success: int,
     failure_cause: str,
+    track_frame_logs: Optional[List[Dict[str, Any]]] = None,
+    gd_frame_logs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, int]:
     """Write the four-layer Phase-G contract without changing policy behavior."""
     os.makedirs(directory, exist_ok=True)
@@ -409,6 +411,9 @@ def dump_phase_g_logs(
         "candidates.jsonl": [],
         "memory_events.jsonl": [],
         "nav_goals.jsonl": [],
+        "track_frames.jsonl": [],
+        "gd_frames.jsonl": [],
+        "gd_proposals.jsonl": [],
     }
     for record in candidate_logs:
         row = {**common, "kind": "candidate", **_jsonable(record)}
@@ -429,6 +434,34 @@ def dump_phase_g_logs(
         row["tp"] = bool(_tp(row))
         labelled_nav.append(row)
     outputs["nav_goals.jsonl"] = labelled_nav
+    for record in track_frame_logs:
+        row = {**common, "kind": "track_frame", **_jsonable(record)}
+        row["memory_uid"] = _uid(row.get("memory_id"), "memory")
+        row["tp"] = bool(_tp(row))
+        outputs["track_frames.jsonl"].append(row)
+
+    for frame in gd_frame_logs or []:
+        frame_row = {**common, "kind": "gd_frame", **_jsonable(frame)}
+        proposals = frame_row.pop("proposals", []) or []
+        frame_row["proposal_ids"] = [p.get("proposal_id") for p in proposals]
+        frame_row["n_proposals"] = len(proposals)
+        outputs["gd_frames.jsonl"].append(frame_row)
+        for proposal in proposals:
+            prow = {
+                **common,
+                "kind": "gd_proposal",
+                "step": frame_row.get("step"),
+                "target_classes": frame_row.get("target_classes"),
+                "camera": frame_row.get("camera"),
+                "robot_xyz": frame_row.get("robot_xyz"),
+                "robot_xy": frame_row.get("robot_xy"),
+                "robot_yaw": frame_row.get("robot_yaw"),
+                **_jsonable(proposal),
+            }
+            prow["memory_uid"] = _uid(prow.get("matched_memory_id"), "memory")
+            prow["candidate_uid"] = _uid(prow.get("matched_candidate_id"), "candidate")
+            prow["tp"] = bool(_tp(prow))
+            outputs["gd_proposals.jsonl"].append(prow)
 
     for filename, rows in outputs.items():
         if not rows:
@@ -462,5 +495,7 @@ def dump_phase_g_logs(
         "candidates": len(candidate_logs),
         "memory_events": len(memory_event_logs),
         "nav_goals": len(nav_goal_logs),
+        "gd_frames": len(outputs["gd_frames.jsonl"]),
+        "gd_proposals": len(outputs["gd_proposals.jsonl"]),
         "episodes": 1,
     }
