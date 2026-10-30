@@ -8,6 +8,16 @@ from vlfm.utils.geometry_utils import within_fov_cone
 CONFIRMED = "confirmed"
 PROVISIONAL = "provisional"
 STABLE = "stable"
+# S6: independent GD-only pool.  TSP3D entries stay untagged; only a GD
+# detection that has no TSP3D backing gets this state and provenance.
+GD = "gd"
+GD_ONLY = "gd-only"
+GD_TSP = "gd-tsp"
+# Provenance labels for entries whose only source is TSP3D.  These are
+# intentionally distinct from `None` so logs and selection can distinguish
+# pure-TSP entries from legacy/unlabelled states.
+TSP_CONFIRMED = "tsp-confirmed"
+TSP_PROVISIONAL = "tsp-provisional"
 
 
 @dataclass(frozen=True)
@@ -82,21 +92,25 @@ class MemoryManagerConfig:
     provisional_to_stable_misses: int = 2
     # S5 runtime upgrade: a provisional entry that is re-observed up close
     # becomes stop-eligible.  Evidence, not confidence, drives the promotion.
-    upgrade_min_obs: int = 2
-    upgrade_max_dist: float = 4.0
-    upgrade_sigma_min: float = 0.52
+    # S6gd1: the only ordinary upgrade criterion is evidence count.  The
+    # merge-time and frame-level paths share this threshold; distance is not
+    # an upgrade gate.
+    upgrade_min_obs: int = 4
 
     # S6: merge evidence gate + `stable` deletion pool.
     enable_stable_pool: bool = False      # master switch for the S6 lifecycle
     merge_into_stable: bool = False       # never absorb evidence into a `stable` entry
+    # S6 GD pool: gd-only has its own state and is never deleted; gd-tsp is a
+    # confirmed entry.  No TTL or TTL-shadow mechanism.
+    enable_gd_pool: bool = False
     merge_new_info_dist: float = 0.2      # pose baseline that counts as a new observation (m)
     merge_new_info_yaw: float = 10.0      # yaw delta (deg) that counts as a new observation
     merge_new_info_steps: int = 3         # step gap that counts as a new observation
     stable_stale_purge: int = 60          # frames since the last match -> delete
     stable_miss_delete: int = 3           # consecutive near-field misses inside `stable`
     stable_total_miss: int = 6            # cumulative near-field misses (a revive does not reset it)
-    stable_revive_radius: float = 0.5     # revive radius (m)
-    stable_revive_window: int = 10        # revive window (frames since the last match)
+    stable_revive_radius: float = 0.8     # revive radius (m)
+    stable_revive_window: int = 20        # revive window (frames since the last match)
     stable_revive_min_sigma: float = 0.50 # revive candidate sigma_c floor
 
 
@@ -135,6 +149,22 @@ class TargetMemoryManager:
 
     def _ensure_state_fields(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Backfill S6/S7 bookkeeping fields on states built by older code paths."""
+        # Old pure-TSP states used ``origin=None``.  Mark them explicitly when
+        # they are first touched; GD-backed origins are never overwritten.
+        _life = str(state.get("lifecycle_state") or CONFIRMED)
+        if (
+            state.get("origin") is None
+            and not bool(state.get("gd_only", False))
+            and _life in (CONFIRMED, PROVISIONAL)
+        ):
+            state["origin"] = (
+                TSP_CONFIRMED if _life == CONFIRMED else TSP_PROVISIONAL
+            )
+        # A gd-only entry promoted by an admitted TSP3D merge is treated as
+        # gd-tsp from that point on.  Keep the promotion flag for provenance,
+        # but normalize legacy states that still carry origin=gd-only.
+        if bool(state.get("promoted_from_gd_only", False)):
+            state["origin"] = GD_TSP
         state.setdefault("total_miss", 0)
         state.setdefault("revive_count", 0)
         state.setdefault("last_obs_step", int(self._frame))
@@ -186,6 +216,58 @@ class TargetMemoryManager:
                 return True
         gap = int(self._frame) - int(state.get("last_obs_step", 0))
         return gap >= int(self.config.merge_new_info_steps)
+
+    def _is_new_gd_information(
+        self,
+        state: Dict[str, Any],
+        robot_xy: np.ndarray,
+        robot_yaw: float,
+    ) -> bool:
+        """New-information gate for GD evidence.
+
+        GD evidence has its own pose history; it must not borrow the TSP3D
+        observation counters, otherwise a GD hit could promote a TSP3D track.
+        """
+        last_xy = state.get("gd_last_xy")
+        if last_xy is None:
+            return True
+        baseline = float(
+            np.linalg.norm(
+                np.asarray(last_xy, dtype=np.float64).reshape(-1)[:2] - robot_xy
+            )
+        )
+        if baseline >= float(self.config.merge_new_info_dist):
+            return True
+        last_yaw = state.get("gd_last_yaw")
+        if last_yaw is not None:
+            dyaw = abs(
+                float(
+                    (float(robot_yaw) - float(last_yaw) + np.pi) % (2 * np.pi)
+                    - np.pi
+                )
+            )
+            if np.rad2deg(dyaw) >= float(self.config.merge_new_info_yaw):
+                return True
+        gap = int(self._frame) - int(state.get("gd_last_evidence_step", self._frame))
+        return gap >= int(self.config.merge_new_info_steps)
+
+    @staticmethod
+    def _gd_fields(state: Dict[str, Any]) -> Dict[str, Any]:
+        """GD evidence fields; `origin` / `gd_only` appear only for GD-only entries."""
+        out: Dict[str, Any] = {
+            "gd_hits": int(state.get("gd_hits", 0)),
+            "gd_conf_max": float(state.get("gd_conf_max", 0.0)),
+            "gd_conf_last": float(state.get("gd_conf_last", 0.0)),
+            "gd_last_step": state.get("gd_last_step"),
+            "gd_pos": bool(state.get("gd_pos", False)),
+            "gd_candidate_pos": bool(state.get("gd_candidate_pos", False)),
+            "gd_last_candidate_id": state.get("gd_last_candidate_id"),
+        }
+        if state.get("origin") is not None:
+            out["origin"] = str(state.get("origin"))
+        if bool(state.get("gd_only", False)):
+            out["gd_only"] = True
+        return out
 
     def _alloc_memory_id(self) -> str:
         memory_id = f"m{self._next_memory_id:06d}"
@@ -246,12 +328,22 @@ class TargetMemoryManager:
         candidate_id: Optional[str] = None,
         new_lifecycle_state: Optional[str] = None,
         sigma_c: Optional[float] = None,
+        origin: Optional[str] = None,
+        force_confirmed: bool = False,
+        block_stable: bool = False,
+        gd_evidence_only: bool = False,
+        expected_memory_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         In-place write / EMA-merge of one admitted detection.
         Merges within merge_dist_thresh of a same-class record 
         (EMA centroid, num_obs+1, max confidence kept, near-miss reset); 
         otherwise registers a new candidate.
+
+        ``expected_memory_id`` makes the write merge-only: if the nearest
+        same-class entry is not that memory id (or no merge is possible), the
+        call returns blocked instead of creating a new entry.  GD-tsp uses
+        this to guarantee that it only enriches an existing TSP track.
 
         Returns a small record of the write for caller-side logging / accounting.
         """
@@ -268,6 +360,14 @@ class TargetMemoryManager:
         score = float(confidence if sigma_c is None else sigma_c)
         recs = self._mem.get(target_class)
         if not recs:
+            if expected_memory_id is not None:
+                return {
+                    "written": False,
+                    "merged": False,
+                    "blocked": "expected_memory_missing",
+                    "candidate_id": candidate_id,
+                    "memory_id": expected_memory_id,
+                }
             if new_lifecycle_state is None:
                 return {
                     "written": False, "merged": False, "new_rejected": True,
@@ -279,6 +379,7 @@ class TargetMemoryManager:
             state = {"near_miss": 0, "memory_id": self._alloc_memory_id(),
                      "last_candidate_id": candidate_id,
                      "lifecycle_state": new_lifecycle_state or "confirmed",
+                     "origin": self._tsp_origin_for_state(origin, new_lifecycle_state),
                      "origin_provisional": new_lifecycle_state == PROVISIONAL,
                      "total_miss": 0, "revive_count": 0}
             self._touch_observation(state, r_xy, robot_yaw)
@@ -288,6 +389,7 @@ class TargetMemoryManager:
             return {"written": True, "merged": False, "num_obs": 1,
                     "memory_id": state["memory_id"], "candidate_id": candidate_id,
                     "lifecycle_state": state["lifecycle_state"],
+                    "origin": state.get("origin"),
                     **self._score_fields(state)}
 
         # Keep the side lists in sync
@@ -306,23 +408,97 @@ class TargetMemoryManager:
         closest_idx = int(np.argmin(dists))
         prev_state = self._lifecycle[target_class][closest_idx]
         self._ensure_state_fields(prev_state)
-        within_merge = bool(dists[closest_idx] < self.config.merge_dist_thresh)
         closest_lifecycle = str(prev_state.get("lifecycle_state", CONFIRMED))
-        block_stable_merge = bool(
+        within_merge = bool(dists[closest_idx] < self.config.merge_dist_thresh)
+        if expected_memory_id is not None:
+            actual_memory_id = str(prev_state.get("memory_id") or "")
+            if not within_merge or actual_memory_id != str(expected_memory_id):
+                return {
+                    "written": False,
+                    "merged": False,
+                    "blocked": "expected_memory_mismatch",
+                    "candidate_id": candidate_id,
+                    "memory_id": actual_memory_id or None,
+                    "lifecycle_state": closest_lifecycle,
+                }
+        if block_stable and closest_lifecycle == STABLE:
+            return {
+                "written": False, "merged": False, "blocked": "stable",
+                "candidate_id": candidate_id,
+                "lifecycle_state": STABLE,
+            }
+        # S6: `stable` is the deletion pool -- it never absorbs evidence.
+        # The revive radius is intentionally independent of merge_dist_thresh:
+        # a stable entry can be revived at 0.8 m even though normal merges stay
+        # at 0.5 m.  If revive fails (sigma/age), this observation is treated as
+        # a new entry rather than silently merging into stable.
+        if (
             self.config.enable_stable_pool
             and not self.config.merge_into_stable
             and closest_lifecycle == STABLE
-        )
-        if within_merge and block_stable_merge:
-            # S6: `stable` is the deletion pool -- it never absorbs evidence.
-            # Only an explicit revive may bring it back.
-            revived = self._revive_stable_entry(
-                target_class, closest_idx, prev_state, c_np, score,
-                r_xy, robot_yaw, confidence, candidate_id, detect_dist,
-            )
-            if revived is not None:
-                return revived
+        ):
+            if float(dists[closest_idx]) <= float(self.config.stable_revive_radius):
+                revived = self._revive_stable_entry(
+                    target_class, closest_idx, prev_state, c_np, score,
+                    r_xy, robot_yaw, confidence, candidate_id, detect_dist,
+                )
+                if revived is not None:
+                    return revived
             within_merge = False
+        # A gd-only entry that is later matched by an admitted TSP3D candidate
+        # is not a GD-only fallback anymore: the detector has supplied the
+        # geometry/identity match.  Promote it to confirmed instead of leaving
+        # it permanently in the `gd` pool.
+        promote_gd_only = bool(
+            within_merge
+            and closest_lifecycle == GD
+            and not gd_evidence_only
+            and new_lifecycle_state in (CONFIRMED, PROVISIONAL)
+        )
+        if within_merge and gd_evidence_only:
+            # gd-tsp is an external confirmation/evidence path: promote the
+            # lifecycle but do NOT count it as a TSP3D observation, move the
+            # centroid, or alter sigma_c/num_obs. Those fields remain owned by
+            # the TSP3D detector.
+            v_old = self._ver[target_class][closest_idx]
+            num_obs_now = int(v_old[0]) if len(v_old) >= 1 else 1
+            prev_state["near_miss"] = 0
+            prev_state["last_candidate_id"] = candidate_id
+            self._touch_observation(prev_state, r_xy, robot_yaw)
+            upgraded = None
+            if force_confirmed:
+                from_state = str(prev_state.get("lifecycle_state", CONFIRMED))
+                prev_state["lifecycle_state"] = CONFIRMED
+                if from_state != CONFIRMED:
+                    prev_state["gd_upgraded"] = True
+                    prev_state["gd_upgraded_from"] = from_state
+                    prev_state["gd_upgraded_step"] = int(self._frame)
+                    upgraded = {
+                        "from_state": from_state,
+                        "to_state": CONFIRMED,
+                        "reason": "gd_tsp",
+                        "num_obs": num_obs_now,
+                        "detect_dist": float(detect_dist),
+                    }
+            if origin is not None:
+                prev_state["origin"] = origin
+            return {
+                "written": True,
+                "merged": True,
+                "new_info": False,
+                "gd_evidence_only": True,
+                "revived": False,
+                "num_obs": num_obs_now,
+                "memory_id": prev_state.get("memory_id"),
+                "candidate_id": candidate_id,
+                "lifecycle_state": prev_state.get("lifecycle_state", CONFIRMED),
+                "origin": prev_state.get("origin"),
+                "upgraded": upgraded,
+                "total_miss": int(prev_state.get("total_miss", 0)),
+                "revive_count": int(prev_state.get("revive_count", 0)),
+                "detect_dist": float(detect_dist),
+                **self._score_fields(prev_state),
+            }
         if within_merge:
             # Cross-frame consensus = strong evidence; hallucinated boxes drift and cannot merge.
             # EMA centroid, keep the max c', reset near-miss.
@@ -352,14 +528,53 @@ class TargetMemoryManager:
             if (
                 str(prev_state.get("lifecycle_state")) == PROVISIONAL
                 and num_obs_now >= int(self.config.upgrade_min_obs)
-                and detect_dist <= float(self.config.upgrade_max_dist)
-                and float(prev_state.get("sigma_c_latest", 0.0)) >= float(self.config.upgrade_sigma_min)
             ):
                 prev_state["lifecycle_state"] = CONFIRMED
+                if prev_state.get("origin") not in (GD_ONLY, GD_TSP):
+                    prev_state["origin"] = TSP_CONFIRMED
                 upgraded = {
                     "from_state": PROVISIONAL,
                     "to_state": CONFIRMED,
-                    "reason": "close_reobservation",
+                    # One ordinary upgrade reason; trigger distinguishes the
+                    # merge-time path from the per-frame path.
+                    "reason": "base_upgrade",
+                    "trigger": "merge",
+                    "num_obs": num_obs_now,
+                    "detect_dist": float(detect_dist),
+                }
+            if force_confirmed:
+                from_state = str(prev_state.get("lifecycle_state", CONFIRMED))
+                prev_state["lifecycle_state"] = CONFIRMED
+                if from_state != CONFIRMED and upgraded is None:
+                    prev_state["gd_upgraded"] = True
+                    prev_state["gd_upgraded_from"] = from_state
+                    prev_state["gd_upgraded_step"] = int(self._frame)
+                    upgraded = {
+                        "from_state": from_state,
+                        "to_state": CONFIRMED,
+                        "reason": "gd_tsp",
+                        "num_obs": num_obs_now,
+                        "detect_dist": float(detect_dist),
+                    }
+            if origin is not None:
+                prev_state["origin"] = origin
+            if promote_gd_only:
+                prev_state["lifecycle_state"] = CONFIRMED
+                prev_state["gd_only"] = False
+                prev_state["promoted_from_gd_only"] = True
+                # Promotion is semantically gd-tsp.  Do not keep a separate
+                # gd-only-tsp category downstream; the promotion flag remains
+                # only as provenance in the logs.
+                prev_state["origin"] = GD_TSP
+                prev_state["gd_promoted_step"] = int(self._frame)
+                # The gd-only entry had no sigma_c; seed it from the TSP3D
+                # observation that matched it, otherwise selection would see
+                # a confirmed entry with score 0.
+                self._update_scores(prev_state, score, new=False)
+                upgraded = {
+                    "from_state": GD,
+                    "to_state": CONFIRMED,
+                    "reason": "gd_only_tsp_merge",
                     "num_obs": num_obs_now,
                     "detect_dist": float(detect_dist),
                 }
@@ -368,7 +583,9 @@ class TargetMemoryManager:
                     "memory_id": prev_state.get("memory_id"),
                     "candidate_id": candidate_id,
                     "lifecycle_state": prev_state.get("lifecycle_state", "confirmed"),
+                    "origin": prev_state.get("origin"),
                     "upgraded": upgraded,
+                    "promoted_from_gd_only": bool(promote_gd_only),
                     "total_miss": int(prev_state.get("total_miss", 0)),
                     "revive_count": int(prev_state.get("revive_count", 0)),
                     "detect_dist": float(detect_dist),
@@ -385,6 +602,7 @@ class TargetMemoryManager:
             state = {"near_miss": 0, "memory_id": self._alloc_memory_id(),
                      "last_candidate_id": candidate_id,
                      "lifecycle_state": new_lifecycle_state or "confirmed",
+                     "origin": self._tsp_origin_for_state(origin, new_lifecycle_state),
                      "origin_provisional": new_lifecycle_state == PROVISIONAL,
                      "total_miss": 0, "revive_count": 0}
             self._touch_observation(state, r_xy, robot_yaw)
@@ -394,7 +612,281 @@ class TargetMemoryManager:
             return {"written": True, "merged": False, "num_obs": 1,
                     "memory_id": state["memory_id"], "candidate_id": candidate_id,
                     "lifecycle_state": state["lifecycle_state"],
+                    "origin": state.get("origin"),
                     **self._score_fields(state)}
+
+    def accumulate_gd_only(
+        self,
+        target_class: str,
+        centroid: np.ndarray,
+        gd_conf: float,
+        near_surface: Optional[np.ndarray] = None,
+        robot_xyz: Optional[np.ndarray] = None,
+        robot_yaw: float = 0.0,
+        candidate_id: Optional[str] = None,
+        new_info: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Write one GD-only observation into the independent `gd` pool.
+
+        This is the `gd-only` branch of the S6 GD mechanism: it creates/merges
+        the independent `gd` state and records provenance/evidence.  It is
+        called by ``GdMechanism`` when a GD proposal has no TSP3D association.
+
+        Invariants:
+          * unmatched GD observation -> new state `gd`, `origin="gd-only"`;
+          * GD matching another `gd` entry -> merge GD evidence;
+          * GD matching a TSP3D `confirmed` / `provisional` entry -> only write
+            `gd_*` evidence fields; never change state, centroid, num_obs or
+            sigma_c, so TSP3D lifecycle is untouched;
+          * `stable` entries are not merged into (same rule as TSP3D);
+          * no sigma_c is fabricated; GD confidence is a separate field.
+        """
+        if not self.config.enable_gd_pool:
+            return {
+                "written": False,
+                "merged": False,
+                "gd_pool_disabled": True,
+                "candidate_id": candidate_id,
+            }
+
+        r_xyz = (
+            np.zeros(3) if robot_xyz is None
+            else np.asarray(robot_xyz, dtype=np.float64).reshape(-1)
+        )
+        r_xy = r_xyz[:2]
+        c_np = np.asarray(centroid, dtype=np.float64).reshape(-1)
+        s_np = (
+            c_np if near_surface is None
+            else np.asarray(near_surface, dtype=np.float64).reshape(-1)
+        )
+        if c_np.shape[0] >= 3:
+            detect_dist = float(np.linalg.norm(c_np - r_xyz))
+        else:
+            detect_dist = float(np.linalg.norm(c_np - r_xy))
+
+        recs = self._mem.get(target_class)
+        if not recs:
+            return self._new_gd_entry(
+                target_class, c_np, s_np, r_xy, robot_yaw, gd_conf,
+                candidate_id, detect_dist,
+            )
+
+        # Keep side lists in sync, mirroring `accumulate` without changing it.
+        if target_class not in self._surf:
+            self._surf[target_class] = list(recs)
+        if target_class not in self._ver:
+            self._ver[target_class] = [
+                (1, r_xy.copy(), float(robot_yaw), float(gd_conf)) for _ in recs
+            ]
+        if target_class not in self._lifecycle:
+            self._lifecycle[target_class] = [
+                {"near_miss": 0, "memory_id": self._alloc_memory_id(),
+                 "last_candidate_id": None, "lifecycle_state": CONFIRMED}
+                for _ in recs
+            ]
+
+        dists = np.linalg.norm(np.asarray(recs, dtype=np.float64) - c_np, axis=1)
+        idx = int(np.argmin(dists))
+        prev_state = self._ensure_state_fields(self._lifecycle[target_class][idx])
+        within_merge = bool(dists[idx] < self.config.merge_dist_thresh)
+        life = str(prev_state.get("lifecycle_state", CONFIRMED))
+
+        if not within_merge:
+            return self._new_gd_entry(
+                target_class, c_np, s_np, r_xy, robot_yaw, gd_conf,
+                candidate_id, detect_dist,
+            )
+        if life == STABLE:
+            return {
+                "written": False, "merged": False,
+                "gd_merge_blocked": "stable",
+                "candidate_id": candidate_id, "detect_dist": float(detect_dist),
+                "lifecycle_state": STABLE,
+            }
+
+        if life == GD:
+            if new_info is None:
+                new_info = self._is_new_gd_information(prev_state, r_xy, robot_yaw)
+            old = np.asarray(recs[idx], dtype=np.float64)
+            recs[idx] = (
+                self.config.ema_weight_old * old
+                + (1.0 - self.config.ema_weight_old) * c_np
+            )
+            v_old = self._ver[target_class][idx]
+            old_conf = float(v_old[3]) if len(v_old) > 3 else float(gd_conf)
+            num_obs_now = int(v_old[0])
+            if bool(new_info):
+                num_obs_now += 1
+                prev_state["gd_hits"] = int(prev_state.get("gd_hits", 0)) + 1
+                prev_state["gd_last_evidence_step"] = int(self._frame)
+                prev_state["gd_last_xy"] = np.asarray(r_xy, dtype=np.float64).tolist()
+                prev_state["gd_last_yaw"] = float(robot_yaw)
+                self._append_observation(prev_state, r_xy, robot_yaw)
+            self._ver[target_class][idx] = (
+                num_obs_now, r_xy.copy(), float(robot_yaw),
+                max(old_conf, float(gd_conf)),
+            )
+            prev_state["gd_conf_last"] = float(gd_conf)
+            prev_state["gd_conf_max"] = max(
+                float(prev_state.get("gd_conf_max", 0.0)), float(gd_conf)
+            )
+            prev_state["gd_last_step"] = int(self._frame)
+            prev_state["last_candidate_id"] = candidate_id
+            self._touch_observation(prev_state, r_xy, robot_yaw)
+            return {
+                "written": True, "merged": True, "revived": False,
+                "new_info": bool(new_info), "num_obs": num_obs_now,
+                "memory_id": prev_state.get("memory_id"),
+                "candidate_id": candidate_id,
+                "lifecycle_state": GD,
+                "detect_dist": float(detect_dist),
+                **self._gd_fields(prev_state),
+            }
+
+        if life in (CONFIRMED, PROVISIONAL):
+            # Evidence-only write: TSP3D owns the geometry, state and counters.
+            if new_info is None:
+                new_info = self._is_new_gd_information(prev_state, r_xy, robot_yaw)
+            if bool(new_info):
+                prev_state["gd_hits"] = int(prev_state.get("gd_hits", 0)) + 1
+                prev_state["gd_last_evidence_step"] = int(self._frame)
+                prev_state["gd_last_xy"] = np.asarray(r_xy, dtype=np.float64).tolist()
+                prev_state["gd_last_yaw"] = float(robot_yaw)
+            prev_state["gd_conf_last"] = float(gd_conf)
+            prev_state["gd_conf_max"] = max(
+                float(prev_state.get("gd_conf_max", 0.0)), float(gd_conf)
+            )
+            prev_state["gd_last_step"] = int(self._frame)
+            prev_state["gd_last_candidate_id"] = candidate_id
+            return {
+                "written": True, "merged": True, "revived": False,
+                "new_info": bool(new_info),
+                "num_obs": int(self._ver[target_class][idx][0]),
+                "memory_id": prev_state.get("memory_id"),
+                "candidate_id": candidate_id,
+                "lifecycle_state": life,
+                "detect_dist": float(detect_dist),
+                **self._gd_fields(prev_state),
+            }
+
+        return {
+            "written": False, "merged": False,
+            "gd_merge_blocked": f"state:{life}",
+            "candidate_id": candidate_id, "lifecycle_state": life,
+        }
+
+    def _new_gd_entry(
+        self,
+        target_class: str,
+        centroid: np.ndarray,
+        surface: np.ndarray,
+        robot_xy: np.ndarray,
+        robot_yaw: float,
+        gd_conf: float,
+        candidate_id: Optional[str],
+        detect_dist: float,
+    ) -> Dict[str, Any]:
+        """Create a new GD-only entry (state `gd`, provenance `gd-only`)."""
+        self._mem.setdefault(target_class, []).append(centroid)
+        self._surf.setdefault(target_class, []).append(surface)
+        self._ver.setdefault(target_class, []).append(
+            (1, np.asarray(robot_xy, dtype=np.float64).reshape(-1)[:2].copy(),
+             float(robot_yaw), float(gd_conf))
+        )
+        state: Dict[str, Any] = {
+            "near_miss": 0,
+            "memory_id": self._alloc_memory_id(),
+            "last_candidate_id": candidate_id,
+            "lifecycle_state": GD,
+            "origin": GD_ONLY,
+            "gd_only": True,
+            "total_miss": 0,
+            "revive_count": 0,
+            "gd_hits": 1,
+            "gd_conf_max": float(gd_conf),
+            "gd_conf_last": float(gd_conf),
+            "gd_last_step": int(self._frame),
+            "gd_last_evidence_step": int(self._frame),
+            "gd_last_xy": np.asarray(robot_xy, dtype=np.float64).reshape(-1)[:2].tolist(),
+            "gd_last_yaw": float(robot_yaw),
+            # No sigma_c is fabricated for GD-only entries.
+            "sigma_c_max": 0.0, "sigma_c_latest": 0.0,
+            "sigma_c_ema_03": 0.0, "sigma_c_ema_05": 0.0,
+            "sigma_c_ema_08": 0.0,
+        }
+        self._touch_observation(state, robot_xy, robot_yaw)
+        self._append_observation(state, robot_xy, robot_yaw)
+        self._lifecycle.setdefault(target_class, []).append(state)
+        return {
+            "written": True, "merged": False, "revived": False,
+            "num_obs": 1,
+            "memory_id": state["memory_id"],
+            "candidate_id": candidate_id,
+            "lifecycle_state": GD,
+            "detect_dist": float(detect_dist),
+            "gd_conf": float(gd_conf),
+            **self._gd_fields(state),
+        }
+
+    def apply_gd_evidence(
+        self,
+        target_class: str,
+        centroid: np.ndarray,
+        *,
+        gd_conf: float,
+        gd_hits: int = 1,
+        gd_pos: bool = False,
+        gd_candidate_pos: bool = False,
+        candidate_id: Optional[str] = None,
+        robot_xy: Optional[np.ndarray] = None,
+        robot_yaw: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Attach GD evidence without changing TSP3D state/geometry/counters."""
+        recs = self._mem.get(target_class, [])
+        if not recs:
+            return {"written": False, "reason": "no_memory"}
+        c_np = np.asarray(centroid, dtype=np.float64).reshape(-1)
+        dists = np.linalg.norm(np.asarray(recs, dtype=np.float64) - c_np, axis=1)
+        idx = int(np.argmin(dists))
+        states = self._lifecycle.get(target_class, [])
+        if idx >= len(states):
+            return {"written": False, "reason": "state_missing"}
+        state = self._ensure_state_fields(states[idx])
+        state["gd_hits"] = max(int(state.get("gd_hits", 0)), int(gd_hits))
+        state["gd_conf_last"] = float(gd_conf)
+        state["gd_conf_max"] = max(float(state.get("gd_conf_max", 0.0)), float(gd_conf))
+        state["gd_last_step"] = int(self._frame)
+        state["gd_last_evidence_step"] = int(self._frame)
+        state["gd_pos"] = bool(state.get("gd_pos", False) or gd_pos)
+        state["gd_candidate_pos"] = bool(
+            state.get("gd_candidate_pos", False) or gd_candidate_pos
+        )
+        if candidate_id is not None:
+            state["gd_last_candidate_id"] = candidate_id
+        if robot_xy is not None:
+            state["gd_last_xy"] = np.asarray(robot_xy, dtype=np.float64).reshape(-1)[:2].tolist()
+        if robot_yaw is not None:
+            state["gd_last_yaw"] = float(robot_yaw)
+        return {
+            "written": True,
+            "memory_id": state.get("memory_id"),
+            "lifecycle_state": state.get("lifecycle_state"),
+            "origin": state.get("origin"),
+            **self._gd_fields(state),
+        }
+
+    @staticmethod
+    def _tsp_origin_for_state(
+        origin: Optional[str], lifecycle_state: Optional[str]
+    ) -> Optional[str]:
+        """Set pure-TSP provenance without touching GD/gd-tsp origins."""
+        if origin in (GD_ONLY, GD_TSP):
+            return origin
+        if lifecycle_state == PROVISIONAL:
+            return TSP_PROVISIONAL
+        if lifecycle_state == CONFIRMED:
+            return TSP_CONFIRMED
+        return origin
 
     def _revive_stable_entry(
         self,
@@ -420,13 +912,21 @@ class TargetMemoryManager:
         if float(score) < float(self.config.stable_revive_min_sigma):
             return None
         self._ensure_state_fields(state)
-        age = int(self._frame) - int(state.get("last_obs_step", 0))
+        last_obs_before = int(state.get("last_obs_step", 0))
+        age = int(self._frame) - last_obs_before
         if age > int(self.config.stable_revive_window):
             return None
         recs = self._mem[target_class]
         old = np.asarray(recs[idx], dtype=np.float64)
+        dist_to_old = float(np.linalg.norm(c_np[:2] - old[:2]))
+        if dist_to_old > float(self.config.stable_revive_radius):
+            return None
+        v_old = self._ver[target_class][idx]
+        num_obs_before = int(v_old[0]) if len(v_old) >= 1 else 1
         recs[idx] = self.config.ema_weight_old * old + (1.0 - self.config.ema_weight_old) * c_np
         state["lifecycle_state"] = PROVISIONAL
+        if state.get("origin") not in (GD_ONLY, GD_TSP):
+            state["origin"] = TSP_PROVISIONAL
         state["near_miss"] = 0
         state["revive_count"] = int(state.get("revive_count", 0)) + 1
         state["last_candidate_id"] = candidate_id
@@ -434,8 +934,7 @@ class TargetMemoryManager:
         self._append_observation(state, robot_xy, robot_yaw)
         self._update_scores(state, float(score), new=False)
         vers = self._ver[target_class]
-        v_old = vers[idx]
-        num_obs_now = int(v_old[0]) + 1
+        num_obs_now = num_obs_before + 1
         vers[idx] = (
             num_obs_now, np.asarray(robot_xy, dtype=np.float64).reshape(-1)[:2].copy(),
             float(robot_yaw),
@@ -448,10 +947,27 @@ class TargetMemoryManager:
             "candidate_id": candidate_id,
             "lifecycle_state": PROVISIONAL,
             "from_state": STABLE,
+            "origin": state.get("origin"),
             "upgraded": None,
             "total_miss": int(state.get("total_miss", 0)),
             "revive_count": int(state.get("revive_count", 0)),
             "detect_dist": float(detect_dist),
+            # Explicit revive diagnostics.  These are copied into the merge
+            # event by the policy so the next run can fit sigma/obs/dist/age
+            # thresholds instead of only knowing that a revive happened.
+            "revive_sigma_c": float(score),
+            "revive_num_obs_before": int(num_obs_before),
+            "revive_num_obs_after": int(num_obs_now),
+            "revive_dist_to_old_centroid": float(dist_to_old),
+            "revive_age_steps": int(age),
+            "revive_last_obs_step": int(last_obs_before),
+            "revive_radius": float(self.config.stable_revive_radius),
+            "revive_window": int(self.config.stable_revive_window),
+            "revive_min_sigma": float(self.config.stable_revive_min_sigma),
+            "revive_detect_dist": float(detect_dist),
+            "revive_robot_xy": np.asarray(robot_xy, dtype=np.float64).reshape(-1)[:2].tolist(),
+            "revive_old_centroid": old[:3].tolist(),
+            "revive_new_centroid": np.asarray(recs[idx], dtype=np.float64).reshape(-1)[:3].tolist(),
             **self._score_fields(state),
         }
 
@@ -578,10 +1094,9 @@ class TargetMemoryManager:
         """S5: promote provisional entries re-observed near the robot, every frame.
 
         The merge-time upgrade missed entries whose second observation arrived far
-        away; this check runs on the centroid distance regardless of merge timing.
-        Note: ``upgrade_sigma_min`` is enforced on the merge-time
-        ``close_reobservation`` path only; this frame-level path uses num_obs and
-        distance.  Add the sigma check here if the floor is intended to be global.
+        away; this check runs every frame.  Both the merge-time and frame-level
+        paths require only ``num_obs >= upgrade_min_obs``; distance is not an
+        upgrade gate.  sigma_c_latest remains a diagnostic/selection field.
         """
         origin = np.asarray(robot_xyz, dtype=np.float64).reshape(-1)
         events: List[Dict[str, Any]] = []
@@ -597,14 +1112,15 @@ class TargetMemoryManager:
                 dist = float(np.linalg.norm(centroid[:3] - origin[:3]))
                 if num_obs < int(self.config.upgrade_min_obs):
                     continue
-                if dist > float(self.config.upgrade_max_dist):
-                    continue
                 state["lifecycle_state"] = CONFIRMED
+                if state.get("origin") not in (GD_ONLY, GD_TSP):
+                    state["origin"] = TSP_CONFIRMED
                 events.append({
                     "event": "upgrade",
                     "target_class": str(cls),
                     "centroid": centroid.copy(),
-                    "reason": "frame_upgrade",
+                    "reason": "base_upgrade",
+                    "trigger": "frame",
                     "from_state": PROVISIONAL,
                     "lifecycle_state": CONFIRMED,
                     "num_obs": num_obs,
@@ -668,6 +1184,14 @@ class TargetMemoryManager:
             for idx, centroid in enumerate(centroids):
                 c_np = np.asarray(centroid, dtype=np.float64)
                 v_state = v_states[idx] if idx < len(v_states) else (1, np.zeros(2), 0.0, 1.0)
+                # S6-final: gd-only entries are never deleted by TTL or by
+                # the TSP3D stable-pool near-miss/stale budgets.
+                if str(lifecycle_states[idx].get("lifecycle_state", CONFIRMED)) == GD:
+                    keep_c.append(c_np)
+                    keep_s.append(surfaces[idx] if idx < len(surfaces) else c_np)
+                    keep_v.append(v_state)
+                    keep_lifecycle.append(lifecycle_states[idx])
+                    continue
                 # S6: `stable` is the deletion pool.  Staleness is checked even
                 # when the entry has left the near field, which the miss budget
                 # alone can never catch.

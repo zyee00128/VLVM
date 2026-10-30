@@ -10,7 +10,7 @@ looks at the bounding rectangle anyway):
 Two VLFM mechanisms are deliberately **not** ported here, because the VLVM memory
 lifecycle already covers their role:
   * `too_offset` + random `range_id`  -> `too_offset_rect` only *flags* the box
-    (`suspect`), and the caller writes it as a suspicious entry;
+    (`suspect`), and the calibration logger records it as a diagnostic flag;
   * `update_explored` (near re-look deletion of flagged ids) -> the existing
     suspicious near-field hysteresis / soft-only free-space erasure.
 """

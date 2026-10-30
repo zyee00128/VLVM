@@ -36,6 +36,11 @@ from vlfm.tsp3d_models.fussion_utils.target_memory_manager import (
     TargetMemoryManager,
 )
 from vlfm.utils.vlvm_stats_logger import VlvmStatsLogger
+from vlfm.semantic_spatial_field.middle_tier import (
+    MiddleTierFeatureAssembler,
+    MiddleTierRanker,
+    MiddleTierShadowLogger,
+)
 from vlfm.tsp3d_models.fussion_utils.target_geometric_gating import (
     TargetGeometricGatingEngine,
     BoxOccupancyConfig,
@@ -106,6 +111,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
             s_penalty_thresh: float = 0.14,
             s_penalty_uncovered_w: float = 1.0,
             det_log_dir: Optional[str] = None,
+            # middle-tier promotion-probability shadow / ranker
+            enable_middle_tier_shadow: bool = True,
+            middle_tier_shadow_every_n: int = 1,
+            middle_tier_model_path: str = "",
+            enable_middle_tier_ranking: bool = False,
             # geometric admission module
             enable_occ_consistency: bool = True,
             occ_min_voxels: int = 8,
@@ -118,20 +128,18 @@ class TSP3DObjectNavPolicy(BasePolicy):
             provisional_min_dist: float = 1.0,
             provisional_max_dist: float = 4.0,
             provisional_s_min: float = 0.07,
-            upgrade_min_obs: int = 2,
-            upgrade_max_dist: float = 4.0,
+            upgrade_min_obs: int = 4,
             stop_gate_confirm_radius: float = 1.2,
             stop_gate_turns: int = 3,
             enable_stable_pool: bool = True,
-            hide_stable_from_selection: bool = True,
             merge_new_info_dist: float = 0.2,
             merge_new_info_yaw: float = 10.0,
             merge_new_info_steps: int = 3,
             stable_stale_purge: int = 60,
             stable_miss_delete: int = 5,
             stable_total_miss: int = 8,
-            stable_revive_radius: float = 0.5,
-            stable_revive_window: int = 10,
+            stable_revive_radius: float = 0.8,
+            stable_revive_window: int = 20,
             stable_revive_min_sigma: float = 0.50,
             confirmed_to_stable_misses: int = 3,
             provisional_to_stable_misses: int = 3,
@@ -139,6 +147,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
             goal_use_surface: bool = True,
             lock_exempt: bool = True,
             lock_exempt_identity: bool = True,
+            enable_gd_mechanism: bool = False,
+            gd_conf_min: float = 0.40,
+            gd_max_dist: float = 5.0,
+            gd_only_classes: str = "",
             enable_stats: bool = True,
             *args: Any,
             **kwargs: Any,
@@ -177,7 +189,6 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._sigma_sce = sigma_sce
         self._tau = tau
         self._enable_stable_pool = bool(enable_stable_pool)
-        self._hide_stable_from_selection = bool(hide_stable_from_selection)
         self._stop_gate_radius = float(stop_gate_confirm_radius)
         self._stop_gate_turns = int(stop_gate_turns)
         self._stop_blacklist: set = set()
@@ -187,6 +198,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._last_goal_num_obs: int = 0
         self._last_goal_state: str = "confirmed"
         self._last_goal_stale: int = 0
+        self._last_goal_origin: Optional[str] = None
+        self._last_goal_gd_hits: int = 0
         self._near_field_dist = near_field_dist
         self._near_field_sigma_scale = near_field_sigma_scale
         self._nlp_mode = use_vlfm_nlp
@@ -213,6 +226,20 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._memory_event_logs: List[Dict[str, Any]] = []
         self._nav_goal_logs: List[Dict[str, Any]] = []
         self._track_frame_logs: List[Dict[str, Any]] = []
+        self._stop_shadow_logs: List[Dict[str, Any]] = []
+        self._middle_rank_shadow_logs: List[Dict[str, Any]] = []
+        self._middle_tier_shadow = None
+        self._middle_tier_shadow_error: Optional[str] = None
+        # Optional raw observation side-channel. It is never read by act's
+        # decision path and is enabled only with det_log_dir.
+        self._field_observation_logger = None
+        self._field_log_error: Optional[str] = None
+        # Shadow-only field exploration coverage.  It has its own region grid
+        # and is called after the action has been selected; no field value is
+        # read by target selection or STOP.
+        self._field_shadow = None
+        self._field_shadow_logs: List[Dict[str, Any]] = []
+        self._field_shadow_error: Optional[str] = None
         self._last_robot_pose: Optional[Tuple[float, float, float]] = None
 
         # Mechanism initialisation
@@ -231,12 +258,18 @@ class TSP3DObjectNavPolicy(BasePolicy):
             occ_threshold=occ_threshold,
             free_threshold=free_threshold,
         )
+        self._enable_gd_mechanism = bool(enable_gd_mechanism)
+        self._gd_conf_min = float(gd_conf_min)
+        self._gd_max_dist = float(gd_max_dist)
+        self._gd_only_classes = tuple(
+            part.strip().lower() for part in str(gd_only_classes).split(",") if part.strip()
+        )
         self._init_memory_manager(
             merge_dist_thresh=merge_dist_thresh,
             ema_weight_old=ema_weight_old,
             upgrade_min_obs=upgrade_min_obs,
-            upgrade_max_dist=upgrade_max_dist,
             enable_stable_pool=enable_stable_pool,
+            enable_gd_pool=self._enable_gd_mechanism,
             merge_new_info_dist=merge_new_info_dist,
             merge_new_info_yaw=merge_new_info_yaw,
             merge_new_info_steps=merge_new_info_steps,
@@ -278,6 +311,22 @@ class TSP3DObjectNavPolicy(BasePolicy):
             goal_use_surface=goal_use_surface,
             det_log_dir=det_log_dir,
         )
+        self._enable_middle_tier_ranking = bool(enable_middle_tier_ranking)
+        self._middle_tier_model_path = str(middle_tier_model_path or "")
+        self._middle_tier_shadow_every_n = int(middle_tier_shadow_every_n)
+        try:
+            self._middle_tier_shadow = MiddleTierShadowLogger(
+                enabled=bool(enable_middle_tier_shadow),
+                assembler=MiddleTierFeatureAssembler(),
+                ranker=MiddleTierRanker(
+                    model_path=str(middle_tier_model_path or ""),
+                    enabled=True,
+                ),
+                every_n=int(middle_tier_shadow_every_n),
+            )
+        except Exception as exc:  # noqa: BLE001 - shadow must not kill nav
+            self._middle_tier_shadow = None
+            self._middle_tier_shadow_error = f"{type(exc).__name__}: {exc}"
         self._provisional_gate = ProvisionalGate(ProvisionalGateConfig(
             enabled=enable_provisional_gate,
             confirmed_sigma=self._sigma_tar,
@@ -299,7 +348,14 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._gd_calib = None
         self._gd_calib_logs: List[Dict[str, Any]] = []
         self._gd_calib_error: Optional[str] = None
-        if os.environ.get("GD_CALIB_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on"):
+        self._gd_mech = None
+        self._gd_mech_error: Optional[str] = None
+        self._gd_mech_last_step: int = -1
+        _gd_requested = self._enable_gd_mechanism or (
+            os.environ.get("GD_CALIB_ENABLE", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        if _gd_requested:
             try:
                 from vlfm.tsp3d_models.grounding_dino.calibration import (
                     GdCalibConfig,
@@ -307,17 +363,45 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 )
 
                 _gd_cfg = GdCalibConfig.from_env()
+                if self._enable_gd_mechanism:
+                    _gd_cfg.enabled = True
                 if _gd_cfg.enabled:
                     self._gd_calib = GdCalibrationLogger(_gd_cfg)
                     print(
                         "[GD-CALIB] enabled "
                         f"every_n={_gd_cfg.every_n} record_every_n={_gd_cfg.record_every_n} "
-                        f"box_thr={_gd_cfg.box_thr} max_boxes={_gd_cfg.max_boxes}",
+                        f"box_thr={_gd_cfg.box_thr} max_boxes={_gd_cfg.max_boxes} "
+                        f"mechanism={self._enable_gd_mechanism}",
                         flush=True,
                     )
-            except BaseException as exc:  # noqa: BLE001 - calibration must not kill nav
+                if self._enable_gd_mechanism:
+                    from vlfm.tsp3d_models.grounding_dino.mechanism import (
+                        GdMechanism,
+                        GdMechanismConfig,
+                    )
+
+                    self._gd_mech = GdMechanism(
+                        memory_manager=self._memory_manager,
+                        geom_gate=self._geom_gate_engine,
+                        obstacle_map3d=self._obstacle_map3d,
+                        config=GdMechanismConfig(
+                            enabled=True,
+                            conf_min=float(self._gd_conf_min),
+                            max_dist_m=float(self._gd_max_dist),
+                            gd_only_classes=tuple(self._gd_only_classes),
+                        ),
+                    )
+                    print(
+                        "[GD-MECH] enabled "
+                        f"conf_min={self._gd_conf_min} "
+                        f"max_dist={self._gd_max_dist} classes={self._gd_only_classes or 'ALL'} "
+                        "depth=gd-only-required/gd-tsp-track-merge no-conf-gate no-ttl",
+                        flush=True,
+                    )
+            except BaseException as exc:  # noqa: BLE001 - GD must not kill nav
                 self._gd_calib_error = f"{type(exc).__name__}: {exc}"
-                print(f"[GD-CALIB] init failed: {self._gd_calib_error}", flush=True)
+                self._gd_mech_error = self._gd_calib_error
+                print(f"[GD-MECH] init failed: {self._gd_calib_error}", flush=True)
 
         # 3D visual grounding and vision-language evaluation clients
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
@@ -355,7 +439,33 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._memory_event_logs = []
         self._nav_goal_logs = []
         self._track_frame_logs = []
+        self._stop_shadow_logs = []
+        self._middle_rank_shadow_logs = []
+        self._field_shadow_logs = []
+        self._field_shadow_error = None
+        middle_shadow = getattr(self, "_middle_tier_shadow", None)
+        if middle_shadow is not None:
+            try:
+                middle_shadow.reset()
+            except Exception:
+                pass
+        shadow = getattr(self, "_field_shadow", None)
+        if shadow is not None:
+            try:
+                shadow.reset()
+            except Exception:
+                pass
         self._gd_calib_logs = []
+        self._gd_mech_last_step = -1
+        self._gd_mech_error = None
+        logger = getattr(self, "_field_observation_logger", None)
+        if logger is not None:
+            try:
+                logger.abort()
+            except Exception:
+                pass
+        self._field_observation_logger = None
+        self._field_log_error = None
         if self._gd_calib is not None:
             self._gd_calib.reset()
         self._stop_blacklist = set()
@@ -365,9 +475,144 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._last_goal_num_obs = 0
         self._last_goal_state = "confirmed"
         self._last_goal_stale = 0
+        self._last_goal_origin = None
+        self._last_goal_gd_hits = 0
         self._lock_step = -1
         self._stats.reset()
         self._did_reset = True
+
+    def _log_field_shadow_frame(self, *, mode: Optional[str] = None) -> None:
+        """Append one read-only field exploration row after action selection.
+
+        The shadow owns its own incremental region grid.  It never mutates
+        policy memory, nav goals, STOP state or the chosen action; exceptions
+        are captured and do not interrupt navigation.
+        """
+        if not getattr(self, "_det_log_dir", None):
+            return
+        enabled = os.environ.get("FIELD_SHADOW_ENABLE", "0").strip().lower()
+        if enabled not in ("1", "true", "yes", "on"):
+            return
+        try:
+            if self._field_shadow is None:
+                from vlfm.semantic_spatial_field.shadow import (
+                    FieldExplorationShadow,
+                    FieldShadowConfig,
+                )
+
+                self._field_shadow = FieldExplorationShadow(
+                    FieldShadowConfig(
+                        enabled=True,
+                        config_path=os.environ.get("FIELD_SHADOW_CONFIG") or None,
+                        cell_size_m=float(os.environ.get("FIELD_SHADOW_CELL_SIZE_M", "1.0")),
+                        top_k=int(os.environ.get("FIELD_SHADOW_TOP_K", "5")),
+                    )
+                )
+            cache = self._observations_cache
+            robot_xyz = np.asarray(cache.get("robot_xy_z", np.zeros(3)))
+            robot_xy = np.asarray(cache.get("robot_xy", robot_xyz[:2]))
+            candidate_points: List[np.ndarray] = []
+            for cls in [c.strip() for c in str(self._target_object).split("|") if c.strip()]:
+                for centroid in self._target_3d_memory.get(cls, []) or []:
+                    point = np.asarray(centroid, dtype=np.float64).reshape(-1)
+                    if point.size >= 2 and np.all(np.isfinite(point[:2])):
+                        candidate_points.append(point[:2].copy())
+            nav_goal = self._last_target_coord
+            row = self._field_shadow.observe(
+                step=int(self._num_steps),
+                robot_xy=robot_xy,
+                frontiers_3d=cache.get("frontier_sensor_3d", np.empty((0, 3))),
+                frontiers_2d=cache.get("frontier_sensor", np.empty((0, 2))),
+                candidate_points=candidate_points,
+                nav_goal_xy=None if nav_goal is None else np.asarray(nav_goal),
+                mode=mode,
+            )
+            if row is not None:
+                self._field_shadow_logs.append(row)
+        except Exception as exc:  # noqa: BLE001 - shadow must never kill nav
+            self._field_shadow_error = f"{type(exc).__name__}: {exc}"
+
+    def _log_field_observation_frame(self) -> None:
+        """Record offline inputs without invoking the field or changing actions."""
+        if not getattr(self, "_det_log_dir", None):
+            return
+        try:
+            from vlfm.semantic_spatial_field.observation_logger import FieldObservationLogger
+
+            cache = self._observations_cache
+            rgbd_views = cache.get("object_map_rgbd", ())
+            if not rgbd_views:
+                return
+            if self._field_observation_logger is None:
+                om = self._obstacle_map3d
+                map_spec = {
+                    "map_kind": self._om_style,
+                    "size_pixels": int(om.size),
+                    "pixels_per_meter": float(om.pixels_per_meter),
+                    "episode_pixel_origin_initial": np.asarray(om._episode_pixel_origin),
+                    "voxel_size_m": float(om._voxel_size),
+                    "height_size_voxels": int(om._height_size),
+                    "min_height_m": float(om._min_height),
+                    "max_height_m": float(om._max_height),
+                    **getattr(self, "_field_map_parameters", {}),
+                    "agent_radius_m": float(om._agent_radius),
+                    "agent_height_m": float(om._agent_height),
+                    "nav_slice_height_m": float(om._nav_slice_height),
+                    "hole_area_thresh": int(om._hole_area_thresh),
+                    "depth_image_shape": list(self._depth_image_shape),
+                    "camera_height_m": float(self._camera_height),
+                    "fov_horizontal_deg": float(self._fov_angle),
+                }
+                self._field_observation_logger = FieldObservationLogger(
+                    self._det_log_dir, map_spec
+                )
+            frontiers_3d = np.asarray(cache.get("frontier_sensor_3d", np.empty((0, 3))))
+            frontiers_2d = np.asarray(cache.get("frontier_sensor", np.empty((0, 2))))
+            robot_xyz = np.asarray(cache.get("robot_xy_z", np.zeros(3)))
+            robot_xy = np.asarray(cache.get("robot_xy", robot_xyz[:2]))
+            robot_yaw = float(cache.get("robot_heading", 0.0))
+            for view_idx, (rgb, depth, tf, min_depth, max_depth, fx, fy) in enumerate(rgbd_views):
+                self._field_observation_logger.append_frame(
+                    step=int(self._num_steps),
+                    view_index=int(view_idx),
+                    target_object=str(self._target_object),
+                    rgb=rgb,
+                    depth=depth,
+                    camera_to_episodic=tf,
+                    depth_range_intrinsics=(min_depth, max_depth, fx, fy),
+                    robot_xyz=robot_xyz,
+                    robot_xy=robot_xy,
+                    robot_yaw=robot_yaw,
+                    frontiers_3d=frontiers_3d,
+                    frontiers_2d=frontiers_2d,
+                    pixel_origin=self._obstacle_map3d._episode_pixel_origin,
+                )
+        except Exception as exc:  # logging must not interrupt navigation
+            self._field_log_error = f"{type(exc).__name__}: {exc}"
+
+    def _finalize_field_observations(
+        self, *, scene_id: str, episode_id: int, target_object: str, infos: Dict[str, Any]
+    ) -> Optional[str]:
+        logger = getattr(self, "_field_observation_logger", None)
+        if logger is None:
+            return None
+        try:
+            path = logger.finalize(
+                scene_id=scene_id,
+                episode_id=episode_id,
+                target_object=target_object,
+                infos=infos,
+            )
+            self._field_observation_logger = None
+            return path
+        except Exception as exc:  # diagnostics must not interrupt episode accounting
+            self._field_log_error = f"{type(exc).__name__}: {exc}"
+            try:
+                logger.abort()
+            except Exception:
+                pass
+            self._field_observation_logger = None
+            return None
     
     # ==========================================================================
     # Mechanism initialisation (one `_init_*` per module)
@@ -392,6 +637,15 @@ class TSP3DObjectNavPolicy(BasePolicy):
         free_threshold: float,
     ) -> None:
         """Core 3D spatial representations: the occupancy / obstacle map backend."""
+        self._field_map_parameters = {
+            "min_obstacle_height_m": float(min_obstacle_height),
+            "max_obstacle_height_m": float(max_obstacle_height),
+            "obstacle_area_threshold_m2": float(obstacle_map_area_threshold),
+            "log_odds_occ": float(log_odds_occ),
+            "log_odds_free": float(log_odds_free),
+            "occ_threshold": float(occ_threshold),
+            "free_threshold": float(free_threshold),
+        }
         height_range = max_obstacle_height - min_obstacle_height
         height_size = int(height_range / voxel_size) + 1
         pixels_per_meter = int(1.0 / voxel_size)
@@ -436,17 +690,17 @@ class TSP3DObjectNavPolicy(BasePolicy):
         *,
         merge_dist_thresh: float,
         ema_weight_old: float,
-        upgrade_min_obs: int = 2,
-        upgrade_max_dist: float = 4.0,
+        upgrade_min_obs: int = 4,
         enable_stable_pool: bool = True,
+        enable_gd_pool: bool = False,
         merge_new_info_dist: float = 0.2,
         merge_new_info_yaw: float = 10.0,
         merge_new_info_steps: int = 3,
         stable_stale_purge: int = 60,
         stable_miss_delete: int = 5,
         stable_total_miss: int = 8,
-        stable_revive_radius: float = 0.5,
-        stable_revive_window: int = 10,
+        stable_revive_radius: float = 0.8,
+        stable_revive_window: int = 20,
         stable_revive_min_sigma: float = 0.50,
         confirmed_to_stable_misses: int = 3,
         provisional_to_stable_misses: int = 3,
@@ -462,8 +716,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
             merge_dist_thresh=merge_dist_thresh,
             ema_weight_old=ema_weight_old,
             upgrade_min_obs=upgrade_min_obs,
-            upgrade_max_dist=upgrade_max_dist,
             enable_stable_pool=enable_stable_pool,
+            enable_gd_pool=enable_gd_pool,
             merge_new_info_dist=merge_new_info_dist,
             merge_new_info_yaw=merge_new_info_yaw,
             merge_new_info_steps=merge_new_info_steps,
@@ -715,8 +969,15 @@ class TSP3DObjectNavPolicy(BasePolicy):
         """
         Navigation goal among the memorized target candidates.
 
-        Final S5 selection: sigma_c band-pass tier -> confirmed over provisional
-        -> nearest centroid -> num_obs tiebreak -> fresher tiebreak.
+        Current four-tier selection:
+          gd-tsp (including promoted gd-only) > gd-only > confirmed >
+          provisional.
+        Internal keys: gd-tsp by sigma band -> gd_hits -> distance ->
+        num_obs/freshness; gd-only by gd_hits -> distance -> num_obs/freshness;
+        confirmed/provisional by sigma band -> distance -> num_obs/freshness.
+
+        Field / region_semantic shadow is intentionally NOT read here: those
+        diagnostics are log-only and must not change the nav goal or STOP.
         """
         valid_centroids: List[np.ndarray] = []
         valid_goals: List[np.ndarray] = []
@@ -728,6 +989,17 @@ class TSP3DObjectNavPolicy(BasePolicy):
         valid_stale: List[int] = []
         valid_bands: List[int] = []
         valid_states: List[str] = []
+        valid_origins: List[Optional[str]] = []
+        valid_classes: List[str] = []
+        valid_gd_hits: List[int] = []
+        valid_gd_only: List[bool] = []
+        valid_gd_tsp: List[bool] = []
+        valid_gd_incremental: List[bool] = []
+        valid_gd_upgraded: List[bool] = []
+        valid_promoted_gd_only: List[bool] = []
+        # Pure confirmed and gd-only are stop-shadow candidates for the next
+        # experiment.  They are logged below but are not stop-eligible now.
+        self._stop_shadow_logs = getattr(self, "_stop_shadow_logs", [])
         target_classes = self._target_object.split("|")
         for cls in target_classes:
             if cls in self._target_3d_memory and len(self._target_3d_memory[cls]) > 0:
@@ -741,7 +1013,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
                     st = self._memory_manager.state_of(centroid)
                     state_name = str(st.get("lifecycle_state") or "confirmed")
-                    if self._hide_stable_from_selection and state_name == "stable":
+                    if state_name == "stable":
                         continue
                     if st.get("memory_id") in self._stop_blacklist:
                         continue
@@ -762,10 +1034,36 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     valid_memory_ids.append(st.get("memory_id"))
                     valid_candidate_ids.append(st.get("last_candidate_id"))
                     valid_scores.append(score)
-                    valid_stop_ok.append(state_name == "confirmed")
+                    # Stop eligibility is assigned after origin/flags are read:
+                    # pure TSP confirmed is temporarily NOT stop-eligible.
                     valid_stale.append(int(stale))
                     valid_bands.append(self._sigma_band(score))
                     valid_states.append(state_name)
+                    origin = st.get("origin")
+                    valid_origins.append(str(origin) if origin is not None else None)
+                    valid_classes.append(str(cls))
+                    valid_gd_hits.append(int(st.get("gd_hits", 0) or 0))
+                    valid_gd_only.append(bool(st.get("gd_only", False)))
+                    promoted_gd_only = bool(
+                        st.get("promoted_from_gd_only", False)
+                    )
+                    # A gd-only entry promoted by a TSP3D merge is gd-tsp,
+                    # not a separate category.  Keep the flag for provenance.
+                    is_gd_tsp = (
+                        str(origin or "") == "gd-tsp" or promoted_gd_only
+                    )
+                    valid_gd_tsp.append(is_gd_tsp)
+                    gd_upgraded = bool(st.get("gd_upgraded", False))
+                    valid_gd_upgraded.append(gd_upgraded)
+                    valid_promoted_gd_only.append(promoted_gd_only)
+                    valid_gd_incremental.append(
+                        gd_upgraded or promoted_gd_only
+                    )
+                    # Only GD-backed confirmations may STOP; promoted gd-only
+                    # entries are included via is_gd_tsp.
+                    valid_stop_ok.append(
+                        state_name == "confirmed" and is_gd_tsp
+                    )
         if len(valid_centroids) == 0:
             self._last_stop_eligible = False
             self._last_goal_memory_id = None
@@ -775,15 +1073,52 @@ class TSP3DObjectNavPolicy(BasePolicy):
         centroids = np.array(valid_centroids)
         dists_2d = np.linalg.norm(centroids[:, :2] - robot_xy, axis=1)
 
-        # Final S5 order: sigma_c band -> confirmed/provisional -> distance
-        # -> num_obs (only within a near-distance tie) -> freshness.
+        # Current middle-tier order: gd-only > confirmed.  A gd-only entry
+        # promoted by a TSP3D merge remains gd-tsp and uses tier 0; there is
+        # no separate promoted tier.  `stable` and stop-blacklisted entries
+        # were already filtered above.
+        def selection_tier(i: int) -> int:
+            if bool(valid_gd_tsp[i]):
+                return 0
+            if bool(valid_gd_only[i]) or valid_states[i] == "gd":
+                return 1
+            if valid_states[i] == "confirmed":
+                return 2
+            if valid_states[i] == "provisional":
+                return 3
+            return 4
+
+        def distance_bucket(i: int) -> int:
+            # 0.5 m buckets: close goals first, but only after the tier's
+            # primary evidence key.  Keep the raw 0.5 m convention used by the
+            # previous selection for continuity.
+            return int(round(float(dists_2d[i]) / 0.5))
+
+        def sigma_band_key(i: int) -> int:
+            t = selection_tier(i)
+            # gd-tsp / confirmed / provisional use sigma band; gd-only uses
+            # gd_hits as its primary evidence.
+            return int(valid_bands[i]) if t in (0, 2, 3) else 0
+
+        def gd_hits_key(i: int) -> int:
+            t = selection_tier(i)
+            # gd-tsp and gd-only use GD hit count; confirmed/provisional do not.
+            return -int(valid_gd_hits[i]) if t in (0, 1) else 0
+
+        def num_obs_key(i: int) -> int:
+            # S6gd2: confirmed/provisional rows with >=3 observations were more
+            # precise than 1-2 observation rows; use 3 as the tie threshold.
+            return 0 if int(valid_obs[i]) >= 3 else 1
+
+        tiers = [selection_tier(i) for i in range(len(valid_centroids))]
         chosen_idx = min(
             range(len(valid_centroids)),
             key=lambda i: (
-                int(valid_bands[i]),
-                0 if valid_states[i] == "confirmed" else 1,
-                round(float(dists_2d[i]) / 0.5),
-                0 if int(valid_obs[i]) >= 2 else 1,
+                int(tiers[i]),
+                sigma_band_key(i),
+                gd_hits_key(i),
+                distance_bucket(i),
+                num_obs_key(i),
                 -int(valid_obs[i]),
                 int(valid_stale[i]),
             ),
@@ -794,10 +1129,63 @@ class TSP3DObjectNavPolicy(BasePolicy):
         self._last_goal_num_obs = int(valid_obs[chosen_idx])
         self._last_goal_state = valid_states[chosen_idx]
         self._last_goal_stale = int(valid_stale[chosen_idx])
+        self._last_goal_origin = valid_origins[chosen_idx]
+        self._last_goal_gd_hits = int(valid_gd_hits[chosen_idx])
         chosen_2d = valid_goals[chosen_idx][:2].copy()
         self._last_target_centroid = np.asarray(
             valid_centroids[chosen_idx], dtype=np.float64
         ).reshape(-1)[:2].copy()
+
+        # STOP shadow: log every selected confirmed (including gd-tsp and
+        # gd-only-promoted-as-gd-tsp) and gd-only goal, with candidate STOP
+        # features and hypothetical thresholds.  This never changes an action.
+        _chosen_state = str(valid_states[chosen_idx])
+        _chosen_is_gd_tsp = bool(valid_gd_tsp[chosen_idx])
+        _chosen_is_promoted = bool(valid_promoted_gd_only[chosen_idx])
+        _chosen_is_gd_only = bool(valid_gd_only[chosen_idx]) or _chosen_state == "gd"
+        _should_log_stop_shadow = (
+            _chosen_is_gd_only or _chosen_state == "confirmed"
+        )
+        if _should_log_stop_shadow:
+            _goal_distance = float(np.linalg.norm(chosen_2d - robot_xy))
+            _obs = int(valid_obs[chosen_idx])
+            _gd_hits = int(valid_gd_hits[chosen_idx])
+            _stop_shadow = {
+                "event": "stop_shadow",
+                "shadow_only": True,
+                "step": int(self._num_steps),
+                "memory_id": valid_memory_ids[chosen_idx],
+                "candidate_id": valid_candidate_ids[chosen_idx],
+                "target_class": str(self._target_object.split("|")[0]),
+                "centroid": np.asarray(valid_centroids[chosen_idx], dtype=np.float64).reshape(-1)[:3].tolist(),
+                "goal": np.asarray(chosen_2d, dtype=np.float64).reshape(-1)[:2].tolist(),
+                "distance": float(dists_2d[chosen_idx]),
+                "goal_distance": _goal_distance,
+                "lifecycle_state": _chosen_state,
+                "origin": valid_origins[chosen_idx],
+                "gd_only": bool(_chosen_is_gd_only),
+                "gd_tsp": bool(_chosen_is_gd_tsp),
+                "promoted_from_gd_only": bool(_chosen_is_promoted),
+                "sigma_c": float(valid_scores[chosen_idx]),
+                "sigma_band": int(valid_bands[chosen_idx]),
+                "gd_hits": _gd_hits,
+                "num_obs": _obs,
+                "stale_steps": int(valid_stale[chosen_idx]),
+                "stop_eligible_current": bool(valid_stop_ok[chosen_idx]),
+                "stop_gate_confirm_radius": float(self._stop_gate_radius),
+                "pointnav_stop_radius": float(self._pointnav_stop_radius),
+                "would_stop_radius_0_9": bool(_goal_distance <= float(self._pointnav_stop_radius)),
+                "would_stop_radius_1_2": bool(_goal_distance <= float(self._stop_gate_radius)),
+                "would_stop_numobs_ge3": bool(_obs >= 3),
+                "would_stop_numobs_ge5": bool(_obs >= 5),
+                "would_stop_gdhits_ge3": bool(_gd_hits >= 3),
+                "would_stop_gdhits_ge5": bool(_gd_hits >= 5),
+                "would_stop_gd3_r09": bool(_goal_distance <= float(self._pointnav_stop_radius) and _gd_hits >= 3),
+                "would_stop_gd5_r09": bool(_goal_distance <= float(self._pointnav_stop_radius) and _gd_hits >= 5),
+                "would_stop_obs3_r09": bool(_goal_distance <= float(self._pointnav_stop_radius) and _obs >= 3),
+                "would_stop_obs5_r09": bool(_goal_distance <= float(self._pointnav_stop_radius) and _obs >= 5),
+            }
+            self._stop_shadow_logs.append(_stop_shadow)
         switch_reason = "initial"
         if self._last_target_coord is None:
             self._last_target_coord = chosen_2d
@@ -813,6 +1201,84 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 self._last_target_coord = chosen_2d
                 switch_reason = "switched"
 
+        # Middle-tier shadow: build the candidate snapshot after selection.
+        # This block is read-only; exceptions are captured by the helper.
+        middle_candidates: List[Dict[str, Any]] = []
+        for i in range(len(valid_centroids)):
+            tier = int(tiers[i])
+            if tier not in (1, 2):
+                continue
+            st_i = self._memory_manager.state_of(
+                np.asarray(valid_centroids[i], dtype=np.float64)
+            )
+            middle_candidates.append(
+                {
+                    "index": int(i),
+                    "memory_id": valid_memory_ids[i],
+                    "candidate_id": valid_candidate_ids[i],
+                    "type": "gd-only" if tier == 1 else "tsp-confirmed",
+                    "target_class": valid_classes[i],
+                    "centroid": np.asarray(valid_centroids[i], dtype=np.float64),
+                    "score": float(valid_scores[i]),
+                    "state": st_i,
+                    "origin": valid_origins[i],
+                    "num_obs": int(valid_obs[i]),
+                    "stale_steps": int(valid_stale[i]),
+                    "gd_hits": int(valid_gd_hits[i]),
+                    "gd_only": bool(valid_gd_only[i]),
+                    "gd_tsp": bool(valid_gd_tsp[i]),
+                    "gd_conf_max": st_i.get("gd_conf_max"),
+                    "gd_conf_last": st_i.get("gd_conf_last"),
+                    "revive_count": st_i.get("revive_count"),
+                    "origin_provisional": bool(st_i.get("origin_provisional", False)),
+                    "selected": bool(i == chosen_idx),
+                    "n_selectable": len(valid_centroids),
+                    "distance": float(dists_2d[i]),
+                    "distance_bucket": int(distance_bucket(i)),
+                    "selection_tier": int(tier),
+                }
+            )
+
+        def _middle_static_key(row: Dict[str, Any]) -> tuple:
+            type_name = str(row.get("type") or "")
+            return (
+                int(row.get("selection_tier") or 0),
+                int(self._sigma_band(float(row.get("score") or 0.0)))
+                if type_name == "tsp-confirmed"
+                else 0,
+                -int(row.get("gd_hits") or 0)
+                if type_name == "gd-only"
+                else 0,
+                int(row.get("distance_bucket") or 0),
+                0 if int(row.get("num_obs") or 0) >= 3 else 1,
+                -int(row.get("num_obs") or 0),
+                int(row.get("stale_steps") or 0),
+            )
+
+        middle_candidates.sort(key=_middle_static_key)
+        for rank, row in enumerate(middle_candidates):
+            row["static_rank"] = int(rank)
+            row["switch_reason"] = switch_reason
+
+        gd_frame = None
+        for record in reversed(getattr(self, "_gd_calib_logs", []) or []):
+            if int(record.get("step", -1)) == int(self._num_steps):
+                gd_frame = record
+                break
+        current_events = [
+            event
+            for event in self._memory_event_logs
+            if int(event.get("step", -1)) == int(self._num_steps)
+        ]
+        self._log_middle_tier_shadow(
+            step=int(self._num_steps),
+            candidates=middle_candidates,
+            robot_xy=robot_xy,
+            gd_frame=gd_frame,
+            memory_events=current_events,
+            switch_reason=switch_reason,
+        )
+
         self._nav_goal_logs.append(
             {
                 "step": int(self._num_steps),
@@ -821,14 +1287,34 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 "centroid": np.asarray(valid_centroids[chosen_idx], dtype=np.float64).tolist(),
                 "goal": np.asarray(self._last_target_coord, dtype=np.float64).tolist(),
                 "quality_score": float(valid_scores[chosen_idx]),
+                "selection_tier": int(tiers[chosen_idx]),
+                "selection_tier_name": (
+                    "gd_tsp" if int(tiers[chosen_idx]) == 0
+                    else "gd_only" if int(tiers[chosen_idx]) == 1
+                    else "confirmed" if int(tiers[chosen_idx]) == 2
+                    else "provisional" if int(tiers[chosen_idx]) == 3
+                    else "other"
+                ),
                 "sigma_tier": int(self._sigma_tier(valid_scores[chosen_idx])),
                 "sigma_band": int(valid_bands[chosen_idx]),
+                "distance_bucket": int(distance_bucket(chosen_idx)),
+                "num_obs_ge3": bool(int(valid_obs[chosen_idx]) >= 3),
                 "distance": float(dists_2d[chosen_idx]),
                 "num_obs": int(valid_obs[chosen_idx]),
                 "switch_reason": switch_reason,
                 "stale_steps": int(valid_stale[chosen_idx]),
                 "n_selectable": len(valid_centroids),
                 "lifecycle_state": str(valid_states[chosen_idx]),
+                "origin": valid_origins[chosen_idx],
+                "gd_only": bool(valid_gd_only[chosen_idx]),
+                "gd_tsp": bool(valid_gd_tsp[chosen_idx]),
+                "gd_incremental": bool(valid_gd_incremental[chosen_idx]),
+                "gd_upgraded": bool(valid_gd_upgraded[chosen_idx]),
+                "promoted_from_gd_only": bool(
+                    valid_promoted_gd_only[chosen_idx]
+                ),
+                "gd_hits": int(valid_gd_hits[chosen_idx]),
+                "stop_eligible": bool(valid_stop_ok[chosen_idx]),
                 "robot_xy": np.asarray(position, dtype=np.float64).reshape(-1)[:2].tolist(),
                 "robot_yaw": None if self._last_robot_pose is None else float(self._last_robot_pose[2]),
             }
@@ -911,6 +1397,32 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     done_initializing=bool(self._done_initializing),
                 )
                 if record is not None:
+                    if self._gd_mech is not None and int(self._gd_mech_last_step) != int(self._num_steps):
+                        try:
+                            mechanism_record = self._gd_mech.process(
+                                record,
+                                pcd=pcd,
+                                robot_xyz=robot_xyz,
+                                robot_yaw=float(robot_yaw),
+                                target_classes=[
+                                    c.strip()
+                                    for c in str(self._target_object).split("|")
+                                    if c.strip()
+                                ],
+                                step=int(self._num_steps),
+                            )
+                            record["mechanism"] = mechanism_record
+                            self._memory_event_logs.extend(
+                                mechanism_record.get("events", []) or []
+                            )
+                            self._gd_mech_last_step = int(self._num_steps)
+                        except BaseException as exc:  # noqa: BLE001 - GD must not kill nav
+                            if self._gd_mech_error is None:
+                                self._gd_mech_error = f"{type(exc).__name__}: {exc}"
+                                print(
+                                    f"[GD-MECH] disabled after error: {self._gd_mech_error}",
+                                    flush=True,
+                                )
                     self._gd_calib_logs.append(record)
             except BaseException as exc:  # noqa: BLE001 - calibration must not kill nav
                 if self._gd_calib_error is None:
@@ -918,6 +1430,41 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     print(f"[GD-CALIB] disabled after error: {self._gd_calib_error}", flush=True)
 
         return detections
+
+    def _log_middle_tier_shadow(
+        self,
+        *,
+        step: int,
+        candidates: List[Dict[str, Any]],
+        robot_xy: np.ndarray,
+        gd_frame: Optional[Dict[str, Any]],
+        memory_events: List[Dict[str, Any]],
+        switch_reason: str,
+    ) -> None:
+        """Append read-only middle-tier rows; never affect selection or STOP."""
+        if not getattr(self, "_det_log_dir", None):
+            return
+        shadow = getattr(self, "_middle_tier_shadow", None)
+        if shadow is None or not candidates:
+            return
+        try:
+            rows = shadow.observe(
+                step=int(step),
+                candidates=candidates,
+                robot_xy=robot_xy,
+                gd_frame=gd_frame,
+                memory_events=memory_events,
+                switch_reason=str(switch_reason),
+            )
+            if rows:
+                self._middle_rank_shadow_logs.extend(rows)
+        except Exception as exc:  # noqa: BLE001 - shadow must not kill nav
+            if self._middle_tier_shadow_error is None:
+                self._middle_tier_shadow_error = f"{type(exc).__name__}: {exc}"
+                print(
+                    f"[MIDDLE-RANK] disabled after error: {self._middle_tier_shadow_error}",
+                    flush=True,
+                )
 
     def _gd_track_snapshot(self) -> List[Dict[str, Any]]:
         """Read-only snapshot of alive target tracks for GD calibration.
@@ -943,12 +1490,18 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         rows: List[Dict[str, Any]] = []
         for target_class, centroids in self._target_3d_memory.items():
-            for centroid in centroids:
+            surfaces = self._target_surface_memory.get(target_class, [])
+            for index, centroid in enumerate(centroids):
                 c = np.asarray(centroid, dtype=np.float64).reshape(-1)
                 state = self._memory_manager.state_of(c)
                 memory_id = state.get("memory_id")
                 if memory_id is None:
                     continue
+                surface = (
+                    np.asarray(surfaces[index], dtype=np.float64).reshape(-1)
+                    if index < len(surfaces)
+                    else c
+                )
                 cid = last_candidate_by_memory.get(str(memory_id))
                 candidate = candidate_by_id.get(str(cid), {}) if cid else {}
                 last_obs = state.get("last_obs_step")
@@ -960,6 +1513,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         "memory_id": memory_id,
                         "target_class": str(target_class),
                         "centroid": c[:3].tolist(),
+                        "surface": surface[:3].tolist(),
                         "box8": candidate.get("box"),
                         "lifecycle_state": state.get("lifecycle_state"),
                         "num_obs": state.get("num_obs"),
@@ -973,7 +1527,24 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         "total_miss": state.get("total_miss"),
                         "revive_count": state.get("revive_count"),
                         "stale_steps": stale,
-                        "src": "tsp3d",
+                        "origin": state.get("origin"),
+                        "gd_only": bool(state.get("gd_only", False)),
+                        "gd_tsp": (
+                            str(state.get("origin") or "") == "gd-tsp"
+                            or bool(state.get("promoted_from_gd_only", False))
+                        ),
+                        "gd_hits": int(state.get("gd_hits", 0) or 0),
+                        "gd_conf_max": state.get("gd_conf_max"),
+                        "gd_conf_last": state.get("gd_conf_last"),
+                        "gd_pos": bool(state.get("gd_pos", False)),
+                        "gd_candidate_pos": bool(state.get("gd_candidate_pos", False)),
+                        "gd_last_step": state.get("gd_last_step"),
+                        "gd_upgraded": bool(state.get("gd_upgraded", False)),
+                        "gd_upgraded_from": state.get("gd_upgraded_from"),
+                        "promoted_from_gd_only": bool(
+                            state.get("promoted_from_gd_only", False)
+                        ),
+                        "src": "gd" if str(state.get("lifecycle_state")) == "gd" else "tsp3d",
                     }
                 )
         return rows
@@ -1181,6 +1752,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         "sigma_c": sigma_c,
                         "num_obs": int(res.get("num_obs", 1)),
                         "lifecycle_state": res.get("lifecycle_state"),
+                        "origin": res.get("origin"),
                         "new_info": res.get("new_info"),
                         "revived": bool(res.get("revived", False)),
                         "revive_count": int(res.get("revive_count", 0)),
@@ -1191,6 +1763,12 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         **{key: res.get(key) for key in (
                             "sigma_c_max", "sigma_c_latest", "sigma_c_ema_03",
                             "sigma_c_ema_05", "sigma_c_ema_08",
+                            "revive_sigma_c", "revive_num_obs_before",
+                            "revive_num_obs_after", "revive_dist_to_old_centroid",
+                            "revive_age_steps", "revive_last_obs_step",
+                            "revive_radius", "revive_window", "revive_min_sigma",
+                            "revive_detect_dist", "revive_robot_xy",
+                            "revive_old_centroid", "revive_new_centroid",
                         )},
                     })
                     upgraded = res.get("upgraded")
@@ -1207,8 +1785,12 @@ class TSP3DObjectNavPolicy(BasePolicy):
                             "sigma_c": sigma_c,
                             "num_obs": int(upgraded.get("num_obs", res.get("num_obs", 1))),
                             "lifecycle_state": upgraded.get("to_state"),
+                            "origin": res.get("origin"),
                             "from_state": upgraded.get("from_state"),
                             "upgrade_reason": upgraded.get("reason"),
+                            "promoted_from_gd_only": bool(
+                                res.get("promoted_from_gd_only", False)
+                            ),
                             "detect_dist": float(upgraded.get("detect_dist", 0.0)),
                             "robot_xy": np.asarray(robot_xyz, dtype=np.float64).reshape(-1)[:2].tolist(),
                             "robot_yaw": float(robot_yaw),
@@ -1267,9 +1849,16 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         "sigma_c": float(conf_amp),
                         "num_obs": int(res.get("num_obs", 1)),
                         "lifecycle_state": res.get("lifecycle_state"),
+                        "origin": res.get("origin"),
                         **{key: res.get(key) for key in (
                             "sigma_c_max", "sigma_c_latest", "sigma_c_ema_03",
                             "sigma_c_ema_05", "sigma_c_ema_08",
+                            "revive_sigma_c", "revive_num_obs_before",
+                            "revive_num_obs_after", "revive_dist_to_old_centroid",
+                            "revive_age_steps", "revive_last_obs_step",
+                            "revive_radius", "revive_window", "revive_min_sigma",
+                            "revive_detect_dist", "revive_robot_xy",
+                            "revive_old_centroid", "revive_new_centroid",
                         )},
                     })
 
@@ -1311,7 +1900,8 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     "near_miss": int(record.get("near_miss", 0)),
                     **{key: record.get(key) for key in (
                         "total_miss", "revive_count", "age_steps", "last_obs_step",
-                        "dist_to_robot", "thresholds",
+                        "dist_to_robot", "thresholds", "gd_age_steps", "gd_last_step",
+                        "gd_hits", "gd_conf_max", "gd_conf_last", "origin",
                     )},
                     **{key: record.get(key) for key in (
                         "sigma_c_max", "sigma_c_latest", "sigma_c_ema_03",
@@ -1384,6 +1974,11 @@ class TSP3DObjectNavPolicy(BasePolicy):
                 num_obs = int(verify[idx][0]) if idx < len(verify) and len(verify[idx]) >= 1 else 1
                 _last_obs = state.get("last_obs_step")
                 _age = max(0, max(0, int(self._memory_manager.frame) - 1) - (max(0, int(self._memory_manager.frame) - 1) if _last_obs is None else int(_last_obs)))
+                _lifecycle = str(state.get("lifecycle_state") or "confirmed")
+                _is_gd_tsp = (
+                    str(state.get("origin") or "") == "gd-tsp"
+                    or bool(state.get("promoted_from_gd_only", False))
+                )
                 self._track_frame_logs.append({
                     "step": int(self._num_steps),
                     "target_class": str(cls),
@@ -1397,12 +1992,32 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     "depth_ok": bool(distance <= float(max_depth) * 0.95),
                     "matched": bool(memory_id in matched_ids),
                     "num_obs": num_obs,
-                    "lifecycle_state": str(state.get("lifecycle_state") or "confirmed"),
+                    "lifecycle_state": _lifecycle,
                     "near_miss": int(state.get("near_miss", 0) or 0),
                     "total_miss": int(state.get("total_miss", 0) or 0),
                     "age_steps": int(_age),
                     "revive_count": int(state.get("revive_count", 0) or 0),
                     "stale_steps": int(max(0, _age)),
+                    "origin": state.get("origin"),
+                    "gd_only": bool(state.get("gd_only", False)),
+                    "gd_tsp": _is_gd_tsp,
+                    "gd_hits": int(state.get("gd_hits", 0) or 0),
+                    "gd_pos": bool(state.get("gd_pos", False)),
+                    "gd_candidate_pos": bool(state.get("gd_candidate_pos", False)),
+                    "gd_last_step": state.get("gd_last_step"),
+                    "gd_age": (
+                        None if state.get("gd_last_step") is None
+                        else max(0, int(self._memory_manager.frame) - 1 - int(state.get("gd_last_step")))
+                    ),
+                    "gd_conf_max": state.get("gd_conf_max"),
+                    "gd_conf_last": state.get("gd_conf_last"),
+                    "gd_upgraded": bool(state.get("gd_upgraded", False)),
+                    "promoted_from_gd_only": bool(
+                        state.get("promoted_from_gd_only", False)
+                    ),
+                    "stop_eligible": bool(
+                        _lifecycle == "confirmed" and _is_gd_tsp
+                    ),
                 })
 
     # ==========================================================================
@@ -1448,6 +2063,12 @@ class TSP3DObjectNavPolicy(BasePolicy):
             return self._stop_action
 
         action = self._pointnav_policy.act(obs_pointnav, masks, deterministic=True)
+        # Hard guard: only a confirmed gd-tsp goal reaches this method with
+        # stop=True.  For pure TSP confirmed / gd-only / provisional we still
+        # use PointNav for movement, but its own STOP action must not bypass
+        # the provenance gate.
+        if not stop:
+            action = action.clamp(min=1)
         return action
 
     def act(
@@ -1463,6 +2084,7 @@ class TSP3DObjectNavPolicy(BasePolicy):
 
         self._pre_step(observations, masks)
         object_map_rgbd = self._observations_cache["object_map_rgbd"]
+        self._log_field_observation_frame()
         detections = []
 
         for i, (rgb, depth, tf, min_depth, max_depth, fx, fy) in enumerate(object_map_rgbd):
@@ -1505,6 +2127,38 @@ class TSP3DObjectNavPolicy(BasePolicy):
                     self._stop_confirm_counts[goal_id] = turns
                     if turns > self._stop_gate_turns:
                         self._stop_blacklist.add(self._last_goal_memory_id)
+                        _blacklist_state = {}
+                        if self._last_target_centroid is not None:
+                            _blacklist_state = self._memory_manager.state_of(
+                                np.asarray(self._last_target_centroid, dtype=np.float64)
+                            )
+                        _blacklist_centroid = (
+                            np.asarray(self._last_target_centroid, dtype=np.float64).reshape(-1)[:3].tolist()
+                            if self._last_target_centroid is not None
+                            else None
+                        )
+                        self._memory_event_logs.append({
+                            "event": "stop_blacklist",
+                            "step": int(self._num_steps),
+                            "memory_id": self._last_goal_memory_id,
+                            "candidate_id": _blacklist_state.get("last_candidate_id"),
+                            "target_class": str(
+                                _blacklist_state.get("target_class")
+                                or self._target_object.split("|")[0]
+                            ),
+                            "centroid": _blacklist_centroid,
+                            "reason": "stop_gate_exhausted",
+                            "blacklist_rule": "near_turns > stop_gate_turns",
+                            "near_turns": int(turns),
+                            "stop_gate_turns": int(self._stop_gate_turns),
+                            "stop_gate_confirm_radius": float(self._stop_gate_radius),
+                            "distance": float(rho),
+                            "lifecycle_state": _blacklist_state.get("lifecycle_state", self._last_goal_state),
+                            "origin": _blacklist_state.get("origin", self._last_goal_origin),
+                            "gd_hits": int(_blacklist_state.get("gd_hits", self._last_goal_gd_hits) or 0),
+                            "num_obs": int(_blacklist_state.get("num_obs", self._last_goal_num_obs) or 0),
+                            "stop_eligible": False,
+                        })
                         self._stop_confirm_counts.pop(goal_id, None)
                         self._lock_step = -1
                         self._last_target_coord = None
@@ -1516,6 +2170,10 @@ class TSP3DObjectNavPolicy(BasePolicy):
                         action = self._turn_left_action
                 else:
                     action = self._pointnav(goal_3d[:2], stop=False)
+
+        # Read-only field exploration shadow: run after the action has been
+        # selected, so it cannot affect target choice, navigation or STOP.
+        self._log_field_shadow_frame(mode=mode)
 
         action_np = action.detach().cpu().numpy()[0]
         if len(action_np) == 1:
@@ -1649,26 +2307,35 @@ class VLVMConfig:
     provisional_min_dist: float = 1.0       # Provisional new-memory distance floor (m).
     provisional_max_dist: float = 4.0       # Provisional new-memory distance ceiling (m).
     provisional_s_min: float = 0.07         # Logging only; S does not gate provisional entries.
-    upgrade_min_obs: int = 2                 # provisional -> confirmed: new-info observations.
-    upgrade_max_dist: float = 4.0            # provisional -> confirmed: centroid distance (m).
+    upgrade_min_obs: int = 4                 # provisional -> confirmed: new-info observations.
     stop_gate_confirm_radius: float = 1.2    # Arrival radius that starts the look-around.
     stop_gate_turns: int = 3                 # Look-around frames before dropping the track.
-    enable_stable_pool: bool = True          # `stable` is the single deletion pool.
-    hide_stable_from_selection: bool = True  # `stable` entries never become nav goals.
+    enable_stable_pool: bool = True          # `stable` is the single deletion pool; stable is always hidden from selection.
     merge_new_info_dist: float = 0.2         # Pose baseline that counts as a new observation (m).
     merge_new_info_yaw: float = 10.0         # Yaw delta (deg) that counts as a new observation.
     merge_new_info_steps: int = 3            # Step gap that counts as a new observation.
     stable_stale_purge: int = 60             # Frames since the last match -> delete from `stable`.
     stable_miss_delete: int = 5              # Consecutive near-field misses inside `stable`.
     stable_total_miss: int = 8               # Cumulative near-field misses (a revive does not reset it).
-    stable_revive_radius: float = 0.5        # Revive radius (m).
-    stable_revive_window: int = 10           # Revive window (frames since the last match).
+    stable_revive_radius: float = 0.8        # Revive radius (m).
+    stable_revive_window: int = 20           # Revive window (frames since the last match).
     stable_revive_min_sigma: float = 0.50    # Revive candidate sigma_c floor.
     confirmed_to_stable_misses: int = 3      # confirmed -> stable near-field miss budget.
     provisional_to_stable_misses: int = 3    # provisional -> stable near-field miss budget.
+    enable_gd_mechanism: bool = False        # Enable GD-only/gd-tsp routing and writes.
+    gd_conf_min: float = 0.40                # GD base-gate confidence (initial filter only).
+    gd_max_dist: float = 5.0                 # GD base-gate robot distance (m).
+    gd_only_classes: str = ""                # empty = all target classes; comma-separated otherwise.
+    # Fixed S6-final: gd-only has no conf gate, no TTL, requires depth_ok;
+    # depth-failed confirmed/provisional tracks may merge via gd-tsp; stable is
+    # never selectable and never upgraded.
     s_penalty_use_surface: bool = True      # query S at the bbox near-surface point (facing camera) instead of the centroid.
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
     det_log_dir: Optional[str] = None       # SP1 per-detection jsonl directory; None = off (logging only, no behaviour change).
+    enable_middle_tier_shadow: bool = True  # Read-only middle-tier feature/probability shadow; never changes selection.
+    middle_tier_shadow_every_n: int = 1     # Shadow sampling stride (steps).
+    middle_tier_model_path: str = ""        # Offline-fitted middle-tier model JSON; empty = features-only shadow.
+    enable_middle_tier_ranking: bool = False  # Future gate: use p for middle-tier ordering; false = static order.
     lock_exempt: bool = True             # Lock hold: while locked in navigate, the nav-goal entry is exempt from the near-field near_miss budget.
     lock_exempt_identity: bool = True    # Exemption reference: True = pursued entry centroid (identity); False = nav-goal near-surface point.
 

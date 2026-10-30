@@ -1,4 +1,4 @@
-"""Data carriers of the GD proposal source (pure data, no behaviour)."""
+"""Data carriers of the current GD proposer used by ``GdCalibrationLogger``."""
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -30,18 +30,8 @@ class MatchResult:
 
 
 @dataclass
-class Tsp3dCandidate:
-    """Minimal view of a TSP3D candidate, used only for the candidate-level merge."""
-
-    centroid: np.ndarray
-    box8: Optional[np.ndarray] = None
-    conf: float = 0.0
-    admitted: bool = True             # survived S-penalty (admitted = "the TSP3D vote")
-
-
-@dataclass
 class GdProposal:
-    """One GD-only 3D candidate of the current frame (single vote until merged)."""
+    """One GroundingDINO 3D proposal of the current frame."""
 
     box_px: np.ndarray                # 2D box in pixels (x1, y1, x2, y2)
     conf: float                       # GD logits (already >= `box_thr`)
@@ -52,7 +42,7 @@ class GdProposal:
     surface: np.ndarray               # cluster point closest to the robot (world)
     box8: np.ndarray                  # AABB corners (8, 3), world
     n_points: int
-    suspect: bool = False             # `too_offset` -> admit as suspicious
+    suspect: bool = False             # `too_offset` diagnostic flag
     diag: Dict[str, Any] = field(default_factory=dict)
 
 

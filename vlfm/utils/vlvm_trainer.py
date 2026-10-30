@@ -248,6 +248,7 @@ def _sp_cfg_snapshot(policy: Any) -> Dict[str, Any]:
     derived_min_w = None if t_s is None else min(1.0, S_MIN / max(float(t_s), 1e-6))
     provisional = getattr(policy, "_provisional_gate", None)
     provisional_cfg = getattr(provisional, "config", None)
+    manager_cfg = getattr(getattr(policy, "_memory_manager", None), "config", None)
     return {
         "enable_s_penalty": bool(getattr(cfg, "enable", False)),
         "t_S": t_s,
@@ -263,6 +264,26 @@ def _sp_cfg_snapshot(policy: Any) -> Dict[str, Any]:
         "provisional_min_dist": getattr(provisional_cfg, "provisional_min_dist", None),
         "provisional_max_dist": getattr(provisional_cfg, "provisional_max_dist", None),
         "provisional_s_min": getattr(provisional_cfg, "s_min", None),
+        "upgrade_min_obs": getattr(manager_cfg, "upgrade_min_obs", None),
+        "enable_gd_mechanism": bool(getattr(policy, "_enable_gd_mechanism", False)),
+        "gd_conf_min": getattr(policy, "_gd_conf_min", None),
+        "gd_max_dist": getattr(policy, "_gd_max_dist", None),
+        "gd_only_classes": list(getattr(policy, "_gd_only_classes", ()) or ()),
+        # Fixed S6-final mechanism (no longer YAML hyper-parameters).
+        "gd_only_depth_required": True,
+        "gd_tsp_depth_track_merge": True,
+        "stable_hidden_from_selection": True,
+        "stable_gd_hits_upgrade": False,
+        "enable_middle_tier_shadow": bool(
+            getattr(getattr(policy, "_middle_tier_shadow", None), "enabled", False)
+        ),
+        "middle_tier_shadow_every_n": getattr(
+            policy, "_middle_tier_shadow_every_n", None
+        ),
+        "middle_tier_model_path": getattr(policy, "_middle_tier_model_path", None),
+        "enable_middle_tier_ranking": bool(
+            getattr(policy, "_enable_middle_tier_ranking", False)
+        ),
     }
 
 
@@ -646,6 +667,7 @@ class VLVMTrainer(PPOTrainer):
 
                     # Per-detection jsonl (raw S-penalty inputs + TP label), 
                     # written only when `det_log_dir` is set. Diagnostics only.
+                    field_observation_path = None
                     try:
                         policy = self._agent.actor_critic
                         det_log_dir = getattr(policy, "_det_log_dir", None)
@@ -655,6 +677,17 @@ class VLVMTrainer(PPOTrainer):
                                 dump_detection_logs,
                                 dump_phase_g_logs,
                             )
+
+                            finalize_field_logs = getattr(
+                                policy, "_finalize_field_observations", None
+                            )
+                            if callable(finalize_field_logs):
+                                field_observation_path = finalize_field_logs(
+                                    scene_id=current_episodes_info[i].scene_id,
+                                    episode_id=current_episodes_info[i].episode_id,
+                                    target_object=str(infos[i].get("target_object", "unknown")),
+                                    infos=infos[i],
+                                )
 
                             os.makedirs(str(det_log_dir), exist_ok=True)
                             det_log_path = os.path.join(
@@ -687,6 +720,12 @@ class VLVMTrainer(PPOTrainer):
                                 nav_goal_logs=getattr(policy, "_nav_goal_logs", None) or [],
                                 track_frame_logs=getattr(policy, "_track_frame_logs", None) or [],
                                 gd_frame_logs=getattr(policy, "_gd_calib_logs", None) or [],
+                                field_shadow_logs=getattr(policy, "_field_shadow_logs", None) or [],
+                                stop_shadow_logs=getattr(policy, "_stop_shadow_logs", None) or [],
+                                middle_rank_shadow_logs=getattr(
+                                    policy, "_middle_rank_shadow_logs", None
+                                )
+                                or [],
                                 cfg_snapshot=_sp_cfg_snapshot(policy),
                                 episode_stats=episode_stats,
                                 success=int(episode_stats["success"]),
@@ -710,6 +749,10 @@ class VLVMTrainer(PPOTrainer):
                             "oracle_success": compute_oracle_success(infos[i]),
                             "failure_cause": failure_cause,
                             "detect_stats": detect_stats,
+                            "field_observation_path": field_observation_path,
+                            "field_observation_error": getattr(
+                                self._agent.actor_critic, "_field_log_error", None
+                            ),
                             "spl": float(episode_stats.get("spl", 0.0)),
                             "soft_spl": float(episode_stats.get("soft_spl", 0.0)),
                             "steps_count": float(

@@ -23,7 +23,7 @@
 
 用法
 ----
-  python -u ft_tsp3d/eval_tools/s_evidence.py \
+  python -u vlfm/tsp3d_models/fussion_utils/s_evidence.py \
       --jsonl <输出目录 或 jsonl 文件> [--sigma-tar 0.60] [--uncovered-w 1.0] \
       [--grid-t-s 0.110,0.1125,0.115,0.1175,0.120] [--out sp1.json]
 """

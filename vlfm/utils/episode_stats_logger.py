@@ -261,7 +261,7 @@ def dump_detection_logs(
     outcome / the S-penalty config in force), then one ``{"kind": "det"}`` line per
     detection carrying the raw S-penalty inputs and the decision branch. TP is decided
     here with the same dilated target-mask test as ``aggregate_detect_stats``, so
-    ``ft_tsp3d/eval_tools/s_evidence.py`` can recompute S-only / fused statistics offline.
+    ``vlfm/tsp3d_models/fussion_utils/s_evidence.py`` can recompute S-only / fused statistics offline.
 
     Only ``t_S`` is searched and can be re-derived offline from the logged raw ``s``.
     ``s_min=0.07`` and query ``radius_m=0.5`` are fixed implementation constants.
@@ -375,6 +375,9 @@ def dump_phase_g_logs(
     failure_cause: str,
     track_frame_logs: Optional[List[Dict[str, Any]]] = None,
     gd_frame_logs: Optional[List[Dict[str, Any]]] = None,
+    field_shadow_logs: Optional[List[Dict[str, Any]]] = None,
+    stop_shadow_logs: Optional[List[Dict[str, Any]]] = None,
+    middle_rank_shadow_logs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, int]:
     """Write the four-layer Phase-G contract without changing policy behavior."""
     os.makedirs(directory, exist_ok=True)
@@ -414,6 +417,9 @@ def dump_phase_g_logs(
         "track_frames.jsonl": [],
         "gd_frames.jsonl": [],
         "gd_proposals.jsonl": [],
+        "field_shadow.jsonl": [],
+        "stop_shadow.jsonl": [],
+        "middle_rank_shadow.jsonl": [],
     }
     for record in candidate_logs:
         row = {**common, "kind": "candidate", **_jsonable(record)}
@@ -425,6 +431,8 @@ def dump_phase_g_logs(
         row["candidate_uid"] = _uid(row.get("candidate_id"), "candidate")
         row["memory_uid"] = _uid(row.get("memory_id"), "memory")
         row["tp"] = bool(_tp(row))
+        if row.get("shadow_kind") and row.get("track_centroid") is not None:
+            row["track_tp"] = bool(_tp({"centroid": row.get("track_centroid")}))
         outputs["memory_events.jsonl"].append(row)
     labelled_nav: List[Dict[str, Any]] = []
     for record in nav_goal_logs:
@@ -439,6 +447,29 @@ def dump_phase_g_logs(
         row["memory_uid"] = _uid(row.get("memory_id"), "memory")
         row["tp"] = bool(_tp(row))
         outputs["track_frames.jsonl"].append(row)
+
+    for record in field_shadow_logs or []:
+        row = {**common, "kind": "field_shadow", **_jsonable(record)}
+        row["tp"] = bool(_tp({"centroid": row.get("top1_xy")}))
+        top_regions = row.get("top_regions") or []
+        row["topk_tp"] = bool(
+            any(_tp({"centroid": item.get("center_xy")}) for item in top_regions)
+        )
+        outputs["field_shadow.jsonl"].append(row)
+
+    for record in stop_shadow_logs or []:
+        row = {**common, "kind": "stop_shadow", **_jsonable(record)}
+        row["tp"] = bool(_tp(row))
+        if row.get("goal") is not None:
+            row["goal_tp"] = bool(_tp({"goal": row.get("goal")}))
+        outputs["stop_shadow.jsonl"].append(row)
+
+    for record in middle_rank_shadow_logs or []:
+        row = {**common, "kind": "middle_rank_shadow", **_jsonable(record)}
+        row["memory_uid"] = _uid(row.get("memory_id"), "memory")
+        row["candidate_uid"] = _uid(row.get("candidate_id"), "candidate")
+        row["tp"] = bool(_tp(row))
+        outputs["middle_rank_shadow.jsonl"].append(row)
 
     for frame in gd_frame_logs or []:
         frame_row = {**common, "kind": "gd_frame", **_jsonable(frame)}
@@ -482,6 +513,9 @@ def dump_phase_g_logs(
         "n_candidates": len(candidate_logs),
         "n_memory_events": len(memory_event_logs),
         "n_nav_goals": len(nav_goal_logs),
+        "n_field_shadow": len(field_shadow_logs or []),
+        "n_stop_shadow": len(stop_shadow_logs or []),
+        "n_middle_rank_shadow": len(middle_rank_shadow_logs or []),
         "first_wrong_lock_step": None if first_wrong is None else first_wrong.get("step"),
         "first_wrong_memory_uid": None if first_wrong is None else first_wrong.get("memory_uid"),
         "wrong_stop_before_target_coverage": bool(
@@ -497,5 +531,8 @@ def dump_phase_g_logs(
         "nav_goals": len(nav_goal_logs),
         "gd_frames": len(outputs["gd_frames.jsonl"]),
         "gd_proposals": len(outputs["gd_proposals.jsonl"]),
+        "field_shadow": len(outputs["field_shadow.jsonl"]),
+        "stop_shadow": len(outputs["stop_shadow.jsonl"]),
+        "middle_rank_shadow": len(outputs["middle_rank_shadow.jsonl"]),
         "episodes": 1,
     }

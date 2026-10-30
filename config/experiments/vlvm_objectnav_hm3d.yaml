@@ -95,39 +95,6 @@ habitat_baselines:
       # TSP3D query
       sigma_tar: 0.60
       sigma_prop: 0.45  # Service return threshold; policy admission stays at sigma_tar.
-      # Target-memory lifecycle
-      merge_dist_thresh: 0.5
-      ema_weight_old: 0.8
-      lock_exempt: True
-      lock_exempt_identity: True
-      ## fallback
-      enable_provisional_gate: True # Provisional gate: 0.50-0.60, 1.0-4.0 m.
-      provisional_sigma: 0.50
-      provisional_min_dist: 1.0
-      provisional_max_dist: 4.0
-      provisional_s_min: 0.07
-      upgrade_min_obs: 2
-      upgrade_max_dist: 4.0
-      upgrade_sigma_min: 0.52
-      stop_gate_confirm_radius: 1.2
-      stop_gate_turns: 3
-      enable_stable_pool: True  # Merge + Stable deletion pool.
-      hide_stable_from_selection: True
-      merge_new_info_dist: 0.2
-      merge_new_info_yaw: 10.0
-      merge_new_info_steps: 3
-      stable_stale_purge: 60
-      stable_miss_delete: 5
-      stable_total_miss: 8
-      stable_revive_radius: 0.5
-      stable_revive_window: 10
-      stable_revive_min_sigma: 0.50
-      confirmed_to_stable_misses: 3
-      provisional_to_stable_misses: 3
-      sigma_sce: 0.15
-      tau: 0.15
-      near_field_dist: 1.0
-      near_field_sigma_scale: 0.8
       # TSP3D Input Processing
       use_vlfm_nlp: False
       fusion_style: world   # Fusion route: "world" / "none"
@@ -149,6 +116,15 @@ habitat_baselines:
       mid_voxel: 0.02
       far_voxel: 0.05
 
+      # GD-only / gd-tsp mechanism (conservative initial version)
+      enable_gd_mechanism: True
+      gd_conf_min: 0.40          # initial GD gate only; not a ranking score
+      gd_max_dist: 5.0              # GD-only/gd-tsp robot-distance gate
+      gd_only_classes: ""        # empty = allow all target classes
+      # Fixed S6-final: gd-only requires depth_ok; only gd-tsp confirmed/
+      # provisional track merge may bypass depth; no conf gate, no TTL,
+      # stable never selectable/upgraded.
+
       # Occupancy-consistency geometric gate
       enable_occ_consistency: True
       occ_min_voxels: 8
@@ -158,11 +134,46 @@ habitat_baselines:
       s_penalty_thresh: 0.14
       s_penalty_uncovered_w: 1.0         # Weight for no coverage (S<=0/None): 1.0 = free pass; <1.0 = mild penalty.
       det_log_dir: null                  # Per-detection jsonl output directory; null = off (diagnostics only).
+      # Middle-tier promotion-probability shadow (read-only; no action change)
+      enable_middle_tier_shadow: True
+      middle_tier_shadow_every_n: 1
+      middle_tier_model_path: ""
+      enable_middle_tier_ranking: False
       # near-surface point
       s_penalty_use_surface: True
       goal_use_surface: True
-      
 
+      # Target-memory lifecycle
+      merge_dist_thresh: 0.5
+      ema_weight_old: 0.8
+      lock_exempt: True
+      lock_exempt_identity: True
+      ## fallback
+      enable_provisional_gate: True # Provisional gate: 0.50-0.60, 1.0-4.0 m.
+      provisional_sigma: 0.55 # 0.50
+      provisional_min_dist: 1.0
+      provisional_max_dist: 4.0
+      provisional_s_min: 0.07
+      upgrade_min_obs: 4
+      stop_gate_confirm_radius: 1.2
+      stop_gate_turns: 3
+      enable_stable_pool: True  # Merge + Stable deletion pool; stable is always hidden from selection.
+      merge_new_info_dist: 0.2
+      merge_new_info_yaw: 10.0
+      merge_new_info_steps: 3
+      stable_stale_purge: 60
+      stable_miss_delete: 5
+      stable_total_miss: 8
+      stable_revive_radius: 0.8
+      stable_revive_window: 20
+      stable_revive_min_sigma: 0.50
+      confirmed_to_stable_misses: 3
+      provisional_to_stable_misses: 3
+      sigma_sce: 0.15
+      tau: 0.15
+      near_field_dist: 1.0
+      near_field_sigma_scale: 0.8
+      
     ppo:
       clip_param: 0.2
       ppo_epoch: 4

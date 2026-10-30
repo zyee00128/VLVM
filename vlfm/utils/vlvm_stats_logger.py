@@ -112,9 +112,11 @@ class VlvmStatsLogger:
             self.nav[key] = int(self.nav.get(key, 0)) + 1
             if 0 <= steps_since_lock <= 5:
                 self.nav["stops_within5"] = int(self.nav.get("stops_within5", 0)) + 1
+        goal_origin = getattr(self.p, "_last_goal_origin", None)
         print(f"[STOP] step={self.p._num_steps} "
               f"n_obs={meta.get('n_obs', 1)} "
-              f"tsp3d_confirm={confirm} steps_since_lock={steps_since_lock} "
+              f"tsp3d_confirm={confirm} goal_origin={goal_origin} "
+              f"steps_since_lock={steps_since_lock} "
               f"stop_allowed={bool(allowed)}")
 
     # 每集汇总

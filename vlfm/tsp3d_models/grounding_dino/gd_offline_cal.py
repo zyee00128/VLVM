@@ -14,8 +14,8 @@ Outputs one JSON bundle plus a compact markdown summary.  It never starts a
 simulator or a model server.
 
 Usage:
-  python -m ft_tsp3d.eval_tools.gd_offline_cal --run-dir outputs/<run>
-  python -m ft_tsp3d.eval_tools.gd_offline_cal --detections-dir outputs/<run>/detections
+  python -m vlfm.grounding_dino.gd_offline_cal --run-dir outputs/<run>
+  python -m vlfm.grounding_dino.gd_offline_cal --detections-dir outputs/<run>/detections
 """
 
 from __future__ import annotations

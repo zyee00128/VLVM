@@ -1,45 +1,35 @@
-"""Grounding-DINO proposal source.
+"""Grounding-DINO proposal source used by the online GD calibration path.
 
-Role
-----
-GD is a *second, independent proposer*: every `every_n` frames it consumes the raw
-observation frame (`rgb` + target text) and proposes 3D candidates on its own. 
-The two models stay **frame-aligned**: GD reads the same frame the pre-TSP3D fusion
-chain just consumed, but its point set is never injected into that chain and its
-boxes are never sent to TSP3D as a re-query.
+Current runtime path::
 
-Vote model
-----------
-A frame's candidates are `TSP3D boxes ∪ GD proposals`:
-  * `BOTH`  — a GD proposal co-locates with an admitted TSP3D candidate -> strong;
-  * `GD`    — GD alone -> written as suspicious (single vote);
-  * `TSP3D` — TSP3D alone -> unchanged existing behaviour.
+    TSP3DObjectNavPolicy
+      -> GdCalibrationLogger (calibration.py)
+      -> GdProposer (proposer.py)
+      -> GdMechanism (mechanism.py)
 
-Module map (no policy / habitat imports at any level)
-----------------------------------------------------
-  `config.py`     `GdProposalConfig` — every knob of this mechanism
-  `types.py`      dataclasses (`CameraView`, `GdProposal`, `Tsp3dCandidate`, ...)
-  `vocab.py`      class-level text alignment + caption builders (T1/T2)
-  `client.py`     guarded GD server access (failure = "no info", never negative)
-  `region.py`     2D box -> 3D cluster = VLFM `_extract_object_cloud` chain
-  `boxes.py`      3D AABB geometry (corners / IaU / containment / nearest point)
-  `proposer.py`   `GdProposer` — frame -> `List[GdProposal]` (+ stats)
-  `provenance.py` candidate-level vote merge + single-vote admission/lock rules
+``calibration.py`` owns the per-frame GD call and candidate/track association;
+``mechanism.py`` consumes its JSON-safe record for track-only gd-tsp routing and
+the gd-only fallback pool.  The older candidate-level vote model
+(``provenance.py`` and ``Tsp3dCandidate``) has been removed.
+
+Active modules
+--------------
+``config.py``    ``GdProposalConfig``
+``types.py``     ``CameraView`` / ``GdProposal`` / ``ProposalStats``
+``vocab.py``     class text alignment and caption builders
+``client.py``    guarded GD server access (failure = no information)
+``region.py``    2D box -> world point cluster
+``boxes.py``     3D AABB geometry
+``proposer.py``  ``GdProposer`` / ``should_run``
+``calibration.py`` ``GdCalibrationLogger`` / ``GdCalibConfig``
+``mechanism.py`` ``GdMechanism`` / ``GdMechanismConfig``
+``gd_offline_cal.py`` offline replay of the calibration logs
 """
 
 from .boxes import aabb_center, aabb_corners, containment, iau_3d, nearest_point
 from .client import GdDetector
 from .config import GdProposalConfig
 from .proposer import GdProposer, should_run
-from .provenance import (
-    BOTH,
-    GD,
-    TSP3D,
-    attach_votes,
-    admit_as_suspicious,
-    is_lockable,
-    merge_vote,
-)
 from .region import (
     backproject_mask,
     depth_holes_to_far,
@@ -49,7 +39,7 @@ from .region import (
     region_points_world,
     too_offset_rect,
 )
-from .types import CameraView, GdProposal, MatchResult, ProposalStats, Tsp3dCandidate
+from .types import CameraView, GdProposal, MatchResult, ProposalStats
 from .vocab import (
     DEFAULT_ALIASES,
     DEFAULT_VOCAB,
@@ -62,14 +52,11 @@ from .vocab import (
 )
 
 __all__ = [
-    # config / types
     "GdProposalConfig",
     "CameraView",
     "GdProposal",
     "ProposalStats",
-    "Tsp3dCandidate",
     "MatchResult",
-    # vocab (T)
     "DEFAULT_VOCAB",
     "DEFAULT_ALIASES",
     "normalize_phrase",
@@ -78,7 +65,6 @@ __all__ = [
     "phrase_classes",
     "match_phrase",
     "build_caption",
-    # client / region / boxes
     "GdDetector",
     "rect_mask",
     "erode_mask",
@@ -92,14 +78,6 @@ __all__ = [
     "nearest_point",
     "iau_3d",
     "containment",
-    # proposer / provenance
     "GdProposer",
     "should_run",
-    "attach_votes",
-    "merge_vote",
-    "admit_as_suspicious",
-    "is_lockable",
-    "BOTH",
-    "GD",
-    "TSP3D",
 ]

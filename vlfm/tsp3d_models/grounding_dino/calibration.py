@@ -218,8 +218,6 @@ class GdCalibrationLogger:
                 dbscan_eps=float(self.cfg.dbscan_eps),
                 dbscan_min_points=int(self.cfg.dbscan_min_points),
                 min_dist=float(self.cfg.min_dist),
-                merge_dist=float(self.cfg.merge_dist),
-                merge_iau=float(self.cfg.merge_iau),
             )
         )
         self._rng = np.random.RandomState(20261026)
@@ -503,7 +501,7 @@ class GdCalibrationLogger:
         match_track = self._match_track(proposal, track_rows)
         memory_id = match_track.get("memory_id")
         candidate_id = match_candidate.get("candidate_id")
-        # Track-level positive vote.  A candidate-only match is useful for
+        # Track-level positive match.  A candidate-only match is useful for
         # coverage/merge analysis but never becomes a track flag.
         gd_pos = bool(match_track.get("same_object"))
         gd_candidate_pos = bool(match_candidate.get("same_object"))
@@ -650,9 +648,15 @@ class GdCalibrationLogger:
         self, proposal: GdProposal, tracks: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         best: Optional[Dict[str, Any]] = None
-        best_score: Optional[Tuple[bool, float]] = None
+        best_score: Optional[Tuple[bool, int, float]] = None
         prop_centroid = np.asarray(proposal.centroid, dtype=np.float64)
         prop_box = np.asarray(proposal.box8, dtype=np.float64)
+        state_priority = {
+            "confirmed": 0,
+            "provisional": 1,
+            "gd": 2,
+            "stable": 3,
+        }
         for row in tracks:
             centroid = row.get("centroid")
             if centroid is None:
@@ -671,12 +675,17 @@ class GdCalibrationLogger:
                 or (cont is not None and cont >= float(self.cfg.merge_containment))
                 or (cont_rev is not None and cont_rev >= float(self.cfg.merge_containment))
             )
-            score = (same, -dist_xy)
+            priority = state_priority.get(
+                str(row.get("lifecycle_state") or ""), 4
+            )
+            score = (same, -priority, -dist_xy)
             if best_score is None or score > best_score:
                 best_score = score
                 best = {
                     "memory_id": row.get("memory_id"),
                     "target_class": row.get("target_class"),
+                    "centroid": row.get("centroid"),
+                    "surface": row.get("surface"),
                     "dist_xy": dist_xy,
                     "dist_3d": dist_3d,
                     "iau": iau,
@@ -692,6 +701,10 @@ class GdCalibrationLogger:
                     "sigma_c_ema_08": row.get("sigma_c_ema_08"),
                     "gd_hits": row.get("gd_hits"),
                     "gd_pos": row.get("gd_pos"),
+                    "gd_upgraded": bool(row.get("gd_upgraded", False)),
+                    "promoted_from_gd_only": bool(
+                        row.get("promoted_from_gd_only", False)
+                    ),
                 }
         return best or {
             "memory_id": None,
@@ -825,6 +838,7 @@ class GdCalibrationLogger:
             "memory_id": memory_id,
             "target_class": track.get("target_class"),
             "centroid": track.get("centroid"),
+            "surface": track.get("surface"),
             "box8": track.get("box8"),
             "lifecycle_state": track.get("lifecycle_state"),
             "num_obs": track.get("num_obs"),
@@ -845,6 +859,11 @@ class GdCalibrationLogger:
             "gd_age": None if last_step is None else int(step) - int(last_step),
             "gd_conf_max": hits.get("conf_max"),
             "gd_conf_last": hits.get("conf_last"),
+            "gd_upgraded": bool(track.get("gd_upgraded", False)),
+            "gd_upgraded_from": track.get("gd_upgraded_from"),
+            "promoted_from_gd_only": bool(
+                track.get("promoted_from_gd_only", False)
+            ),
         }
         return row
 

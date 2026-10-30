@@ -7,7 +7,7 @@ Consumes a run's ``detections/`` logs and reports:
   * admission band expansion cost
 
 Usage:
-  python -m ft_tsp3d.eval_tools.s5_offline_cal --run-dir outputs/s2_2026-10-23_012020
+  python -m vlfm.eval_tools.s5_offline_cal --run-dir outputs/s2_2026-10-23_012020
 """
 from __future__ import annotations
 

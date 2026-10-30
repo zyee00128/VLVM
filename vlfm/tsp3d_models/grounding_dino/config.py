@@ -25,9 +25,4 @@ class GdProposalConfig:
     dbscan_min_points: int = 100      # VLFM DBSCAN min_points
     min_dist: float = 1.0             # VLFM near rejection (closest cluster point to camera)
 
-    # ---- candidate-level two-vote merge (rules used by the caller) ----
-    merge_dist: float = 0.5           # centroid distance (m) that counts as "same object"
-    merge_iau: float = 0.3            # AABB intersection-over-union that counts as overlap
 
-    # ---- single-vote policy (accuracy-first defaults) ----
-    weak_guard: bool = True           # single-vote (`GD`) proposals are not lockable
