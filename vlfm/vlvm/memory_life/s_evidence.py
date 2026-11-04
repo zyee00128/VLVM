@@ -23,7 +23,7 @@
 
 用法
 ----
-  python -u vlfm/tsp3d_models/fussion_utils/s_evidence.py \
+  python -u vlfm/vlvm/memory_life/s_evidence.py \
       --jsonl <输出目录 或 jsonl 文件> [--sigma-tar 0.60] [--uncovered-w 1.0] \
       [--grid-t-s 0.110,0.1125,0.115,0.1175,0.120] [--out sp1.json]
 """
@@ -41,7 +41,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from vlfm.tsp3d_models.fussion_utils.s_penalty import S_MIN, S_QUERY_RADIUS_M
+from vlfm.vlvm.memory_life.s_penalty import SPenaltyConfig
+
+_S_CFG = SPenaltyConfig()
 
 DET_FILE = "s4_sp1_detections.jsonl"
 DIST_BANDS: Tuple[Tuple[float, float], ...] = ((0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 1e9))
@@ -190,7 +192,7 @@ def reweight(s: Optional[float], t_s: float, uncovered_w: float) -> float:
     """w_S for logged raw S with fixed ``s_min=0.1`` and variable ``t_S``."""
     if s is None or s <= 0.0:
         return float(uncovered_w)
-    return float(min(1.0, max(float(s), S_MIN) / max(float(t_s), 1e-9)))
+    return float(min(1.0, max(float(s), _S_CFG.s_min) / max(float(t_s), 1e-9)))
 
 
 def _covered(det: Dict[str, Any]) -> bool:
@@ -224,9 +226,9 @@ def _admit_stats(
             fp_kept += 1
     return {
         "t_S": float(t_s),
-        "s_min": S_MIN,
-        "derived_min_w": float(min(1.0, S_MIN / max(float(t_s), 1e-9))),
-        "radius_m": S_QUERY_RADIUS_M,
+        "s_min": _S_CFG.s_min,
+        "derived_min_w": float(min(1.0, _S_CFG.s_min / max(float(t_s), 1e-9))),
+        "radius_m": _S_CFG.query_radius_m,
         "uncovered_w": float(uncovered_w),
         "admitted": n_kept,
         "tp_kept": tp_kept,
@@ -543,7 +545,7 @@ def main() -> None:
         if not contract["counts_monotone"]:
             raise SystemExit("proposal shadow counts are not monotone")
     summary["_inputs"] = {"files": [str(p) for p in paths], "t_S": t_s,
-                          "s_min": S_MIN, "radius_m": S_QUERY_RADIUS_M,
+                          "s_min": _S_CFG.s_min, "radius_m": _S_CFG.query_radius_m,
                           "sigma_tar": args.sigma_tar, "uncovered_w": args.uncovered_w,
                           "sigma_prop_floor": sigma_prop_floor,
                           "cfg_from_ep_header": cfg}

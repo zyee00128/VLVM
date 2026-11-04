@@ -84,6 +84,8 @@ class MemoryManagerConfig:
     """
     # cross-view EMA merge (memory write)
     merge_dist_thresh: float = 0.5        # merge two observations of the same class within this distance (m)
+    # gd-only promotion has no geometric or temporal gate; only STOP blacklist
+    # state is checked at the promotion point.
     ema_weight_old: float = 0.8           # EMA smoothing: old * 0.8 + new * 0.2
 
     # S5-S2 lifecycle.  Unmatched candidates may create a memory only when
@@ -200,6 +202,40 @@ class TargetMemoryManager:
         state["last_obs_xy"] = np.asarray(robot_xy, dtype=np.float64).reshape(-1)[:2].copy()
         state["last_obs_yaw"] = float(robot_yaw)
         state["last_obs_step"] = int(self._frame)
+
+    def _record_latest_surface(
+        self,
+        state: Dict[str, Any],
+        surface: np.ndarray,
+        target_class: str,
+        idx: int,
+    ) -> None:
+        """Record-only bookkeeping of the newest near-surface point (S8/M-0).
+
+        The three points kept per memory entry are:
+          * centroid      -> ``self._mem[cls][idx]`` (EMA; target management)
+          * first surface -> ``self._surf[cls][idx]`` (first write; nav goal)
+          * latest surface-> ``state["surface_latest"]`` (this method)
+
+        Nothing reads ``surface_latest`` in this version: navigation still
+        uses the first-write surface, and no merge/admission/STOP/selection
+        path is affected.  The step stamps and the first-write copy exist only
+        so staleness can be measured offline.
+        """
+        s_np = np.asarray(surface, dtype=np.float64).reshape(-1)
+        if s_np.size < 3 or not np.all(np.isfinite(s_np[:3])):
+            return
+        state["surface_latest"] = [float(v) for v in s_np[:3]]
+        state["surface_latest_step"] = int(self._frame)
+        if "surface_first" in state:
+            return
+        first = s_np[:3]
+        surfaces = self._surf.get(target_class) or []
+        if idx < len(surfaces):
+            cand = np.asarray(surfaces[idx], dtype=np.float64).reshape(-1)
+            if cand.size >= 3 and np.all(np.isfinite(cand[:3])):
+                first = cand[:3]
+        state["surface_first"] = [float(v) for v in first]
 
     def _is_new_information(self, state: Dict[str, Any], robot_xy: np.ndarray, robot_yaw: float) -> bool:
         """True when this observation comes from a genuinely different viewpoint."""
@@ -333,6 +369,7 @@ class TargetMemoryManager:
         block_stable: bool = False,
         gd_evidence_only: bool = False,
         expected_memory_id: Optional[str] = None,
+        blocked_memory_ids: Optional[set] = None,
     ) -> Dict[str, Any]:
         """
         In-place write / EMA-merge of one admitted detection.
@@ -385,6 +422,7 @@ class TargetMemoryManager:
             self._touch_observation(state, r_xy, robot_yaw)
             self._append_observation(state, r_xy, robot_yaw)
             self._update_scores(state, score, new=True)
+            self._record_latest_surface(state, s_np, target_class, 0)
             self._lifecycle[target_class] = [state]
             return {"written": True, "merged": False, "num_obs": 1,
                     "memory_id": state["memory_id"], "candidate_id": candidate_id,
@@ -447,14 +485,22 @@ class TargetMemoryManager:
             within_merge = False
         # A gd-only entry that is later matched by an admitted TSP3D candidate
         # is not a GD-only fallback anymore: the detector has supplied the
-        # geometry/identity match.  Promote it to confirmed instead of leaving
-        # it permanently in the `gd` pool.
+        # TSP3D match.  Promote it to confirmed instead of leaving it
+        # permanently in the `gd` pool.
         promote_gd_only = bool(
             within_merge
             and closest_lifecycle == GD
             and not gd_evidence_only
             and new_lifecycle_state in (CONFIRMED, PROVISIONAL)
         )
+        promotion_gate_reason = None
+        if promote_gd_only:
+            state_ok = str(prev_state.get("memory_id") or "") not in set(
+                blocked_memory_ids or ()
+            )
+            if not state_ok:
+                promote_gd_only = False
+                promotion_gate_reason = "blacklist"
         if within_merge and gd_evidence_only:
             # gd-tsp is an external confirmation/evidence path: promote the
             # lifecycle but do NOT count it as a TSP3D observation, move the
@@ -524,6 +570,9 @@ class TargetMemoryManager:
             prev_state["near_miss"] = 0
             prev_state["last_candidate_id"] = candidate_id
             self._touch_observation(prev_state, r_xy, robot_yaw)
+            self._record_latest_surface(
+                prev_state, s_np, target_class, closest_idx
+            )
             upgraded = None
             if (
                 str(prev_state.get("lifecycle_state")) == PROVISIONAL
@@ -586,6 +635,7 @@ class TargetMemoryManager:
                     "origin": prev_state.get("origin"),
                     "upgraded": upgraded,
                     "promoted_from_gd_only": bool(promote_gd_only),
+                    "promotion_gate_reason": promotion_gate_reason,
                     "total_miss": int(prev_state.get("total_miss", 0)),
                     "revive_count": int(prev_state.get("revive_count", 0)),
                     "detect_dist": float(detect_dist),
@@ -608,6 +658,7 @@ class TargetMemoryManager:
             self._touch_observation(state, r_xy, robot_yaw)
             self._append_observation(state, r_xy, robot_yaw)
             self._update_scores(state, score, new=True)
+            self._record_latest_surface(state, s_np, target_class, len(recs) - 1)
             self._lifecycle[target_class].append(state)
             return {"written": True, "merged": False, "num_obs": 1,
                     "memory_id": state["memory_id"], "candidate_id": candidate_id,

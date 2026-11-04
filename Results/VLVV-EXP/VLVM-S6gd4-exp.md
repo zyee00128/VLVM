@@ -230,4 +230,4 @@
 - `gd_depth_failed_gd_only=true`：depth 失败允许进入 gd-only new/merge；
 - GD 命中 `stable` 仍只写 `gd_stable_shadow`，不升级为 gd-tsp；
 - `occ` gate 使用 `occ_passed`，保留 gd-only merge；
-- 中间档 `tsp-confirmed / gd-only` 的 gd-tsp 提升概率量化方法见 [VLVM-S7.md](VLVM-S7.md) §2，尚未实现。
+- 中间档 `tsp-confirmed / gd-only` 的 gd-tsp 提升概率量化方法见 [VLVM-S7.md](VLVM-S7.md) §4，尚未实现。

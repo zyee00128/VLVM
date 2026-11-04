@@ -2,22 +2,22 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
-# Fixed S-penalty constants (Phase G): S lower clamp and query radius.
-# Current three-scene logs have min covered S = 0.087629; 0.07 sits below
-# that and only prevents future near-zero values from collapsing w_S.
-S_MIN = 0.07
-S_QUERY_RADIUS_M = 0.5
-
 
 @dataclass
 class SPenaltyConfig:
-    """Runtime S-penalty settings; only ``thresh`` is searched in P1."""
+    """Runtime S-penalty settings.
+
+    ``s_min`` / ``query_radius_m`` are hyper-parameters (previously module-level
+    constants) owned by the policy config, not by this module.
+    """
 
     enable: bool = True
     thresh: float = 0.15
     uncovered_w: float = 1.0  # weight when there is NO semantic coverage (S=None/<=0);
                               # 1.0 = free pass (A1 default), <1.0 = mild penalty for
                               # detections the value map cannot corroborate at all.
+    s_min: float = 0.07
+    query_radius_m: float = 0.5
 
 
 def query_semantic_at(x: float, y: float, radius_m: Optional[float] = None) -> Optional[float]:
@@ -72,7 +72,8 @@ def compute_w_s(s: Optional[float], cfg: SPenaltyConfig) -> Tuple[float, Optiona
     if s is None or s <= 0.0:
         return float(cfg.uncovered_w), None
     s_f = float(s)
-    w_s = min(1.0, max(s_f, S_MIN) / max(float(cfg.thresh), 1e-6))
+    s_min = float(getattr(cfg, "s_min", 0.07))
+    w_s = min(1.0, max(s_f, s_min) / max(float(cfg.thresh), 1e-6))
     return float(w_s), s_f
 
 
@@ -129,7 +130,7 @@ def apply_s_penalty(
             if near_pt is not None:
                 s_pt = near_pt
                 s_pt_source = "surface"
-        s = query_semantic(s_pt[0], s_pt[1], S_QUERY_RADIUS_M)
+        s = query_semantic(s_pt[0], s_pt[1], float(cfg.query_radius_m))
         w_s, _ = compute_w_s(s, cfg)
         conf_amp = conf_f * w_s
         admitted = conf_amp >= sigma_tar
@@ -177,10 +178,12 @@ def apply_s_penalty(
                     "reject": reject_reason,
                     "use_surface": bool(use_surface),
                     "s_enabled": bool(cfg.enable),
-                    "radius_m": S_QUERY_RADIUS_M,
+                    "radius_m": float(cfg.query_radius_m),
                     "thresh": float(cfg.thresh),
-                    "s_min": S_MIN,
-                    "derived_min_w": min(1.0, S_MIN / max(float(cfg.thresh), 1e-6)),
+                    "s_min": float(cfg.s_min),
+                    "derived_min_w": min(
+                        1.0, float(cfg.s_min) / max(float(cfg.thresh), 1e-6)
+                    ),
                 }
             out_log.append(log_record)
             if candidate_records is not None:
@@ -219,6 +222,8 @@ class SPenaltyV2Config:
     beta: float = 0.30
     q_admit: float = 0.60
     thresh: float = 0.15
+    s_min: float = 0.07
+    query_radius_m: float = 0.5
 
 
 def compute_q_v2(
@@ -295,7 +300,7 @@ def apply_s_penalty_v2(
             if near_pt is not None:
                 s_pt = near_pt
                 s_pt_source = "surface"
-        s = query_semantic(s_pt[0], s_pt[1], S_QUERY_RADIUS_M)
+        s = query_semantic(s_pt[0], s_pt[1], float(cfg.query_radius_m))
         q, branch = compute_q_v2(conf_f, s, cfg)
         admitted = q >= float(cfg.q_admit)
         if admitted:
@@ -333,7 +338,7 @@ def apply_s_penalty_v2(
                 "reject": reject_reason,
                 "use_surface": bool(use_surface),
                 "s_enabled": bool(cfg.enable),
-                "radius_m": S_QUERY_RADIUS_M,
+                "radius_m": float(cfg.query_radius_m),
                 "thresh": float(cfg.thresh),
             }
             out_log.append(log_record)

@@ -174,6 +174,11 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
             ]
             for rgb in all_rgb
         ]
+        self._last_itm_cosine = (
+            float(cosines[0][0])
+            if cosines and cosines[0]
+            else None
+        )
 
         self._update_value_map_impl(cosines)
 

@@ -46,5 +46,3 @@ def image_resize(
     if no_batch_dim:
         img = img.squeeze(dim=0)  # Removes the batch dimension
     return img
- # Removes the batch dimension
-    return img

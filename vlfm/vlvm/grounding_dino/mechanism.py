@@ -39,7 +39,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from vlfm.tsp3d_models.fussion_utils.target_memory_manager import (
+from vlfm.vlvm.memory_life.target_memory_manager import (
     CONFIRMED,
     GD,
     GD_ONLY,

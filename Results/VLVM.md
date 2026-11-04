@@ -13,14 +13,18 @@
 | TSP3D 微调 | **定稿** | base → U0/U1/U2/U3 → Rank；采用 vlvm v1 (R1 E3) |
 | 几何障碍场 | **定稿** | `ProbabilisticGrid` 3D log-odds 体素（±2、截断 ±6、体素 0.05 m） |
 | 语义价值场 | **定稿** | `ITMPolicyV1` region 式 2.5D 场，`S + λ·H₁`，λ = 0.3 |
+**TSP3D Adaption**
 | 时空融合与输入适配 | **定稿** | world 增量地图 8 帧窗 + 视角去重 + 近场刷新 + 距离自适应采样 |
 | 感知与目标定位 | **定稿** | TSP3D 单阶段 3D bbox 回归 |
+**Memory Life Manager**
 | 几何准入 | **定稿** | occ geometry gate（8 体素 / 0.001 / 0.90 自由比）+ `geom_unknown` 保留 |
 | 语义准入 | **定稿** | S-penalty v1，$$\sigma_c = c·w_S$$ ，`t_S` = 0.14，`s_min` = 0.07 |
 | 记忆与生命周期 | **定稿** | 两种目标来源：tsp / gd，四种状态：gd-tsp / gd-only / tsp-confirmed /tsp-provisional / stable，行为：Merge (EMA + new_info + merge_gd/tsp) / New / upgrade / trans / delete /revive |
-| GD proposer | **定稿（S6 final）** | gd-only 全类别近场补召 + gd-tsp track-only 正向仲裁；gd-only 无 conf gate、无 TTL、必须 depth_ok；仅 confirmed/provisional gd-tsp track merge 可绕过 depth；stable 隐藏且不写 shadow |
-| 目标选择 | **定稿（S6 final）** | `gd-tsp > gd-only > confirmed > provisional`；中间档 `gd-only` 先于 `tsp-confirmed`；S7 middle-tier ranker 仅 shadow |
-| 停止 | **定稿（S6 final）** | 仅 `gd-tsp`可停；纯 TSP-confirmed/provisional、gd-only 不可停；`pointnav_stop_radius=0.90 m` |
+**GD Proposer**
+| GD proposer | **定稿** | gd-only 全类别近场补召 + gd-tsp track-only 正向仲裁；gd-only: base gate + depth_ok, gd-tsp track merge confirmed/provisional 可绕过 depth；stable 直接放弃 |
+**Goal Select and Stop**
+| 目标选择 | **定稿** | `gd-tsp > gd-only > confirmed > provisional` + `recheck` |
+| 停止 | **定稿** | 仅 `gd-tsp`可停；TSP-confirmed/provisional、gd-only 不可停；`pointnav_stop_radius=0.90 m`；explore STOP 经 recheck 延迟（`recheck_arrive_steps` = 45） |
 
 ## 1. 系统架构总览
 
@@ -68,7 +72,7 @@ flowchart TB
 | GD 离线标定 | proposal 精度 / 阈值标定 | `vlfm/tsp3d_models/grounding_dino/calibration.py`、`gd_offline_cal.py` |
 | 目标选择 | tier 排序 / 导航点选择 | `vlfm/policy/tsp3d_objectnav_policy.py` |
 
-## 2. 系统机制（S6 final 定稿）
+## 2. 系统机制
 
 ### 2.1 感知与目标接地
 
@@ -146,7 +150,7 @@ flowchart TB
 | 准入 | $$\sigma_c$$ = c·w_S ≥ 0.60 |
 | conflict 子机制 | `c ≥ 0.80` 且 `0 < S < t_S` 直接拒绝，**已放弃并关闭** |
 
-### 2.6 记忆与生命周期（S6 定稿）
+### 2.6 记忆与生命周期
 
 条目字段为类别、质心、近表面点、num_obs、$$\sigma_c$$ 五列、生命周期状态与来源标签；GD 条目额外记录。
 
@@ -215,7 +219,7 @@ stable 是 TSP3D 条目的唯一删除池，所有 TSP3D 删除都发生在 stab
 
 `gd-only` 条目使用 `lifecycle="gd"`、`origin="gd-only"`；**无 TTL、无 TTL shadow、不删除**，保留到 episode 结束或被 TSP3D 合并提升。重复 GD 命中只累计 `gd_hits/gd_conf`，不会自证为 confirmed；被 TSP3D 合并提升后归一为 `origin="gd-tsp"`（`promoted_from_gd_only=true` 仅保留 provenance）。
 
-### 2.7 目标选择与停止（S6 final）
+### 2.7 目标选择与停止
 
 > 目标选择固定为 `gd-tsp > gd-only > confirmed > provisional`；停止仅允许 gd-tsp confirmed。两者均为 S6 final，S7 middle-tier ranker 只做 shadow、不改变该顺序。
 
@@ -230,12 +234,9 @@ stable 是 TSP3D 条目的唯一删除池，所有 TSP3D 删除都发生在 stab
 | 3 | `tsp-confirmed`（纯 TSP3D） | `sigma_c` 带通档 → 距离桶 → `num_obs≥3` / 数量 → stale |
 | 4 | `provisional` | 同 `tsp-confirmed`；作为 TSP 内部中转/低档 |
 
-补充口径：
-
 - `sigma_c` 带通档：`0.65–0.70` → `0.60–0.65` → `0.55–0.60` → `≥0.70` → `<0.55`。
 - 距离桶按 `round(distance_m / 0.5)`；同桶再比较 `num_obs`，`num_obs≥3` 优先于 1–2，随后多者优先；`freshness` 仅在 `num_obs` 相同时作为 tiebreak。
-- 中间档固定为 `gd-only` 先于 `tsp-confirmed`；S6gd3 使用该顺序（SR 46.80%），S6gd4 对调为 `confirmed` 优先（SR 44.44%），S6 final 回到 gd-only 优先。中间档改为 gd-tsp 条件提升概率排序的讨论见 [VLVM-S7.md](VLVM-S7.md) §2；S7 baseline 仅 shadow，尚未在线接入。
-- `gd-only` 无 `sigma_c`，不进入 `sigma_c` 带通档；`stop_eligible=false`。
+- 中间档固定为 `gd-only` 先于 `tsp-confirmed`。
 
 **质心 / 近表面点的分工**
 
@@ -261,7 +262,32 @@ stable 是 TSP3D 条目的唯一删除池，所有 TSP3D 删除都发生在 stab
 | 近场放弃 | `provisional` 追到 1.2 m 内，每帧左转确认，超过 3 帧仍未升级则把该轨道加入停止黑名单并回 explore |
 | 观测 | 所有被选中的 `confirmed`（含 gd-tsp / promoted）与 `gd-only` 每步写 `stop_shadow.jsonl`，不影响动作 |
 
-### 2.8 GD proposer（S6 定稿）
+#### recheck：explore STOP → 延迟 STOP
+
+> 作用只有两条：**把 explore STOP 推迟**、**把剩余步数花在已有记忆航点上**。STOP 仍发生在队列耗尽那一步、机器人当前所在位置；不做目标确认、不改目标选择。
+
+| 项 | 行为 |
+| :--- | :--- |
+| 实现 | `vlfm/vlvm/recheck/mode.py::RecheckMixin`，`vlfm/policy/tsp3d_objectnav_policy.py::_explore_safe` 调用 |
+| 触发 | `_get_target_object_location()` 返回 `None`（处于 explore）且基线 `_explore()` 返回 STOP；存在 `gd-tsp confirmed` 时策略在 navigate，机制不可能触发 |
+| 候选池 | 当前目标类别全部记忆条目；**不排除 `_stop_blacklist`**，排除 `stable` 与本集已尝试 `memory_id` |
+| 排序 | 复用目标选择 comparator：`tier → sigma_band → −gd_hits → ⌊distance/0.5⌋ → num_obs 满不足 → −num_obs → stale → memory_id`；建队后固定，不按当前位置重排 |
+| 航点 | 质心 `centroid[:2]`；`goal_use_surface=True` 且有表面点时改用表面点 |
+| 巡回 | `rho > pointnav_stop_radius` → PointNav；否则 `recheck_result{outcome=arrived}` 并推进 |
+| 到达超时 | 单候选步数 > `recheck_arrive_steps` → `outcome=arrive_timeout` 并推进 |
+| 收尾 | 队列耗尽 → `_recheck_active=False`、`_explore_exhausted=True`、`recheck_exhausted{total_steps, best_memory_id, best_distance}`，就地 STOP |
+
+| 参数 | 值 |
+| :--- | :---: |
+| `recheck_enable` | `true` |
+| `recheck_arrive_steps` | `45`（单航点预算，机制唯一节流阀；无队列总预算、无候选上限、无距离自适应） |
+
+不变量：目标 STOP 仍只由 `gd-tsp confirmed` 触发，explore STOP 仅在「frontier 为空且复核队列耗尽」时允许；不解除 `_stop_blacklist`；不改排序、准入、merge/delete/revive 与 TSP3D 阈值；`try/except` 异常隔离。
+
+因为 `_get_target_object_location()` 已跳过 `stable` 与黑名单，explore STOP 时刻可选中候选必为空，故候选池必须包含黑名单条目，否则队列恒空、机制无效。这也决定能力上界：队列条目全部是已确认失败的记忆，机制只能挑 STOP 落点，不能发现新目标。
+
+
+### 2.8 GD proposer
 
 > 结论：GD 不是独立覆盖源，而是**近场补召 + TSP3D 正向仲裁**。机制实现 `vlfm/tsp3d_models/grounding_dino/mechanism.py`，记忆写入 `TargetMemoryManager`。
 
@@ -272,7 +298,7 @@ stable 是 TSP3D 条目的唯一删除池，所有 TSP3D 删除都发生在 stab
 | `gd-only` | 未关联 TSP3D 的 GD bbox | 全类别 + 近场 + `occ_passed` | `accumulate_gd_only(...)` | `lifecycle="gd"`、`origin="gd-only"` | 否 |
 | `gd-tsp` | GD bbox 命中 TSP3D `provisional/confirmed` track | `track_same` + 候选占据 | `accumulate(force_confirmed=True, origin="gd-tsp", block_stable=True)` + `apply_gd_evidence` | `confirmed`、`origin="gd-tsp"` | 是 |
 
-**base gate**（逐帧、按顺序；任一失败即拒绝）
+**base gate**
 
 1. `canon` 属于当前 episode 目标类别（多类别 `|` 分割）。
 2. `conf >= gd_conf_min`，默认 0.40。
@@ -313,9 +339,6 @@ stable 是 TSP3D 条目的唯一删除池，所有 TSP3D 删除都发生在 stab
 | stable | 固定隐藏、不升级、不写 shadow |
 | gd-only conf gate / TTL | 已删除（无 YAML 字段/状态/shadow） |
 
-**日志**：`gd_frames.jsonl`、`gd_proposals.jsonl`、`memory_events.jsonl`（`gd_only_new/gd_only_merge/gd_tsp_merge`）、`stop_shadow.jsonl`、`track_frames.jsonl`、`nav_goals.jsonl`；S7 baseline 另有 `middle_rank_shadow.jsonl`（只读）。
-
-> 依据：[VLVM-S6.md](VLVM-S6.md) §4；结果 [VLVM-S6gd3-exp.md](VLVM-S6gd3-exp.md)、[VLVM-S6gd4-exp.md](VLVM-S6gd4-exp.md)。
 
 ## 3. 微调策略
 
@@ -364,38 +387,3 @@ stable 是 TSP3D 条目的唯一删除池，所有 TSP3D 删除都发生在 stab
 | 边界 / 损失 | U1 + `L_base + L_rank` |
 | 工作点 | `sigma_tar` = 0.60（无 S-penalty 四场景 grid 最优） |
 | 主导指标 | hit@0.25 29.11% → 33.63%（+4.52 pp）；AUPRC 0.4107 → 0.4511；FPR@TPR95 0.7854 → 0.5901 |
-
-## 4. S6 final 与 S7 只读入口
-
-> GD proposer 已定稿，见 §2.8；目标选择与停止为 S6 final；S7 middle-tier ranker 当前只写 shadow，不改变动作。
-
-### 4.1 目标选择（S6 final）
-
-| 项 | 定稿口径 |
-| :--- | :--- |
-| 层级 | `gd-tsp > gd-only > confirmed > provisional` |
-| 中间档 | `gd-only` 先于 `tsp-confirmed` |
-| 依据 | S6gd3 该顺序 SR 46.80%；S6gd4 对调后 SR 44.44%；S6 final 回到 gd-only 优先 |
-| S7 入口 | middle-tier 条件提升概率排序仅 shadow，见 [VLVM-S7.md](VLVM-S7.md) §2；`enable_middle_tier_ranking=False` |
-
-### 4.2 停止（S6 final）
-
-| 项 | 定稿口径 |
-| :--- | :--- |
-| 可停资格 | 仅 `gd-tsp confirmed`（含 promoted gd-only） |
-| 不可停 | 纯 TSP `confirmed`、`gd-only`、`provisional`、`stable` |
-| 停靠半径 | `pointnav_stop_radius=0.90 m` |
-| 近场放弃 | `provisional` 追到 1.2 m 内，3 帧未升级则拉黑并回 explore |
-| 状态 | S6 final 定稿；未接入 GD/field 到 STOP |
-
-### 4.3 field 探索覆盖（只读）
-
-- field 候选排序/准入已删除，不参与候选排序、记忆或 STOP。
-- 在线仅写 `detections/field_shadow.jsonl`；`field_observations` 原始归档继续采集。
-- 后续在线实验拆为探索覆盖与 `region_semantic` 两个独立臂，见 [VLVM-S7.md](VLVM-S7.md) §1.6。
-
-### 4.4 middle-tier 提升概率（只读 shadow）
-
-- 四个特征组 `cross / repeat / geo / ctx`；在线只记录特征、子分数、$p$ 与静态排名。
-- 输出 `detections/middle_rank_shadow.jsonl`；脚本结束后自动离线拟合到 `<run>/middle_tier/middle_tier_model.json`。
-- `enable_middle_tier_ranking=False`，不改变选择、记忆、STOP 或动作；模型路径为空时 $p=null$。

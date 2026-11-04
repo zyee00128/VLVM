@@ -116,16 +116,18 @@ habitat_baselines:
       mid_voxel: 0.02
       far_voxel: 0.05
 
-      # GD-only / gd-tsp mechanism (conservative initial version)
+      # GD Proposer
       enable_gd_mechanism: True
       gd_conf_min: 0.40          # initial GD gate only; not a ranking score
-      gd_max_dist: 5.0              # GD-only/gd-tsp robot-distance gate
+      gd_max_dist: 5.0           # GD-only/GD-tsp robot-distance gate
       gd_only_classes: ""        # empty = allow all target classes
-      # Fixed S6-final: gd-only requires depth_ok; only gd-tsp confirmed/
-      # provisional track merge may bypass depth; no conf gate, no TTL,
-      # stable never selectable/upgraded.
+      
+      # Recheck mode
+      recheck_enable: True
+      recheck_arrive_steps: 45
 
-      # Occupancy-consistency geometric gate
+      # Memory life-cycle
+      # Occupancy geometric gate
       enable_occ_consistency: True
       occ_min_voxels: 8
       occ_min_ratio: 0.001
@@ -133,22 +135,17 @@ habitat_baselines:
       enable_s_penalty: True
       s_penalty_thresh: 0.14
       s_penalty_uncovered_w: 1.0         # Weight for no coverage (S<=0/None): 1.0 = free pass; <1.0 = mild penalty.
+      s_min: 0.07                        # S lower clamp used by w_S.
+      s_query_radius_m: 0.5              # Radius for the S query on the value map.
       det_log_dir: null                  # Per-detection jsonl output directory; null = off (diagnostics only).
-      # Middle-tier promotion-probability shadow (read-only; no action change)
-      enable_middle_tier_shadow: True
-      middle_tier_shadow_every_n: 1
-      middle_tier_model_path: ""
-      enable_middle_tier_ranking: False
       # near-surface point
       s_penalty_use_surface: True
       goal_use_surface: True
-
-      # Target-memory lifecycle
       merge_dist_thresh: 0.5
       ema_weight_old: 0.8
       lock_exempt: True
       lock_exempt_identity: True
-      ## fallback
+      # States
       enable_provisional_gate: True # Provisional gate: 0.50-0.60, 1.0-4.0 m.
       provisional_sigma: 0.55 # 0.50
       provisional_min_dist: 1.0

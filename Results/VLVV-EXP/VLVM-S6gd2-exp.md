@@ -402,10 +402,10 @@ state tier (confirmed > provisional > gd)
 | TSP3D + `sigma_c` | 候选准入与 TSP 候选分数 | 不负责候选外探索 |
 | GD-tsp | 对既有 confirmed/provisional track 做确认/增强；按类别提高选择优先级 | 不做全局候选排序，不从 candidate-only 新建 track |
 | GD-only | 候选外探索池；首次探索起点；`gd_hits` 用于后续排序 | 不可停、不参与 confirmed 判定 |
-| field | 候选外区域 Top-K 探索覆盖先验 | 不参与候选排序、准入、记忆或 STOP |
+| field | 未覆盖区域 Top-K 目标覆盖先验 | 不能做排序选择；不参与目标选择、记忆或 STOP |
 | 语义侧车 | 可选的离线研究项 | 不作为当前机制前置，不生成全量 |
 
-结论：**可以按“field 只做探索覆盖、排序选择交给 `sigma_c` + GD 证据”推进。** 但要把措辞限定为：GD-tsp 是“确认/增强 + 按类别的选择优先级”，不是完整的全候选 ranker；`gd-only` 是探索池，不是排序器。若后续要进一步提升排序，不建议回到 field candidate score；轻量离线 ranker 的初步想法已记录在 `VLVM-S7.md` §1.8，**当前明确延后实现**，先完成本轮 conf/TTL/shadow 判据统计。
+结论：**可以按“field 只做目标覆盖、目标选择交给 `sigma_c` + GD 证据”推进。** GD-tsp 只做确认/增强与按类别的选择优先级，`gd-only` 是探索池；轻量中间档 ranker 见 `VLVM-S7.md` §4，**当前明确延后实现**。
 
 ## 8. 产物
 
@@ -420,7 +420,6 @@ state tier (confirmed > provisional > gd)
 - `field_analysis/field_offline_report.json`
 - `field_analysis/field_offline_summary.md`
 - `field_analysis/field_inference_config.json`
-- `field_analysis/field_candidate_scores.jsonl`
 - `s6_summary.json`
 - `gd_offline_cal.json`
 - `COMPLETED`
