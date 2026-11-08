@@ -11,7 +11,7 @@
 - **VLFM / VLVM 基线都不能跨层搜索**。`frontier_sensor` 的 `top_down_map` 按 `ref_floor_height=agent_y`、`ceiling_height=2.0 m` 切片，只含当前楼层；输出 `(N,2)`，PointNav 只有 `rho/theta`，无楼层/楼梯语义。
 - **floor 机制冻结**：已有显式通道但实测未跑通（`2026-11-03_005206`：198 集仅 4 集上楼；VERIFIED entry 后 `at_entry_timeout`）。冻结的代价是 `never_saw` 不可回收。
 - **机制 A 不依赖 floor**：explore STOP 后的可用预算只能转为“对已有候选的确认”，不是“再探索”。
-- 主代码位置：`vlfm/vlvm/recheck/mode.py::RecheckMixin`（策略通过多继承接入），`vlfm/policy/tsp3d_objectnav_policy.py::_explore_safe` 调用。
+- 主代码位置：`vlfm/vlvm/recheck/expl_recheck.py::ExplRecheckMixin`（原 `mode.py::RecheckMixin`；策略通过多继承接入），`vlfm/policy/tsp3d_objectnav_policy.py::_explore_safe` 调用。
 
 ## 1. 失败结构（机制 A 的决策依据）
 
@@ -239,7 +239,7 @@ $$
 | :--- | :--- |
 | `vlfm/vlvm/semantic_spatial_field/` | 整目录（`coverage.py` / `coverage_log.py` / `core.py` / `inference.py` / `__init__.py`） |
 | `vlfm/policy/tsp3d_objectnav_policy.py` | `_field_eval` / `_field_select_index` / `_log_field_eval`、`_field_logs`、`_field_sel_*` 状态、`_explore_safe` 中的 field 选点分支、`field_log_enable` / `field_select_enable` / `field_sel_stale_steps` / `field_sel_min_progress_m` 超参数 |
-| `vlfm/vlvm/recheck/mode.py` | `_init_recheck` 中的 4 个 field 参数与对应属性 |
+| `vlfm/vlvm/recheck/expl_recheck.py` | `_init_recheck` 中的 4 个 field 参数与对应属性 |
 | `config/experiments/vlvm_objectnav_hm3d.yaml` | 4 个 field 字段 |
 | `vlfm/utils/vlvm_trainer.py` / `episode_stats_logger.py` | `field_logs` 参数与 `coverage_field.jsonl` 输出通道 |
 | `scripts/_nav_s7.sh` | `FIELD_SELECT_ENABLE` 开关与 banner 行 |

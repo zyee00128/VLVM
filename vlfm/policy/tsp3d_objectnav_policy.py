@@ -18,7 +18,6 @@ from vlfm.policy.base_policy import BasePolicy
 from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
 from vlfm.utils.geometry_utils import rho_theta, extract_yaw, get_fov
 from vlfm.utils.vlvm_stats_logger import VlvmStatsLogger
-from vlfm.mapping.obstacle_map import ObstacleMap3D, ProbabilisticGrid
 
 from vlfm.tsp3d_models.fussion_utils.pipeline import TSP3DInputPreprocessor
 from vlfm.vlvm.memory_life.s_penalty import (
@@ -40,7 +39,7 @@ from vlfm.vlvm.memory_life.target_geometric_gating import (
     BoxOccupancyConfig,
     apply_geom_gate,
 )
-from vlfm.vlvm.recheck import RecheckMixin
+from vlfm.vlvm.recheck import ExplRecheckMixin, ExploreRuntimeMixin
 from vlfm.vlvm.utils.policy_init import PolicyInitMixin
 from vlfm.vlvm.utils.policy_logging import PolicyLoggingMixin
 from vlfm.vlvm.utils.three_points import three_point_fields_for
@@ -49,7 +48,11 @@ from vlfm.vlvm.utils.three_points import three_point_fields_for
 PROMPT_SEPARATOR = "|"
 
 class TSP3DObjectNavPolicy(
-    PolicyInitMixin, PolicyLoggingMixin, RecheckMixin, BasePolicy
+    PolicyInitMixin,
+    PolicyLoggingMixin,
+    ExplRecheckMixin,
+    ExploreRuntimeMixin,
+    BasePolicy,
 ):
     """TSP3D-based 3D active semantic target navigation policy."""
     _target_object: str = ""
@@ -84,6 +87,7 @@ class TSP3DObjectNavPolicy(
             pointnav_stop_radius: float = 0.90, 
             det_seed: int = 0,
             det_log_dir: Optional[str] = None,
+            enable_stats: bool = True,
             # TSP3D query
             sigma_sce: float = 0.15,
             sigma_tar: float = 0.60,
@@ -148,14 +152,13 @@ class TSP3DObjectNavPolicy(
             gd_conf_min: float = 0.40,
             gd_max_dist: float = 5.0,
             gd_only_classes: str = "",
-            
-            # Recheck switches (were environment variables).
+            # Recheck & Explore mode
             explore_stuck_steps: int = 15,
             explore_stuck_move_m: float = 0.05,
             recheck_enable: bool = True,
             recheck_arrive_steps: int = 45,
-
-            enable_stats: bool = True,
+            explore_auto_mode: bool = True,
+            explore_sem_value_min: float = 0.14,
             *args: Any,
             **kwargs: Any,
         ) -> None:
@@ -180,86 +183,36 @@ class TSP3DObjectNavPolicy(
         self._log_odds_free = log_odds_free
         self._occ_threshold = occ_threshold
         self._free_threshold = free_threshold
-        # TSP3D & Mem-life
-        self._sigma_tar = float(sigma_tar)
-        self._sigma_prop = (
-            self._sigma_tar if sigma_prop is None else float(sigma_prop)
-        )
-        if not 0.0 <= self._sigma_prop <= 1.0:
-            raise ValueError(f"sigma_prop must be in [0, 1], got {self._sigma_prop}")
-        self._sigma_sce = sigma_sce
-        self._tau = tau
-        self._s_query_radius_m = float(s_query_radius_m)
-        self._enable_stable_pool = bool(enable_stable_pool)
-        self._stop_gate_radius = float(stop_gate_confirm_radius)
-        self._stop_gate_turns = int(stop_gate_turns)
-        self._stop_blacklist: set = set()
-        self._stop_confirm_counts: Dict[str, int] = {}
-        self._last_stop_eligible: bool = True
-        self._last_goal_memory_id: Optional[str] = None
-        self._last_goal_num_obs: int = 0
-        self._last_goal_state: str = "confirmed"
-        self._last_goal_stale: int = 0
-        self._last_goal_origin: Optional[str] = None
-        self._last_goal_gd_hits: int = 0
-        self._last_goal_score: float = 0.0
-        self._lookaround_trace: List[Dict[str, Any]] = []
-        self._near_field_dist = near_field_dist
-        self._near_field_sigma_scale = near_field_sigma_scale
-        self._nlp_mode = use_vlfm_nlp
-        self._pointnav_stop_radius = pointnav_stop_radius
-        self._init_step_count = 0
+        # Episode / action state.
         self._num_steps = 0
-        self._last_goal = np.zeros(2)  # Current 3D goal coordinate [x, y, z]
+        self._last_goal = np.zeros(2)
         self._done_initializing = False
         self._called_stop = False
         self._did_reset = False
-        self._explore_exhausted = False
-        self._explore_stop_suppressed = 0
-        self._explore_fallback_turns = 0
         self._stop_action = torch.tensor([[0]], dtype=torch.long)
-        self._forward_action = torch.tensor([[1]], dtype=torch.long)
         self._turn_left_action = torch.tensor([[2]], dtype=torch.long)
-        self._turn_right_action = torch.tensor([[3]], dtype=torch.long)
-        self._look_up_action = torch.tensor([[4]], dtype=torch.long)
-        self._look_down_action = torch.tensor([[5]], dtype=torch.long)
-        self._target_3d_memory: Dict[str, List[np.ndarray]] = {}
-        self._target_surface_memory: Dict[str, List[np.ndarray]] = {}  # per-centroid near-surface point
-        # (num_obs, last robot xy, last robot yaw, c' = S-penalty score)
-        self._target_verify_state: Dict[str, List[Tuple[int, np.ndarray, float, float]]] = {}
-        self._target_lifecycle_state: Dict[str, List[Dict[str, Any]]] = {}
-        self._last_target_coord: Union[None, np.ndarray] = None
-        self._last_target_centroid: Union[None, np.ndarray] = None
-        self._candidate_seq = 0
-        self._candidate_logs: List[Dict[str, Any]] = []
-        self._memory_event_logs: List[Dict[str, Any]] = []
-        self._nav_goal_logs: List[Dict[str, Any]] = []
-        self._track_frame_logs: List[Dict[str, Any]] = []
-        self._stop_shadow_logs: List[Dict[str, Any]] = []
-        self._explore_stuck_steps = int(explore_stuck_steps)
-        self._explore_stuck_move_m = float(explore_stuck_move_m)
-        self._explore_stuck_count = 0
-        self._explore_action_repeat_count = 0
-        self._explore_frontier_repeat_count = 0
-        self._last_explore_frontier: Optional[np.ndarray] = None
-        self._last_itm_cosine: Optional[float] = None
-        self._last_explore_cosine: Optional[float] = None
-        self._explore_forced_fallback = False
-        self._last_explore_xy: Optional[np.ndarray] = None
-        self._last_explore_action: Optional[int] = None
-        self._explore_frontier_blacklist: List[np.ndarray] = []
         self._last_tsp3d_local_pcd: Optional[np.ndarray] = None
-        self._enable_gd_mechanism = bool(enable_gd_mechanism)
-        self._gd_conf_min = float(gd_conf_min)
-        self._gd_max_dist = float(gd_max_dist)
-        self._gd_only_classes = tuple(
-            part.strip().lower() for part in str(gd_only_classes).split(",") if part.strip()
-        )
         self._last_robot_pose: Optional[Tuple[float, float, float]] = None
 
-        # Recheck mode: after the current-floor frontier is exhausted, visit
-        # each selectable memory once and evaluate it with the regular
-        # per-step TSP3D + GD queries.
+        # TSP3D query (must run BEFORE `_init_memory_manager`, which reads `_sigma_tar`)
+        self._init_tsp3d_query(
+            sigma_tar=sigma_tar,
+            sigma_prop=sigma_prop,
+            sigma_sce=sigma_sce,
+            tau=tau,
+            s_query_radius_m=s_query_radius_m,
+            near_field_dist=near_field_dist,
+            near_field_sigma_scale=near_field_sigma_scale,
+            use_vlfm_nlp=use_vlfm_nlp,
+        )
+        # Per-module state. Each init owns the fields of its own mechanism.
+        self._init_policy_logging()
+        self._init_explore_mode(
+            enable=explore_auto_mode,
+            sem_value_min=explore_sem_value_min,
+            stuck_steps=explore_stuck_steps,
+            stuck_move_m=explore_stuck_move_m,
+        )
         self._init_recheck(
             enable=recheck_enable,
             arrive_steps=recheck_arrive_steps,
@@ -285,7 +238,7 @@ class TSP3DObjectNavPolicy(
             ema_weight_old=ema_weight_old,
             upgrade_min_obs=upgrade_min_obs,
             enable_stable_pool=enable_stable_pool,
-            enable_gd_pool=self._enable_gd_mechanism,
+            enable_gd_pool=bool(enable_gd_mechanism),
             enable_provisional_gate=enable_provisional_gate,
             provisional_sigma=provisional_sigma,
             provisional_min_dist=provisional_min_dist,
@@ -304,6 +257,9 @@ class TSP3DObjectNavPolicy(
             provisional_to_stable_misses=provisional_to_stable_misses,
             lock_exempt=lock_exempt,
             lock_exempt_identity=lock_exempt_identity,
+            stop_gate_confirm_radius=stop_gate_confirm_radius,
+            stop_gate_turns=stop_gate_turns,
+            pointnav_stop_radius=pointnav_stop_radius,
         )
         self._init_fusion(
             fusion_style=fusion_style,
@@ -340,14 +296,14 @@ class TSP3DObjectNavPolicy(
             occ_min_ratio=occ_min_ratio,
         )
         
-        # GD mechanism: one binary switch controls calibration + routing.
+        # GD mechanism
         self._init_gd_mechanism(
-            enabled=self._enable_gd_mechanism,
-            conf_min=self._gd_conf_min,
-            max_dist=self._gd_max_dist,
-            gd_only_classes=self._gd_only_classes,
+            enabled=enable_gd_mechanism,
+            conf_min=gd_conf_min,
+            max_dist=gd_max_dist,
+            gd_only_classes=gd_only_classes,
         )
-        # 3D visual grounding and vision-language evaluation clients
+        # TSP3D client
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
         self._itm_client = BLIP2ITMClient(port=int(os.environ.get("BLIP2ITM_PORT", "12182")))
         self._pointnav_policy = WrappedPointNavResNetPolicy(pointnav_policy_path)
@@ -361,64 +317,25 @@ class TSP3DObjectNavPolicy(
     def _reset(self) -> None:
         """Reset memories, step counters, pointnav model, and 3D occupancy map."""
         self._target_object = ""
-        self._init_step_count = 0
         self._num_steps = 0
         self._last_goal = np.zeros(2)
         self._done_initializing = False
         self._called_stop = False
-        self._explore_exhausted = False
-        self._explore_stop_suppressed = 0
-        self._explore_fallback_turns = 0
-        self._explore_stuck_count = 0
-        self._explore_action_repeat_count = 0
-        self._explore_frontier_repeat_count = 0
-        self._last_explore_frontier = None
-        self._last_itm_cosine = None
-        self._last_explore_cosine = None
-        self._explore_forced_fallback = False
-        self._last_explore_xy = None
-        self._last_explore_action = None
-        self._explore_frontier_blacklist = []
-        self._target_3d_memory.clear()
-        self._target_surface_memory.clear()
-        self._target_verify_state.clear()
-        self._target_lifecycle_state.clear()
         self._stats.episode_summary()
-        self._memory_manager.reset_ids()
-        self._last_target_coord = None
-        self._last_target_centroid = None
         self._geom_gate_engine.reset()
-        self._last_lock_step = 0
         self._pointnav_policy.reset()
         self._obstacle_map3d.reset()
         self._preprocessor.reset()
-        self._detect_logs = []
-        self._candidate_seq = 0
-        self._candidate_logs = []
-        self._memory_event_logs = []
-        self._nav_goal_logs = []
-        self._track_frame_logs = []
-        self._stop_shadow_logs = []
         self._last_tsp3d_local_pcd = None
+        if self._gd_calib is not None:
+            self._gd_calib.reset()
         self._gd_calib_logs = []
         self._gd_mech_last_step = -1
         self._gd_mech_error = None
-        if self._gd_calib is not None:
-            self._gd_calib.reset()
-        self._stop_blacklist = set()
-        self._stop_confirm_counts = {}
-        self._last_stop_eligible = True
-        self._last_goal_memory_id = None
-        self._last_goal_num_obs = 0
-        self._last_goal_state = "confirmed"
-        self._last_goal_stale = 0
-        self._last_goal_origin = None
-        self._last_goal_gd_hits = 0
-        self._last_goal_score = 0.0
-        # Look-around trace (log-only): lets us judge whether extra view/time
-        # at the stop gate could ever flip a memory to stop-eligible.
-        self._lookaround_trace: List[Dict[str, Any]] = []
-        self._lock_step = -1
+        # Per-module resets
+        self._reset_memory_state()
+        self._reset_policy_logging()
+        self._reset_explore_mode()
         self._recheck_reset()
         self._stats.reset()
         self._did_reset = True
@@ -584,7 +501,6 @@ class TSP3DObjectNavPolicy(
         valid_gd_incremental: List[bool] = []
         valid_gd_upgraded: List[bool] = []
         valid_promoted_gd_only: List[bool] = []
-        self._stop_shadow_logs = getattr(self, "_stop_shadow_logs", [])
         target_classes = self._target_object.split("|")
         for cls in target_classes:
             if cls in self._target_3d_memory and len(self._target_3d_memory[cls]) > 0:
@@ -722,13 +638,6 @@ class TSP3DObjectNavPolicy(
             "stale": valid_stale,
             "stop_ok": valid_stop_ok,
         }
-        self._log_stop_shadow(
-            chosen_idx=chosen_idx,
-            chosen_2d=chosen_2d,
-            robot_xy=robot_xy,
-            dists_2d=dists_2d,
-            valid=valid_payload,
-        )
         
         switch_reason = "initial"
         if self._last_target_coord is None:
@@ -1178,149 +1087,14 @@ class TSP3DObjectNavPolicy(
             )
 
         self._log_track_frames(frame_log_start, robot_xyz, robot_yaw, max_depth)
-        return detections
 
+        return detections
 
     def _initialize(self) -> Tensor:
         raise NotImplementedError
     
     def _explore(self, observations: "TensorDict") -> Tensor:
         raise NotImplementedError
-
-
-    @staticmethod
-    def _is_stop_action(action: Tensor) -> bool:
-        """Return True only for the discrete Habitat STOP action (0)."""
-        try:
-            values = action.detach().cpu().numpy().reshape(-1)
-            return bool(values.size == 1 and int(values[0]) == 0)
-        except Exception:
-            return False
-
-
-    def _filter_blacklisted_frontiers(self) -> None:
-        """Remove frontiers that repeatedly failed to produce motion."""
-        blacklist = getattr(self, "_explore_frontier_blacklist", None) or []
-        if not blacklist:
-            return
-        cache = self._observations_cache
-        raw = np.asarray(
-            cache.get("frontier_sensor", np.empty((0, 2))),
-            dtype=np.float64,
-        )
-        if raw.size == 0:
-            return
-        points = raw.reshape(-1, 2) if raw.ndim == 1 else raw[:, :2]
-        keep = np.ones(points.shape[0], dtype=bool)
-        for stuck in blacklist:
-            stuck_xy = np.asarray(stuck, dtype=np.float64).reshape(-1)[:2]
-            if stuck_xy.size != 2 or not np.all(np.isfinite(stuck_xy)):
-                continue
-            keep &= (
-                np.linalg.norm(points - stuck_xy[None, :], axis=1)
-                > 0.50
-            )
-        cache["frontier_sensor"] = points[keep]
-
-    def _explore_safe(self, observations: "TensorDict") -> Tensor:
-        """Explore via the Habitat frontier sensor and baseline explorer."""
-        robot_xy = np.asarray(
-            self._observations_cache.get("robot_xy", np.zeros(2)),
-            dtype=np.float64,
-        ).reshape(-1)[:2]
-
-        if self._recheck_active:
-            recheck_action = self._recheck_act(observations, robot_xy)
-            if recheck_action is not None:
-                return recheck_action
-
-        self._filter_blacklisted_frontiers()
-
-        # Fallback trigger: the robot has not moved for several explore steps.
-        if self._last_explore_xy is not None:
-            moved = float(np.linalg.norm(robot_xy - self._last_explore_xy))
-            if moved <= self._explore_stuck_move_m:
-                self._explore_stuck_count += 1
-            else:
-                self._explore_stuck_count = 0
-        self._last_explore_xy = robot_xy.copy()
-
-        self._explore_forced_fallback = False
-
-        action = self._explore(observations)
-        if not self._is_stop_action(action):
-            if self._explore_stuck_count < self._explore_stuck_steps:
-                self._explore_exhausted = False
-                self._explore_fallback_turns = 0
-                return action
-
-            stuck_xy = np.asarray(
-                getattr(self, "_last_frontier", np.zeros(2)),
-                dtype=np.float64,
-            ).reshape(-1)[:2]
-            if (
-                stuck_xy.size == 2
-                and np.all(np.isfinite(stuck_xy))
-                and not np.allclose(stuck_xy, 0.0)
-            ):
-                self._explore_frontier_blacklist.append(stuck_xy.copy())
-            self._last_frontier = np.zeros(2, dtype=np.float64)
-            self._explore_stuck_count = 0
-            self._last_explore_frontier = None
-            self._explore_forced_fallback = True
-            self._explore_stop_suppressed += 1
-            print(
-                "[EXPLORE] frontier fallback: "
-                f"stuck={self._explore_stuck_steps}steps "
-                f"frontier={stuck_xy.tolist()}",
-                flush=True,
-            )
-            self._filter_blacklisted_frontiers()
-            retry_action = None
-            try:
-                retry_action = self._explore(observations)
-            except Exception:
-                retry_action = None
-            if retry_action is not None and not self._is_stop_action(
-                retry_action
-            ):
-                self._explore_forced_fallback = False
-                self._explore_exhausted = False
-                self._explore_fallback_turns = 0
-                print(
-                    "[EXPLORE] retry with failed frontier removed",
-                    flush=True,
-                )
-                return retry_action
-            self._explore_exhausted = True
-        else:
-            self._explore_forced_fallback = False
-            self._explore_exhausted = True
-            self._explore_stuck_count = 0
-            self._last_explore_frontier = None
-            self._explore_stop_suppressed += 1
-            print(
-                "[EXPLORE] frontier exhausted: STOP suppressed; "
-                f"count={self._explore_stop_suppressed}",
-                flush=True,
-            )
-
-        # Frontier exhausted on this floor: spend the remaining budget on
-        # rechecking existing memories (one arrival; the per-step TSP3D/GD
-        # queries already ran on the arrival frame).  Only when nothing is
-        # left to recheck is explore allowed to emit STOP.
-        if self._recheck_begin(robot_xy):
-            recheck_action = self._recheck_act(observations, robot_xy)
-            if recheck_action is not None:
-                return recheck_action
-        self._explore_exhausted = True
-        print(
-            "[EXPLORE] no candidate to recheck: STOP allowed "
-            f"step={int(self._num_steps)}",
-            flush=True,
-        )
-        return self._stop_action
-
 
     def _pointnav(self, goal: np.ndarray, stop: bool = False) -> Tensor:
         """PointNav to goal via rho/theta; supports 2D (x,y) and 3D (x,y,z) goals."""
@@ -1592,7 +1366,7 @@ class VLVMConfig:
     far_voxel: float = 0.05             # distance sampling: far-band voxel (m)
     fusion_style: str = "world"         # Fusion route: "world" (incremental map) / "none" (raw current frame).
     fuse_max_points: int = 200000           # Cap on fused point count; higher = more detail but heavier sparse-conv inference.
-    # Phase 5c: World-frame Local Map (TSP3DInputPreprocessor)
+    # Phase 5b: World-frame Local Map (TSP3DInputPreprocessor)
     wm_max_frames: Optional[int] = 8                # world: frame-window cap (keep voxels of the most recent N frames); None = all history
     wm_voxel_size: float = 0.02                     # world: local map voxel size (m) for fixed-grid dedup
     wm_max_voxels: int = 400000                     # world: hard cap on map voxels
@@ -1602,7 +1376,7 @@ class VLVMConfig:
     wm_near_refresh_radius: Optional[float] = 3.0   # world: near-field refresh radius (m). None=off (first-observation accounting); >0: re-observed near-field voxels are re-owned by the current frame (cam-style accounting, survives frame-window slide-out).
     wm_near_refresh_value: bool = False             # world: also overwrite the stored point of refreshed near-field voxels with the current observation (cam-style sliding refresh of the value layer). False = value layer stays first.
 
-    # Phase 7a: Mem-Life
+    # Phase 7: Mem-Life
     enable_occ_consistency: bool = True     # box must have occupied-voxel support in the 3D grid
     occ_min_voxels: int = 8                 # occ gate: min occupied voxels supporting the box
     occ_min_ratio: float = 0.001            # occ gate: min occupied/(box volume) ratio
@@ -1613,9 +1387,6 @@ class VLVMConfig:
     s_min: float = 0.07                     # S lower clamp used by w_S (was a module constant).
     s_query_radius_m: float = 0.5           # Radius for the S query on the value map (was a module constant).
 
-    # Recheck mode (explore frontier exhausted -> delayed STOP).
-    recheck_enable: bool = True             # Master switch for the recheck queue.
-    recheck_arrive_steps: int = 45          # Per-waypoint arrival budget (fixed); measured need p100 = 39, tail 42-48.
     merge_dist_thresh: float = 0.5          # cross-view EMA merge distance threshold (m)
     ema_weight_old: float = 0.8             # cross-view EMA smoothing (old * w + new * (1 - w))
     enable_provisional_gate: bool = True    # Final S5: unmatched candidates use the provisional gate.
@@ -1653,6 +1424,12 @@ class VLVMConfig:
     gd_conf_min: float = 0.40                # GD base-gate confidence (initial filter only).
     gd_max_dist: float = 5.0                 # GD base-gate robot distance (m).
     gd_only_classes: str = ""                # empty = all target classes; comma-separated otherwise.
+
+    # Recheck & Explore mode.
+    recheck_enable: bool = True             # Master switch for the recheck queue.
+    recheck_arrive_steps: int = 45          # Per-waypoint arrival budget (fixed); measured need p100 = 39, tail 42-48.
+    explore_auto_mode: bool = True          # Master switch; False keeps the pure value-map ordering.
+    explore_sem_value_min: float = 0.14     # Pure ValueMap S of the best frontier (excludes h_lam*H1).
 
     enable_stats: bool = True     # 通用前置量测开关（[NAV]/[STOP] 打印与逐集摘要；零行为）
 

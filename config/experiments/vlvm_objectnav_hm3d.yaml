@@ -122,10 +122,6 @@ habitat_baselines:
       gd_max_dist: 5.0           # GD-only/GD-tsp robot-distance gate
       gd_only_classes: ""        # empty = allow all target classes
       
-      # Recheck mode
-      recheck_enable: True
-      recheck_arrive_steps: 45
-
       # Memory life-cycle
       # Occupancy geometric gate
       enable_occ_consistency: True
@@ -170,7 +166,13 @@ habitat_baselines:
       tau: 0.15
       near_field_dist: 1.0
       near_field_sigma_scale: 0.8
-      
+
+      # Recheck & Explore mode switch
+      recheck_enable: True
+      recheck_arrive_steps: 45
+      explore_auto_mode: True
+      explore_sem_value_min: 0.14
+
     ppo:
       clip_param: 0.2
       ppo_epoch: 4

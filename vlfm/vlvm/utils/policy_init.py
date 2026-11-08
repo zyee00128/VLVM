@@ -6,7 +6,7 @@ per-step control flow.  These are plain mixin methods: they operate on
 """
 
 import os
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -83,6 +83,34 @@ class PolicyInitMixin:
                 free_threshold=self._free_threshold,
             )
 
+    def _init_tsp3d_query(
+        self,
+        *,
+        sigma_tar: float,
+        sigma_prop: Optional[float],
+        sigma_sce: float,
+        tau: float,
+        s_query_radius_m: float,
+        near_field_dist: float,
+        near_field_sigma_scale: float,
+        use_vlfm_nlp: bool,
+    ) -> None:
+        """TSP3D proposal threshold, soft-pruning and S-query resolution."""
+        self._sigma_tar = float(sigma_tar)
+        self._sigma_prop = (
+            self._sigma_tar if sigma_prop is None else float(sigma_prop)
+        )
+        if not 0.0 <= self._sigma_prop <= 1.0:
+            raise ValueError(
+                f"sigma_prop must be in [0, 1], got {self._sigma_prop}"
+            )
+        self._sigma_sce = float(sigma_sce)
+        self._tau = float(tau)
+        self._s_query_radius_m = float(s_query_radius_m)
+        self._near_field_dist = float(near_field_dist)
+        self._near_field_sigma_scale = float(near_field_sigma_scale)
+        self._nlp_mode = bool(use_vlfm_nlp)
+
     def _init_memory_manager(
         self,
         *,
@@ -109,11 +137,43 @@ class PolicyInitMixin:
         provisional_to_stable_misses: int = 3,
         lock_exempt: bool = True,
         lock_exempt_identity: bool = True,
+        stop_gate_confirm_radius: float = 1.2,
+        stop_gate_turns: int = 3,
+        pointnav_stop_radius: float = 0.90,
     ) -> None:
         """
         Target-memory lifecycle manager (EMA merge + stable pool + erasure)
-        bound to the policy's memory dicts.
+        bound to the policy's memory dicts, plus the selection/STOP-gate state
+        that indexes them.
         """
+        # Memory dicts (must exist before ``bind``).
+        self._target_3d_memory: Dict[str, List[np.ndarray]] = {}
+        # per-centroid near-surface point
+        self._target_surface_memory: Dict[str, List[np.ndarray]] = {}
+        # (num_obs, last robot xy, last robot yaw, c' = S-penalty score)
+        self._target_verify_state: Dict[
+            str, List[Tuple[int, np.ndarray, float, float]]
+        ] = {}
+        self._target_lifecycle_state: Dict[str, List[Dict[str, Any]]] = {}
+        self._last_target_coord: Union[None, np.ndarray] = None
+        self._last_target_centroid: Union[None, np.ndarray] = None
+
+        # Selection / STOP-gate state.
+        self._enable_stable_pool = bool(enable_stable_pool)
+        self._pointnav_stop_radius = float(pointnav_stop_radius)
+        self._stop_gate_radius = float(stop_gate_confirm_radius)
+        self._stop_gate_turns = int(stop_gate_turns)
+        self._stop_blacklist: set = set()
+        self._stop_confirm_counts: Dict[str, int] = {}
+        self._last_stop_eligible: bool = True
+        self._last_goal_memory_id: Optional[str] = None
+        self._last_goal_num_obs: int = 0
+        self._last_goal_state: str = "confirmed"
+        self._last_goal_stale: int = 0
+        self._last_goal_origin: Optional[str] = None
+        self._last_goal_gd_hits: int = 0
+        self._last_goal_score: float = 0.0
+
         self._memory_manager = TargetMemoryManager(MemoryManagerConfig(
             near_field_radius=float(self._max_depth) * 0.5,
             merge_dist_thresh=merge_dist_thresh,
@@ -149,6 +209,27 @@ class PolicyInitMixin:
             s_min=provisional_s_min,
         ))
 
+    def _reset_memory_state(self) -> None:
+        """Clear the target-memory pool and the selection / STOP-gate state."""
+        self._target_3d_memory.clear()
+        self._target_surface_memory.clear()
+        self._target_verify_state.clear()
+        self._target_lifecycle_state.clear()
+        self._memory_manager.reset_ids()
+        self._last_target_coord = None
+        self._last_target_centroid = None
+        self._lock_step = -1
+        self._stop_blacklist = set()
+        self._stop_confirm_counts = {}
+        self._last_stop_eligible = True
+        self._last_goal_memory_id = None
+        self._last_goal_num_obs = 0
+        self._last_goal_state = "confirmed"
+        self._last_goal_stale = 0
+        self._last_goal_origin = None
+        self._last_goal_gd_hits = 0
+        self._last_goal_score = 0.0
+
     def _init_gd_mechanism(
         self,
         *,
@@ -163,6 +244,14 @@ class PolicyInitMixin:
         calibration logger remains available log-only via ``GD_CALIB_ENABLE``
         so offline GD calibration does not require the mechanism.
         """
+        self._enable_gd_mechanism = bool(enabled)
+        self._gd_conf_min = float(conf_min)
+        self._gd_max_dist = float(max_dist)
+        self._gd_only_classes = tuple(
+            part.strip().lower()
+            for part in str(gd_only_classes or "").split(",")
+            if part.strip()
+        )
         self._gd_calib = None
         self._gd_calib_logs: List[Dict[str, Any]] = []
         self._gd_calib_error: Optional[str] = None
@@ -249,7 +338,6 @@ class PolicyInitMixin:
         if fusion_style not in ("world", "none"):
             raise ValueError("fusion_style MUST BE 'world' or 'none'")
         self._fusion_style = fusion_style
-        self._last_lock_step: int = 0
         self._preprocessor = TSP3DInputPreprocessor(
             fusion_style=fusion_style,
             map_voxel_size=wm_voxel_size,
@@ -316,8 +404,3 @@ class PolicyInitMixin:
                 min_occupancy_ratio=occ_min_ratio,
             ),
         )
-
-    # ==========================================================================
-    # === Input & Mapping Module ===
-    # ==========================================================================
-

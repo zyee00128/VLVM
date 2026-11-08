@@ -14,6 +14,12 @@ from vlfm.utils.img_utils import pixel_value_within_radius
 from vlfm.vlm.blip2itm import BLIP2ITMClient
 from vlfm.policy.tsp3d_objectnav_policy import TSP3DObjectNavPolicy
 from vlfm.vlm.detections import ObjectDetections
+from vlfm.vlvm.recheck import (
+    MODE_NEAREST,
+    MODE_SEMANTIC,
+    classify as classify_explore_mode,
+    nearest_index as nearest_frontier_index,
+)
 
 try:
     from habitat_baselines.common.tensor_dict import TensorDict
@@ -242,6 +248,21 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
     def _score_frontiers(self, frontiers: np.ndarray) -> List[float]:
         raise NotImplementedError
 
+    def _score_frontiers_split(
+        self, frontiers: np.ndarray
+    ) -> Tuple[List[float], List[float]]:
+        """Return ``(S, h_lam * H1)`` per frontier, the two halves of the score.
+
+        The explore mode gate must look at the **pure semantic score ``S``**:
+        ``h_lam * H1`` is a passability bonus worth ~+0.30 in every indoor
+        frame, so including it shifts the gate by a constant and makes any
+        fixed threshold meaningless.  The default keeps the legacy behaviour
+        (all weight in the first element) so subclasses that only implement
+        ``_score_frontiers`` keep working.
+        """
+        values = self._score_frontiers(frontiers)
+        return list(values), [0.0] * len(values)
+
     def _sort_frontiers_by_value(
         self, observations: "TensorDict", frontiers: np.ndarray
     ) -> Tuple[np.ndarray, List[float]]:
@@ -324,11 +345,78 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
         frontiers = self._observations_cache["frontier_sensor"]
         if np.array_equal(frontiers, np.zeros((1, 2))) or len(frontiers) == 0:
             return self._stop_action
-        best_frontier, best_value = self._get_best_frontier(observations, frontiers)
-        os.environ["DEBUG_INFO"] = f"Best value: {best_value*100:.2f}%"
-        pointnav_action = self._pointnav(best_frontier, stop=False)
 
-        return pointnav_action
+        cfg = getattr(self, "_explore_mode_cfg", None)
+        if cfg is None or not bool(cfg.enable):
+            best_frontier, best_value = self._get_best_frontier(observations, frontiers)
+            os.environ["DEBUG_INFO"] = f"Best value: {best_value*100:.2f}%"
+            return self._pointnav(best_frontier, stop=False)
+
+        s_vals, h_vals = self._score_frontiers_split(frontiers)
+        values = [float(s) + float(h) for s, h in zip(s_vals, h_vals)]
+        if len(values) == 0:
+            return self._stop_action
+        order = np.argsort([-v for v in values])
+        sorted_pts = np.asarray(frontiers, dtype=np.float64)[order]
+        sorted_values = [values[i] for i in order]
+        sorted_s = [float(s_vals[i]) for i in order]
+        robot_xy = np.asarray(
+            self._observations_cache["robot_xy"], dtype=np.float64
+        ).reshape(-1)[:2]
+        top_s = float(sorted_s[0])
+        top_value = float(sorted_values[0])
+        mode, reason = classify_explore_mode(top_s, cfg)
+
+        sem_goal = np.asarray(sorted_pts[0], dtype=np.float64).reshape(-1)[:2]
+        near_idx = nearest_frontier_index(sorted_pts, robot_xy)
+        near_goal = (
+            None
+            if near_idx < 0
+            else np.asarray(sorted_pts[near_idx], dtype=np.float64).reshape(-1)[:2]
+        )
+
+        if mode == MODE_SEMANTIC:
+            best_frontier, best_value = self._get_best_frontier(
+                observations, frontiers
+            )
+            os.environ["DEBUG_INFO"] = (
+                f"Best value: {best_value*100:.2f}% ({reason})"
+            )
+        else:
+            idx = nearest_frontier_index(
+                sorted_pts,
+                robot_xy,
+                sticky_point=self._last_frontier,
+                sticky_radius=float(cfg.sticky_radius),
+            )
+            if idx < 0:
+                return self._stop_action
+            best_frontier = np.asarray(sorted_pts[idx], dtype=np.float64).reshape(-1)[:2]
+            best_value = float(sorted_values[idx])
+            top_two_values = tuple(sorted_values[:2])
+            self._acyclic_enforcer.add_state_action(
+                robot_xy, best_frontier, top_two_values
+            )
+            self._last_value = best_value
+            self._last_frontier = best_frontier
+            os.environ["DEBUG_INFO"] = (
+                "nearest frontier: "
+                f"dist={float(np.linalg.norm(best_frontier - robot_xy)):.2f} "
+                f"value={best_value*100:.2f}%"
+            )
+
+        self._explore_mode_note(
+            mode=mode,
+            reason=reason,
+            top_value=top_s,
+            n_frontiers=int(len(frontiers)),
+            chosen=best_frontier,
+            robot_xy=robot_xy,
+            sem_goal=sem_goal,
+            near_goal=near_goal,
+            value_with_h1=top_value,
+        )
+        return self._pointnav(best_frontier, stop=False)
 
 
 class ITMPolicyV1(BaseITMPolicy):
@@ -359,13 +447,21 @@ class ITMPolicyV1(BaseITMPolicy):
 
     def _score_frontiers(self, frontiers: np.ndarray) -> List[float]:
         """S (region ValueMap radius query) + lambda * H1 (vertical passability)."""
+        s_vals, h_vals = self._score_frontiers_split(frontiers)
+        return [s + h for s, h in zip(s_vals, h_vals)]
+
+    def _score_frontiers_split(
+        self, frontiers: np.ndarray
+    ) -> Tuple[List[float], List[float]]:
+        """``S`` and ``h_lam * H1`` kept apart so the mode gate can use ``S``."""
         h1 = self._compute_h1()
-        values = []
-        for i, (x, y) in enumerate(frontiers):
-            s = self._query_2d_value(x, y)
+        s_vals: List[float] = []
+        h_vals: List[float] = []
+        for (x, y) in frontiers:
+            s_vals.append(self._query_2d_value(x, y))
             h = self._query_2d_map_radius(h1, x, y) if h1 is not None else 0.0
-            values.append(s + self._h_lam * h)
-        return values
+            h_vals.append(self._h_lam * h)
+        return s_vals, h_vals
 
     def _query_2d_value(self, x: float, y: float, radius_m: Optional[float] = None) -> float:
         """

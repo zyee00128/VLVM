@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 
@@ -96,6 +96,9 @@ def apply_s_penalty(
 ) -> List[Tuple[float, np.ndarray, Optional[np.ndarray], List[str]]]:
     """
     S-penalty + admission gate for filtered detections.
+
+    ``conf_override`` 已随 S8 §3 弃用移除；本函数只消费 TSP3D 原始置信，
+    ``sigma_c = conf_f * w_s`` 与所有阈值不变。
 
     Returns [(conf_amp, centroid, near_surface, active_classes)].
 

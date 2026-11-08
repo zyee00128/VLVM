@@ -375,7 +375,7 @@ def dump_phase_g_logs(
     failure_cause: str,
     track_frame_logs: Optional[List[Dict[str, Any]]] = None,
     gd_frame_logs: Optional[List[Dict[str, Any]]] = None,
-    stop_shadow_logs: Optional[List[Dict[str, Any]]] = None,
+    explore_mode_logs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, int]:
     """Write the four-layer Phase-G contract without changing policy behavior."""
     os.makedirs(directory, exist_ok=True)
@@ -415,7 +415,7 @@ def dump_phase_g_logs(
         "track_frames.jsonl": [],
         "gd_frames.jsonl": [],
         "gd_proposals.jsonl": [],
-        "stop_shadow.jsonl": [],
+        "explore_mode.jsonl": [],
     }
     for record in candidate_logs:
         row = {**common, "kind": "candidate", **_jsonable(record)}
@@ -444,12 +444,9 @@ def dump_phase_g_logs(
         row["tp"] = bool(_tp(row))
         outputs["track_frames.jsonl"].append(row)
 
-    for record in stop_shadow_logs or []:
-        row = {**common, "kind": "stop_shadow", **_jsonable(record)}
-        row["tp"] = bool(_tp(row))
-        if row.get("goal") is not None:
-            row["goal_tp"] = bool(_tp({"goal": row.get("goal")}))
-        outputs["stop_shadow.jsonl"].append(row)
+    for record in explore_mode_logs or []:
+        row = {**common, "kind": "explore_mode", **_jsonable(record)}
+        outputs["explore_mode.jsonl"].append(row)
 
     for frame in gd_frame_logs or []:
         frame_row = {**common, "kind": "gd_frame", **_jsonable(frame)}
@@ -493,7 +490,12 @@ def dump_phase_g_logs(
         "n_candidates": len(candidate_logs),
         "n_memory_events": len(memory_event_logs),
         "n_nav_goals": len(nav_goal_logs),
-        "n_stop_shadow": len(stop_shadow_logs or []),
+        "n_explore_frames": len(explore_mode_logs or []),
+        "n_explore_nearest": sum(
+            1
+            for row in explore_mode_logs or []
+            if str(row.get("mode")) != "semantic"
+        ),
         "first_wrong_lock_step": None if first_wrong is None else first_wrong.get("step"),
         "first_wrong_memory_uid": None if first_wrong is None else first_wrong.get("memory_uid"),
         "wrong_stop_before_target_coverage": bool(
@@ -509,6 +511,6 @@ def dump_phase_g_logs(
         "nav_goals": len(nav_goal_logs),
         "gd_frames": len(outputs["gd_frames.jsonl"]),
         "gd_proposals": len(outputs["gd_proposals.jsonl"]),
-        "stop_shadow": len(outputs["stop_shadow.jsonl"]),
+        "explore_mode": len(outputs["explore_mode.jsonl"]),
         "episodes": 1,
     }

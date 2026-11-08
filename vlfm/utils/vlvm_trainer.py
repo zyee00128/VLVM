@@ -702,7 +702,7 @@ class VLVMTrainer(PPOTrainer):
                                 nav_goal_logs=getattr(policy, "_nav_goal_logs", None) or [],
                                 track_frame_logs=getattr(policy, "_track_frame_logs", None) or [],
                                 gd_frame_logs=getattr(policy, "_gd_calib_logs", None) or [],
-                                stop_shadow_logs=getattr(policy, "_stop_shadow_logs", None) or [],
+                                explore_mode_logs=getattr(policy, "_explore_mode_rows", None) or [],
                                 cfg_snapshot=_sp_cfg_snapshot(policy),
                                 episode_stats=episode_stats,
                                 success=int(episode_stats["success"]),

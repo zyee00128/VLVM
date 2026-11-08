@@ -63,7 +63,7 @@ import quaternion as qt  # noqa: E402
 from depth_camera_filtering import filter_depth  # noqa: E402
 from habitat_sim.utils.common import quat_from_angle_axis  # noqa: E402
 
-from vlfm.tsp3d_models.grounding_dino.vocab import (  # noqa: E402
+from vlfm.vlvm.grounding_dino.vocab import (  # noqa: E402
     DEFAULT_VOCAB,
     build_alias_map,
     normalize_phrase,

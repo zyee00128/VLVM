@@ -1,4 +1,7 @@
-"""Recheck mode: explore frontier exhausted -> delayed STOP.
+"""``expl recheck``: explore frontier exhausted -> delayed STOP.
+
+Scope: **explore 侧唯一受控 STOP 入口**。STOP 前的视图质量/负证据核验（S8 §4）
+已于 2026-11-06 删除，见 `Results/VLVM-S8-run3.md`。
 
 Every behaviour has exactly one job:
 
@@ -22,7 +25,9 @@ import numpy as np
 from torch import Tensor
 
 
-class RecheckMixin:
+class ExplRecheckMixin:
+    """Explore-side recheck tour (``expl recheck``)."""
+
     def _init_recheck(
         self,
         *,
@@ -40,6 +45,7 @@ class RecheckMixin:
         self._recheck_idx = 0
         self._recheck_total_steps = 0
         self._recheck_attempted: set = set()
+        self._recheck_relaxed = False
 
     def _log_recheck_event(self, event: str, **fields: Any) -> None:
         """Write one recheck row into the memory-event stream."""
@@ -51,9 +57,14 @@ class RecheckMixin:
         self._log_memory_event(row)
 
     def _recheck_candidates(
-        self, robot_xyz: np.ndarray
+        self, robot_xyz: np.ndarray, relaxed: bool = False
     ) -> List[Dict[str, Any]]:
-        """Selection-ordered memory list for recheck (blacklist NOT filtered)."""
+        """Selection-ordered memory list for recheck (blacklist NOT filtered).
+
+        ``relaxed=True`` is the second-level filter used only when the normal
+        queue is empty: the ``stable`` state and the ``_recheck_attempted``
+        record are no longer excluded, so a fallback waypoint still exists.
+        """
         robot_xy = np.asarray(robot_xyz, dtype=np.float64).reshape(-1)[:2]
         rows: List[Dict[str, Any]] = []
         for cls in [
@@ -73,10 +84,10 @@ class RecheckMixin:
                 if memory_id is None:
                     continue
                 memory_id = str(memory_id)
-                if memory_id in self._recheck_attempted:
+                if not relaxed and memory_id in self._recheck_attempted:
                     continue
                 state_name = str(st.get("lifecycle_state") or "confirmed")
-                if state_name == "stable":
+                if not relaxed and state_name == "stable":
                     continue
                 origin = str(st.get("origin") or "")
                 promoted = bool(st.get("promoted_from_gd_only", False))
@@ -151,12 +162,17 @@ class RecheckMixin:
         rows.sort(key=_selection_key)
         return rows
 
-    def _recheck_begin(self, robot_xyz: np.ndarray) -> bool:
+    def _recheck_begin(
+        self,
+        robot_xyz: np.ndarray,
+        relaxed: bool = False,
+        max_items: Optional[int] = None,
+    ) -> bool:
         """Build the recheck queue once; False when nothing can be checked."""
         if not self._recheck_enabled:
             return False
         try:
-            rows = self._recheck_candidates(robot_xyz)
+            rows = self._recheck_candidates(robot_xyz, relaxed=relaxed)
         except BaseException as exc:  # noqa: BLE001 - recheck must not kill nav
             print(
                 f"[RECHECK] candidate build failed: {type(exc).__name__}: {exc}",
@@ -165,22 +181,26 @@ class RecheckMixin:
             return False
         if not rows:
             return False
+        if max_items is not None:
+            rows = rows[: max(1, int(max_items))]
         self._recheck_queue = rows
         self._recheck_idx = 0
         self._recheck_active = True
         self._recheck_total_steps = 0
+        self._recheck_relaxed = bool(relaxed)
         rows[0]["start_step"] = int(self._num_steps)
         print(
             "[RECHECK] start "
             f"n={len(rows)} step={int(self._num_steps)} "
             f"first={rows[0]['memory_id']} tier={rows[0]['tier']} "
             f"dist={rows[0]['distance']:.2f} "
-            f"blacklisted={rows[0]['blacklisted']}",
+            f"blacklisted={rows[0]['blacklisted']} relaxed={int(relaxed)}",
             flush=True,
         )
         self._log_recheck_event(
             "recheck_start",
             n_candidates=len(rows),
+            relaxed=bool(relaxed),
             candidates=[
                 {
                     "memory_id": r["memory_id"],

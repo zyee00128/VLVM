@@ -10,6 +10,27 @@ import numpy as np
 
 
 class PolicyLoggingMixin:
+    def _init_policy_logging(self) -> None:
+        """Create the per-episode log buffers consumed by the trainer.
+
+        Every list here is drained by ``episode_stats_logger``; keeping them in
+        one place makes it obvious which channels a run writes.
+        """
+        self._detect_logs: List[Dict[str, Any]] = []
+        self._candidate_seq = 0
+        self._candidate_logs: List[Dict[str, Any]] = []
+        self._memory_event_logs: List[Dict[str, Any]] = []
+        self._nav_goal_logs: List[Dict[str, Any]] = []
+        self._track_frame_logs: List[Dict[str, Any]] = []
+        # STOP look-around trace: log-only, lets offline analysis judge whether
+        # extra view/time at the stop gate could ever flip a memory to
+        # stop-eligible.
+        self._lookaround_trace: List[Dict[str, Any]] = []
+
+    def _reset_policy_logging(self) -> None:
+        """Drop last episode's rows; called from ``policy._reset``."""
+        self._init_policy_logging()
+
     @staticmethod
     def _sigma_tier(score: float) -> int:
         """only for log compatibility."""
@@ -20,90 +41,6 @@ class PolicyLoggingMixin:
         if score >= 0.60:
             return 1
         return 0
-
-    def _log_stop_shadow(
-        self,
-        *,
-        chosen_idx: int,
-        chosen_2d: np.ndarray,
-        robot_xy: np.ndarray,
-        dists_2d: np.ndarray,
-        valid: Dict[str, List[Any]],
-    ) -> None:
-        """Append one read-only STOP shadow row for the selected goal.
-
-        This only writes diagnostics; it never changes selection, action, or
-        STOP eligibility.
-        """
-        idx = int(chosen_idx)
-        chosen_2d = np.asarray(chosen_2d, dtype=np.float64).reshape(-1)[:2]
-        robot_xy = np.asarray(robot_xy, dtype=np.float64).reshape(-1)[:2]
-        chosen_state = str(valid["states"][idx])
-        chosen_is_gd_tsp = bool(valid["gd_tsp"][idx])
-        chosen_is_promoted = bool(valid["promoted_gd_only"][idx])
-        chosen_is_gd_only = (
-            bool(valid["gd_only"][idx]) or chosen_state == "gd"
-        )
-        if not (chosen_is_gd_only or chosen_state == "confirmed"):
-            return
-
-        goal_distance = float(np.linalg.norm(chosen_2d - robot_xy))
-        obs = int(valid["obs"][idx])
-        gd_hits = int(valid["gd_hits"][idx])
-        row = {
-            "event": "stop_shadow",
-            "shadow_only": True,
-            "step": int(self._num_steps),
-            "memory_id": valid["memory_ids"][idx],
-            "candidate_id": valid["candidate_ids"][idx],
-            "target_class": str(self._target_object.split("|")[0]),
-            "centroid": np.asarray(
-                valid["centroids"][idx], dtype=np.float64
-            ).reshape(-1)[:3].tolist(),
-            "goal": np.asarray(chosen_2d, dtype=np.float64).reshape(-1)[:2].tolist(),
-            "distance": float(dists_2d[idx]),
-            "goal_distance": goal_distance,
-            "lifecycle_state": chosen_state,
-            "origin": valid["origins"][idx],
-            "gd_only": bool(chosen_is_gd_only),
-            "gd_tsp": bool(chosen_is_gd_tsp),
-            "promoted_from_gd_only": bool(chosen_is_promoted),
-            "sigma_c": float(valid["scores"][idx]),
-            "sigma_band": int(valid["bands"][idx]),
-            "gd_hits": gd_hits,
-            "num_obs": obs,
-            "stale_steps": int(valid["stale"][idx]),
-            "stop_eligible_current": bool(valid["stop_ok"][idx]),
-            "stop_gate_confirm_radius": float(self._stop_gate_radius),
-            "pointnav_stop_radius": float(self._pointnav_stop_radius),
-            "would_stop_radius_0_9": bool(
-                goal_distance <= float(self._pointnav_stop_radius)
-            ),
-            "would_stop_radius_1_2": bool(
-                goal_distance <= float(self._stop_gate_radius)
-            ),
-            "would_stop_numobs_ge3": bool(obs >= 3),
-            "would_stop_numobs_ge5": bool(obs >= 5),
-            "would_stop_gdhits_ge3": bool(gd_hits >= 3),
-            "would_stop_gdhits_ge5": bool(gd_hits >= 5),
-            "would_stop_gd3_r09": bool(
-                goal_distance <= float(self._pointnav_stop_radius)
-                and gd_hits >= 3
-            ),
-            "would_stop_gd5_r09": bool(
-                goal_distance <= float(self._pointnav_stop_radius)
-                and gd_hits >= 5
-            ),
-            "would_stop_obs3_r09": bool(
-                goal_distance <= float(self._pointnav_stop_radius)
-                and obs >= 3
-            ),
-            "would_stop_obs5_r09": bool(
-                goal_distance <= float(self._pointnav_stop_radius)
-                and obs >= 5
-            ),
-        }
-        self._stop_shadow_logs.append(row)
 
     def _log_nav_goal(
         self,
