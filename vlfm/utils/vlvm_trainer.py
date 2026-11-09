@@ -673,7 +673,7 @@ class VLVMTrainer(PPOTrainer):
 
                             os.makedirs(str(det_log_dir), exist_ok=True)
                             det_log_path = os.path.join(
-                                str(det_log_dir), "s4_sp1_detections.jsonl"
+                                str(det_log_dir), "candidate_admission.jsonl"
                             )
                             dump_detection_logs(
                                 det_log_path,
@@ -703,6 +703,8 @@ class VLVMTrainer(PPOTrainer):
                                 track_frame_logs=getattr(policy, "_track_frame_logs", None) or [],
                                 gd_frame_logs=getattr(policy, "_gd_calib_logs", None) or [],
                                 explore_mode_logs=getattr(policy, "_explore_mode_rows", None) or [],
+                                gd_decision_logs=getattr(policy, "_gd_decision_logs", None) or [],
+                                stop_gate_logs=getattr(policy, "_stop_gate_logs", None) or [],
                                 cfg_snapshot=_sp_cfg_snapshot(policy),
                                 episode_stats=episode_stats,
                                 success=int(episode_stats["success"]),

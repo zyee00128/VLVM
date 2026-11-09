@@ -22,6 +22,11 @@ class PolicyLoggingMixin:
         self._memory_event_logs: List[Dict[str, Any]] = []
         self._nav_goal_logs: List[Dict[str, Any]] = []
         self._track_frame_logs: List[Dict[str, Any]] = []
+        # GD routing decisions (already computed by the mechanism; geometry of
+        # the GD<->track association is what the merge thresholds calibrate on).
+        self._gd_decision_logs: List[Dict[str, Any]] = []
+        # STOP-gate frames: rho / stop eligibility / look-around turn count.
+        self._stop_gate_logs: List[Dict[str, Any]] = []
         # STOP look-around trace: log-only, lets offline analysis judge whether
         # extra view/time at the stop gate could ever flip a memory to
         # stop-eligible.
@@ -203,6 +208,80 @@ class PolicyLoggingMixin:
         """Append multiple memory-lifecycle events."""
         if events:
             self._memory_event_logs.extend(events)
+
+    def _log_gd_decisions(self, decisions: List[Dict[str, Any]]) -> None:
+        """One row per GD proposal decision, with the association geometry.
+
+        ``match_dist_xy`` / ``match_iau`` / ``match_containment`` are what the
+        ``gd_calib.merge_*`` thresholds act on; logging them lets the offline
+        audit sweep those thresholds without re-running navigation.
+        """
+        if not getattr(self, "_det_log_dir", None):
+            return
+        for row in decisions or []:
+            self._gd_decision_logs.append(
+                {
+                    "step": int(self._num_steps),
+                    "proposal_id": row.get("proposal_id"),
+                    "canon": row.get("canon"),
+                    "conf": float(row.get("conf", 0.0) or 0.0),
+                    "dist_robot": float(row.get("dist_robot", 0.0) or 0.0),
+                    "depth_ok": bool(row.get("depth_ok", False)),
+                    "in_fov": bool(row.get("in_fov", False)),
+                    "association": row.get("association"),
+                    "route": row.get("route"),
+                    "reason": row.get("reason"),
+                    "match_memory_id": row.get("match_memory_id"),
+                    "match_lifecycle_state": row.get("match_lifecycle_state"),
+                    "match_dist_xy": row.get("match_dist_xy"),
+                    "match_dist_3d": row.get("match_dist_3d"),
+                    "match_iau": row.get("match_iau"),
+                    "match_containment": row.get("match_containment"),
+                    "match_same_object": row.get("match_same_object"),
+                    "occ_status": row.get("occ_status"),
+                    "occ_passed": row.get("occ_passed"),
+                }
+            )
+
+    def _log_stop_gate(
+        self,
+        *,
+        memory_id: Any,
+        rho: float,
+        stop_ok: bool,
+        turns: int,
+        sigma_c: float,
+        lifecycle_state: Optional[str],
+        origin: Optional[str],
+    ) -> None:
+        """One navigate-frame STOP-gate row (rho vs gate radius, turns used).
+
+        Lets the offline audit answer "would a larger stop radius / fewer
+        look-around turns have changed the decision" from a single run.
+        """
+        if not getattr(self, "_det_log_dir", None):
+            return
+        self._stop_gate_logs.append(
+            {
+                "step": int(self._num_steps),
+                "memory_id": memory_id,
+                "rho": float(rho),
+                "stop_ok": bool(stop_ok),
+                "stop_gate_confirm_radius": float(
+                    getattr(self, "_stop_gate_radius", 0.0) or 0.0
+                ),
+                "pointnav_stop_radius": float(
+                    getattr(self, "_pointnav_stop_radius", 0.0) or 0.0
+                ),
+                "turns": int(turns),
+                "stop_gate_turns": int(
+                    getattr(self, "_stop_gate_turns", 0) or 0
+                ),
+                "sigma_c": float(sigma_c),
+                "lifecycle_state": lifecycle_state,
+                "origin": origin,
+            }
+        )
 
     def _log_accumulate_event(
         self,

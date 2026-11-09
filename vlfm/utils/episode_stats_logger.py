@@ -376,6 +376,8 @@ def dump_phase_g_logs(
     track_frame_logs: Optional[List[Dict[str, Any]]] = None,
     gd_frame_logs: Optional[List[Dict[str, Any]]] = None,
     explore_mode_logs: Optional[List[Dict[str, Any]]] = None,
+    gd_decision_logs: Optional[List[Dict[str, Any]]] = None,
+    stop_gate_logs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, int]:
     """Write the four-layer Phase-G contract without changing policy behavior."""
     os.makedirs(directory, exist_ok=True)
@@ -416,6 +418,8 @@ def dump_phase_g_logs(
         "gd_frames.jsonl": [],
         "gd_proposals.jsonl": [],
         "explore_mode.jsonl": [],
+        "gd_decisions.jsonl": [],
+        "stop_gate.jsonl": [],
     }
     for record in candidate_logs:
         row = {**common, "kind": "candidate", **_jsonable(record)}
@@ -447,6 +451,18 @@ def dump_phase_g_logs(
     for record in explore_mode_logs or []:
         row = {**common, "kind": "explore_mode", **_jsonable(record)}
         outputs["explore_mode.jsonl"].append(row)
+
+    for record in gd_decision_logs or []:
+        row = {
+            **common,
+            "kind": "gd_decision",
+            **_jsonable(record),
+        }
+        outputs["gd_decisions.jsonl"].append(row)
+
+    for record in stop_gate_logs or []:
+        row = {**common, "kind": "stop_gate", **_jsonable(record)}
+        outputs["stop_gate.jsonl"].append(row)
 
     for frame in gd_frame_logs or []:
         frame_row = {**common, "kind": "gd_frame", **_jsonable(frame)}

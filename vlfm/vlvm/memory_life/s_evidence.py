@@ -45,7 +45,7 @@ from vlfm.vlvm.memory_life.s_penalty import SPenaltyConfig
 
 _S_CFG = SPenaltyConfig()
 
-DET_FILE = "s4_sp1_detections.jsonl"
+DET_FILE = "candidate_admission.jsonl"
 DIST_BANDS: Tuple[Tuple[float, float], ...] = ((0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 1e9))
 PROPOSAL_THRESHOLDS: Tuple[float, ...] = (0.45, 0.50, 0.55, 0.60)
 

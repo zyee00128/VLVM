@@ -471,3 +471,97 @@ TP% 以各自池内 TP 为分母；precision 为候选级。
 - 0.45 在拟合父分布中的位置：全体约第 50.4 百分位，TP 约第 7.6 百分位，FP 约第 66.1 百分位。
 - 排序上，未观测样本全部低于已观测最小值 0.45；整体位于全候选的底部一半，但在 TP 中只占底部 7.6%。
 - 限制：raw $c$ 有界且非高斯，服务端 top-k 也破坏随机截断假设；该表只用于判断数量级，精确值需降低 `sigma_prop` 重采。
+
+## Ablation
+
+### 0. 定稿参数（运行前锁定）
+
+| 参数 | 定值 | 原值 | 日志依据 |
+| :--- | :---: | :---: | :--- |
+| `occ_min_voxels` | **64** | 8 | 8→64 只损失 1 TP、减 100 FP；再抬到 128 仅再减 76 FP 却丢 5 TP，收益变平 |
+| `occ_min_ratio` | **0.01** | 0.001 | 0.001→0.01 减 135 FP / 丢 11 TP；到 0.03 再减 534 FP 但丢 119 TP（过杀远景目标），取 0.01 为拐点 |
+| `explore_sem_value_min` | **0.15** | 0.14 | 每帧首选 frontier 的 `S`：p50 = 0.119 / p75 = 0.134 / p90 = 0.165；按集看 nearest 占比中位 77.8%、低语义集 56.2%。阈值抬到 0.15 使 semantic 只在 `S` 明显偏高时启用，减少弱信号下的长距离跨房 |
+| `stable_stale_purge` | **90** | 60 | `stable` 删除原因中 stale_purge 占 43/48，且其中仅 5 条为 TP；stale_demote 仍在 60 步（保留），只把 stable 的最终删除预算放宽到 90 步，给 revive 留出窗口 |
+
+### 0.1 机制证据与日志映射
+
+| 机制 | 日志 | 复算项（`offline_audit` 段） | 对应参数 |
+| :--- | :--- | :--- | :--- |
+| 3D 检测 + 输入适配 | `candidates.jsonl` / `track_frames.jsonl` | `thresholds`、`score_distributions` | `sigma_prop`、`fusion_style` |
+| S-penalty 语义准入 | `candidates.jsonl`（`s` / `w_s` / `sigma_c` / `conf` / `tp`） | `s_penalty_branches`、`score_distributions`、`parameter_calibration.t_s_sweep` | `sigma_tar`、`t_S`、`s_min` |
+| occ 几何一致性门 | `candidates.jsonl`（`occ_ratio` / `occ_num_occ` / `occ_reason`） | `admission_funnel`（`occ_rejected`）、`parameter_calibration.occ_gate_sweep` | `occ_min_ratio`、`occ_min_voxels` |
+| 候选准入总览 | `candidates.jsonl` + `candidate_admission.jsonl` | `admission_funnel`（阶段漏斗）、`episode_threshold_coverage` | `sigma_tar`、`provisional_sigma` |
+| provisional/confirmed 生命周期 | `memory_events.jsonl`（`new` / `merge` / `upgrade` / `transition` / `delete` / `revive`） | `lifecycle`（事件构成、delete 原因、transition、upgrade `num_obs`） | `provisional_sigma`、`upgrade_min_obs`、`stable_*` |
+| merge 的新信息判据 | `memory_events.jsonl`（`robot_xy/yaw/step` + `centroid`） | `parameter_calibration.merge_new_info` | `merge_new_info_*` |
+| GD 近场补召 + 正向仲裁 | `gd_frames.jsonl`、`gd_proposals.jsonl`、`gd_decisions.jsonl` | `gd_funnel`（提案密度、`route` / `association` 命中率）、`parameter_calibration.gd_association` | `gd_calib.every_n`、`max_boxes`、`merge_dist`、`merge_iau`、`merge_containment` |
+| 目标选择 | `nav_goals.jsonl` | `selection`（tier / sigma band / distance bucket / switch reason / stop_eligible） | 选择器顺序、`pointnav_stop_radius` |
+| Nav STOP + 近场放弃 | `stop_gate.jsonl` | `parameter_calibration.stop_gate`、`selection.stop_eligible_*` | `stop_gate_confirm_radius`、`stop_gate_turns`、`pointnav_stop_radius` |
+| Explore 双模 frontier | `explore_mode.jsonl` | `parameter_calibration.explore_mode`（`S` 分位、nearest 占比、黑名单规模） | `explore_sem_value_min`、`sticky_radius` |
+| Explore STOP + Recheck | `memory_events.jsonl`（`recheck_start` / `recheck_result` / `recheck_exhausted`） | `parameter_calibration.recheck`、`lifecycle` | `recheck_arrive_steps`、`recheck_enable` |
+| 失败归因 | `episodes.jsonl`（`failure_cause` / `oracle_success`） | `buckets` / `attribution` / `fp` / `never_saw` / `floor_split` | — |
+
+复算入口（只读，不跑仿真）：
+
+```
+PYTHONPATH=$PWD python -m vlfm.vlvm.utils.offline_audit \
+    --run-dir outputs/<run> --json-out outputs/<run>/offline_audit.json \
+    --md-out outputs/<run>/offline_audit.md
+```
+
+JSON 顶层键即各段：`buckets` / `attribution` / `fp` / `never_saw` / `floor_split` /
+`thresholds` / `admission_funnel` / `s_penalty_branches` / `score_distributions` /
+`episode_threshold_coverage` / `lifecycle` / `selection` / `gd_funnel` /
+`parameter_calibration`；`--md-out` 输出 §1–§13 同名表。
+
+### 1. 评测口径
+
+| 项 | 取值 |
+| :--- | :--- |
+| 数据集 | HM3D ObjectNav v1 val 全量，20 场景共 2000 集 |
+| 场景 | `4ok3usBNeis` `5cdEh9F2hJL` `6s7QHgap2fW` `bxsVRursffK` `cvZr5TUy5C5` `Dd4bFSTQ8gi` `DYehNKdT76V` `mL8ThkuaVTM` `mv2HUxq3B53` `Nfvxx8J5NCo` `p53SfW6mjZe` `q3zU7Yy5E5s` `QaLdnwvtxbs` `qyAac8rV8Zk` `svBbv1Pavdk` `TEEsavR23oF` `wcojb4TFT35` `XB4GS9ShBRE` `ziup5kvtCCR` `zt1RVoi7PcG` |
+| 权重 | `data/vlvm_v1/vlvm_v1.pth` |
+| 基线 | 用当前定稿代码重跑 |
+| 单变量 | 每 run 只改一项，不重调阈值、不换权重 |
+| 统计 | n=2000，SR 边际 95% CI ≈ ±2.2 pp；ΔSR < 3 pp 不作结论 |
+| 成本 | 实测 0.48–0.51 s/step × 193–244 step ≈ 93–125 s/集；2000 集约 52–69 h，排程按 65 h |
+| 预算 | 3 卡 × 5 天 = 360 GPU·h；6 个 run × 65 h = 390 GPU·h（5.4 天），按 60 h/run 恰好 120 h |
+| 冒烟 | 每配置先跑 3 集，核对 `resolved_config.yaml` 目标字段生效后再起正式 run |
+
+### 2. 消融配置
+
+override 前缀均为 `habitat_baselines.rl.policy.`。
+
+| # | 配置 | 消融模块 | override | 实现位置 |
+| :--- | :--- | :--- | :--- | :--- |
+| E0 | Full | — | 默认 YAML | — |
+| E1 | w/o 输入适配 | world 8 帧融合 + 视角去重 + 近场刷新 + 距离自适应采样 | `fusion_style=none` | `vlfm/tsp3d_models/fussion_utils/pipeline.py` |
+| E2 | w/o GD | gd-only 补召 + gd-tsp 仲裁；STOP 资格同步放宽到 `tsp-confirmed` | `enable_gd_mechanism=false`、`stop_require_gd=false` | `vlfm/vlvm/grounding_dino/mechanism.py`、`_get_target_object_location` |
+| E3 | w/o 准入门 | occ 一致性门 + S-penalty（$\sigma_c=c\cdot w_S$） | `enable_occ_consistency=false`、`enable_s_penalty=false` | `vlfm/vlvm/memory_life/target_geometric_gating.py`、`s_penalty.py` |
+| E4 | w/o 生命周期 | provisional 门 + stable 池（new_info / trans / delete / revive） | `enable_provisional_gate=false`、`enable_stable_pool=false` | `vlfm/vlvm/memory_life/target_memory_manager.py` |
+| E5 | w/o explore 终止 | 双模 frontier + recheck | `explore_auto_mode=false`、`recheck_enable=false` | `vlfm/vlvm/recheck/explore_mode.py`、`explore_runtime.py`、`expl_recheck.py` |
+
+- E2 的 `stop_require_gd` 为新增开关：当前判定是 `state=="confirmed" and is_gd_tsp`，GD 关闭后无条目可停、SR 恒 0；只改该判定 1 行。
+- E3 两门同关：`geom_status=gate_off`、`w_S=1`，准入退化为 raw $c\ge\sigma_{tar}$，provisional 门仍按 `sigma_c` 分流。
+- E4 关闭 stable 池后 `num_obs` 不再受 new_info 门约束（每次 merge 累加），等价回退到 v1 简化生命周期。
+- E5 双模关闭后 frontier 恒走价值排序；recheck 关闭后 explore 耗尽即 STOP。
+- E1 的 `distance_sample` 仅在 `fusion_style=world` 内生效，关 fusion 即同时关距离自适应采样。
+
+### 3. 排程（3 卡，E0 最后）
+
+| 波次 | 相对时间（按 65 h/run） | 卡0 | 卡1 | 卡2 |
+| :--- | :--- | :--- | :--- | :--- |
+| W1 | 0–65 h | E1 | E2 | E3 |
+| W2 | 65–130 h | E4 | E5 | E0 |
+| 汇总 | 130 h 后 | — | — | — |
+
+- 6 run × 65 h = 390 GPU·h；按实测 52 h 下限为 104 h（4.3 天），60 h 为 120 h（5 天），65 h 为 130 h（5.4 天）。
+- 每 run 独占 1 卡 + 1 套三服务；`CUDA_VISIBLE_DEVICES` 与 `TSP3D_PORT` / `BLIP2ITM_PORT` / `GROUNDING_DINO_PORT` 三套互不重叠。
+- 每配置先跑 3 集冒烟，核对 `resolved_config.yaml` 后起正式 run。
+
+### 4. 汇总口径
+
+| 表 | 内容 |
+| :--- | :--- |
+| 主结果 | 配置 / SR / Oracle / SPL / SoftSPL / steps / ΔSR（vs E0） |
+| 模块诊断 | 各 run `detections/` 下 `candidates.jsonl`、`memory_events.jsonl`、`nav_goals.jsonl`、`episodes.jsonl`：admitted 计数与 precision、gd-only / gd-tsp 事件、状态迁移计数、recheck 与 stop 事件、explore mode 占比 |
+| 判定 | 主判据 SR；ΔSR ≥ 3 pp 且 SPL 同向记为有效，ΔSR < 3 pp 只记录不下结论 |

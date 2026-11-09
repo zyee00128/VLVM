@@ -93,6 +93,7 @@ class ExploreRuntimeMixin:
         sem_goal=None,
         near_goal=None,
         value_with_h1=None,
+        n_blacklisted: int = 0,
     ) -> None:
         """Record one ``explore_mode.jsonl`` row; never changes the action.
 
@@ -118,6 +119,7 @@ class ExploreRuntimeMixin:
             value_with_h1=value_with_h1,
         )
         row["step"] = int(self._num_steps)
+        row["n_blacklisted"] = int(n_blacklisted)
         rows.append(row)
         if str(mode) != "semantic":
             print(

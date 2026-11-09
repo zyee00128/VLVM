@@ -14,15 +14,16 @@
 | 感知与目标定位 | **定稿** | TSP3D 单阶段 3D bbox 回归 |
 **GD Proposer**
 | GD proposer | **定稿** | gd-only 全类别近场补召 + gd-tsp track-only 正向仲裁；gd-only: base gate + gd-only depth_ok, gd-tsp track merge confirmed/provisional 可绕过 depth；stable 直接放弃 |
+| GD 参数 | **定稿** | `gd_calib` 超参块（唯一来源，无 env）：`every_n` 1、`max_boxes` 4、`box_thr` 0.40、caption vocab、merge 0.5/0.3/0.8 |
 **Memory Life Manager**
-| 几何准入 | **定稿** | occ geometry gate（8 体素 / 0.001 / 0.90 自由比）+ `geom_unknown` 保留 |
+| 几何准入 | **定稿** | occ geometry gate（64 体素 / 0.01 / 0.90 自由比）+ `geom_unknown` 保留 |
 | 语义准入 | **定稿** | `S ≤ 0` → 1.0；`S > 0` → `min(1, max(S, s_min) / t_S)`；$$\sigma_c = c·w_S$$ ，`t_S` = 0.14，`s_min` = 0.07 |
 | 记忆与生命周期 | **定稿** | origin：tsp-confirmed / tsp-provisional / gd-tsp / gd-only，lifecycle：confirmed / provisional / stable / gd，行为：Merge (EMA + new_info + merge_gd/tsp) / New / upgrade / trans / delete /revive |
 **Goal Select and Stop**
 | 目标选择 | **定稿** | `gd-tsp > gd-only > confirmed > provisional` |
 | 停止 | **定稿** | 仅 `gd-tsp`可停；TSP-confirmed/provisional、gd-only 不可停；`pointnav_stop_radius=0.90 m` |
 | Explore Recheck | **定稿** | frontier 耗尽 → 记忆航点巡回，队列耗尽就地 STOP |
-| Explore Mode | **定稿** | `S ≥ 0.14` 走语义 frontier，否则最近 frontier（sticky 0.5 m） |
+| Explore Mode | **定稿** | `S ≥ 0.15` 走语义 frontier，否则最近 frontier（sticky 0.5 m） |
 
 ## 1. 系统架构总览
 
@@ -132,10 +133,10 @@ flowchart TB
 | 规则 | 判据 | 结果 |
 | :--- | :--- | :--- |
 | 越界 (out_of_bounds) | 框 AABB 与占据栅格无交集 | 放行，状态 `geom_unknown` |
-| insufficient_occ_voxels | `占据体素 < 8` | 拒绝 |
-| low_occupancy_ratio | `占据体素 / 体积 < 0.001` | 拒绝 |
+| insufficient_occ_voxels | `占据体素 < 64` | 拒绝 |
+| low_occupancy_ratio | `占据体素 / 体积 < 0.01` | 拒绝 |
 | air_penetration | `探索体素 > 16` 且 `自由比 > 0.90 ` 且 `占据体素 < 16` | 拒绝 |
-| arguments | `occ_min_voxels` / `occ_min_ratio` / `free_ratio_rejection_thresh` | 8 / 0.001 / 0.90 |
+| arguments | `occ_min_voxels` / `occ_min_ratio` / `free_ratio_rejection_thresh` | 64 / 0.01 / 0.90 |
 
 **S-penalty**（语义级，后于 occ 门）
 
@@ -151,6 +152,25 @@ flowchart TB
 ### 2.6 GD proposer
 
 > 结论：GD 不是独立覆盖源，而是**近场补召 + TSP3D 正向仲裁**。
+
+**gd_calib 超参（唯一来源，无 `GD_CALIB_*` env）**
+
+| 键 | 值 | 含义 |
+| :--- | :---: | :--- |
+| `every_n` | 1 | 查询节流（步） |
+| `record_every_n` | 1 | 记录节流（仅日志） |
+| `box_thr` | 0.40 | GD logit 阈值 |
+| `max_boxes` | 4 | 单帧提案上限 |
+| `port` | 12181 | GD 服务端口 |
+| `caption_style` | `vocab` | 类别表描述 |
+| `min_dist` | 1.0 m | 近距拒绝 |
+| `erode_iters` / `min_pixels` | 5 / 256 | 2D 框腐蚀与最小面积 |
+| `rand_subarray` | 5000 | 深度点采样数 |
+| `dbscan_eps` / `dbscan_min_points` | 0.2 / 100 | 3D 聚类 |
+| `merge_dist` / `merge_iau` / `merge_containment` | 0.5 / 0.3 / 0.8 | 同物判定（GD ↔ track / candidate） |
+| `new_info_dist` / `new_info_yaw_deg` / `new_info_steps` | 0.2 / 10.0 / 3 | GD 新信息门 |
+| `max_fails` | 2 | 连续 `no_gd` 熔断 |
+| `save_points` / `max_points_saved` / `save_images` / `image_dir` | false / 64 / false / null | 离线调试落盘 |
 
 **两条路径**
 
@@ -244,7 +264,7 @@ geom_unknown 条目最高只到 provisional，即使 $$\sigma_c$$ ≥ 0.60 也�
 | confirmed / provisional | 距上次匹配 ≥ 60 步 | → stable，stale_demote |
 | stable | 连续 near_miss ≥ 5 | 删除，stable_miss_delete |
 | stable | 累计 near_miss ≥ 8 | 删除，stable_total_miss |
-| stable | 距上次匹配 ≥ 60 步 | 删除，stable_stale_purge |
+| stable | 距上次匹配 ≥ 90 步 | 删除，stable_stale_purge |
 | provisional | 每帧检查升级门槛 | → confirmed，见下表 |
 | confirmed / provisional | - | 永不直接删除 |
 
@@ -319,7 +339,7 @@ stable 是 TSP3D 条目的唯一删除池，所有 TSP3D 删除都发生在 stab
 | :--- | :--- |
 | 门控量 | `S` = 价值场 2D 半径查询（0.5 m 中位数）在 `S + λ·H₁` 排序首位 frontier 上的纯语义分，不含 `h_lam·H₁` |
 | 判据 | `S ≥ explore_sem_value_min` → `semantic`；否则 → `nearest` |
-| 阈值 | `explore_sem_value_min` = 0.14（297 集 `S` 分布 p75） |
+| 阈值 | `explore_sem_value_min` = 0.15（价值场 `S` 分布 p75 附近） |
 | `semantic` | 沿用价值排序 `S + λ·H₁`；带「粘住上次 frontier（0.5 m 内且分数不低于上次 +0.01）」与 acyclic 约束 |
 | `nearest` | 取机器人欧氏最近的 frontier；`sticky_radius` = 0.50 m 内保留上次 frontier 的最近者，防止最近的两个 frontier 逐帧交替 |
 | 打分口径 | 每帧一次打分拆成 `S` 与 `λ·H₁` 两半，排序用两者之和，门控只用 `S` |

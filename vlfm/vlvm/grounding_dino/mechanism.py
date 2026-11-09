@@ -227,6 +227,17 @@ class GdMechanism:
         match_candidate = row.get("match_candidate") or {}
         track_state = str(match_track.get("lifecycle_state") or "")
         track_same = bool(match_track.get("same_object"))
+        # Association geometry, logged so offline calibration can justify the
+        # merge_dist / merge_iau / merge_containment settings.
+        for _key in (
+            "memory_id", "dist_xy", "dist_3d", "iau", "containment",
+            "containment_reverse", "same_object", "lifecycle_state", "num_obs",
+        ):
+            decision[f"match_{_key}"] = match_track.get(_key)
+        decision["match_candidate_same"] = bool(
+            match_candidate.get("same_object")
+        )
+        decision["match_candidate_dist"] = match_candidate.get("dist_xy")
         candidate_id = match_candidate.get("candidate_id") or row.get("matched_candidate_id")
         candidate = candidates.get(str(candidate_id)) if candidate_id is not None else None
 

@@ -209,7 +209,7 @@ check_import "habitat / habitat_baselines" 'import habitat, habitat_baselines'
 check_import "habitat-sim（EGL 渲染栈）" 'import habitat_sim' "habitat-sim==0.2.4"
 check_import "frontier_exploration（配置组注册）" 'import frontier_exploration'
 check_import "depth_camera_filtering" 'import depth_camera_filtering'
-check_import "groundingdino（GD 辅助源）" 'import groundingdino'
+check_import "groundingdino（GD 提议源）" 'import groundingdino'
 check_import "opencv / open3d / flask" 'import cv2, open3d, flask'
 check_import "hydra / omegaconf" 'import hydra, omegaconf'
 check_import "gym（habitat 依赖）" 'import gym' "gym==0.23.0"
@@ -232,22 +232,24 @@ hdr "3. 权重与数据（仓库内 data/ 为软链或本地产物）"
 for f in \
   "data/tsp3d_models/model.safetensors|TSP3D 文本分支 RoBERTa 权重" \
   "data/tsp3d_models/config.json|TSP3D 文本分支配置" \
-  "data/groundingdino_swint_ogc.pth|GroundingDINO 权重（GD 辅助源）" \
+  "data/groundingdino_swint_ogc.pth|GroundingDINO 权重（GD 提议源）" \
   "data/pointnav_weights.pth|PointNav 底层策略权重" \
   "data/dummy_policy.pth|habitat-baselines eval 占位权重" ; do
   IFS='|' read -r rel desc <<< "$f"
   if [[ -f "$VLVM_ROOT/$rel" ]]; then ok "$desc  ($(du -h "$VLVM_ROOT/$rel" | cut -f1))"
   else warn "$desc 缺失：$VLVM_ROOT/$rel"; fi
 done
-# 主权重：按在位文件探测（两机档名不同，见上注释）
+# 主权重：最终版固定 data/vlvm_v1/vlvm_v1.pth；历史档名仅作兼容回退
 _found_ck=""
-for _n in tsp3d_scanrefer.pth ckpt_sr3d.pth ckpt_nr3d.pth; do
-  [[ -f "$VLVM_ROOT/data/tsp3d_models/$_n" ]] && { _found_ck="$_n"; break; }
+for _rel in "data/vlvm_v1/vlvm_v1.pth" "data/tsp3d_models/tsp3d_scanrefer.pth" \
+            "data/tsp3d_models/ckpt_sr3d.pth" "data/tsp3d_models/ckpt_nr3d.pth"; do
+  [[ -f "$VLVM_ROOT/$_rel" ]] && { _found_ck="$_rel"; break; }
 done
 if [[ -n "$_found_ck" ]]; then
-  ok "TSP3D 主权重探测命中: $_found_ck ($(du -h "$VLVM_ROOT/data/tsp3d_models/$_found_ck" | cut -f1))（可用 TSP3D_CHECKPOINT=<path> 显式切换）"
+  ok "TSP3D 主权重命中: $_found_ck ($(du -h "$VLVM_ROOT/$_found_ck" | cut -f1))（可用 TSP3D_CHECKPOINT=<path> 显式切换）"
+  [[ "$_found_ck" == *vlvm_v1* ]] || warn "  未命中最终版 data/vlvm_v1/vlvm_v1.pth，当前回退到历史档名"
 else
-  warn "三个候选权重名均未在 $VLVM_ROOT/data/tsp3d_models/ 命中；"
+  warn "未在 data/vlvm_v1/ 与 data/tsp3d_models/ 命中主权重；"
   warn "  启动服务前请：export TSP3D_CHECKPOINT=<实际 .pth 路径>"
 fi
 
@@ -266,6 +268,8 @@ _check_link() {
 }
 _check_link "ObjectNav 数据集" "data/datasets/objectnav/hm3d/v1" "data/datasets"
 [[ $? -eq 2 ]] && warn "  ObjectNav 数据集未就位：候选 data/datasets/objectnav/hm3d/v1（见指南 §3.3）"
+_check_link "ObjectNav MP3D episodes" "data/datasets/objectnav/mp3d/v1"
+[[ $? -eq 2 ]] && info "  MP3D ObjectNav episodes 未就位（仅 MP3D 评测需要，见指南 §3.3）"
 _check_link "HM3D 场景 train" "data/scene_datasets/hm3d_v0.2/train" "data/scene_datasets/hm3d/train"
 [[ $? -eq 2 ]] && info "  HM3D train 未就位（旧机仅需 val 即可跑 eval；要跑 train split 时再补）"
 _check_link "HM3D 场景 val" "data/scene_datasets/hm3d_v0.2/val" "data/scene_datasets/hm3d/val"
@@ -402,7 +406,8 @@ fi
 
 # -----------------------------------------------------------------------------
 hdr "6. 环境变量提示（run 前需设置）"
-CKPT_HINT="$VLVM_ROOT/data/tsp3d_models/tsp3d_scanrefer.pth"
+CKPT_HINT="$VLVM_ROOT/data/vlvm_v1/vlvm_v1.pth"
+[[ -f "$CKPT_HINT" ]] || CKPT_HINT="$VLVM_ROOT/data/tsp3d_models/tsp3d_scanrefer.pth"
 [[ -f "$CKPT_HINT" ]] || CKPT_HINT="$VLVM_ROOT/data/tsp3d_models/ckpt_sr3d.pth"
 ARCH_HINT="12.0"; CUDA_HINT="/usr/local/cuda-12.8"
 [[ "$TORCH_MAJOR" == "2" ]] || { ARCH_HINT="8.6"; CUDA_HINT="/usr/local/cuda-11.3"; }
@@ -410,15 +415,21 @@ BERT_HINT=""
 for _b in data/bert-base-uncased data/tsp3d_models/bert-base-uncased; do
   [[ -d "$VLVM_ROOT/$_b" ]] && { BERT_HINT="$VLVM_ROOT/$_b"; break; }
 done
+if [[ -n "$BERT_HINT" ]]; then
+  BERT_HINT_LINE="export LAVIS_BERT_MODEL_PATH=$BERT_HINT"
+else
+  BERT_HINT_LINE="# （本机无 LAVIS BERT 目录，可不设；LAVIS 走 HF 缓存）"
+fi
 cat <<EOF
   export PYTHONPATH=$VLVM_ROOT:\$PYTHONPATH
   export HF_ENDPOINT=https://hf-mirror.com
   export TSP3D_DATA_PATH=$VLVM_ROOT/data/tsp3d_models/
   export TSP3D_CHECKPOINT=$CKPT_HINT
-  ${BERT_HINT:+export LAVIS_BERT_MODEL_PATH=$BERT_HINT}${BERT_HINT:-# （本机无 LAVIS BERT 目录，可不设；LAVIS 走 HF 缓存）}
+  ${BERT_HINT_LINE}
   export EGL_PLATFORM=surfaceless
   # 端口：TSP3D_PORT=12186 / BLIP2ITM_PORT=12182 / GROUNDING_DINO_PORT=12181
-  # scripts/my_eval.sh 与 scripts/launch_vlm_servers.sh 已内置以上设置
+  # scripts/launch_vlm_servers.sh 已内置以上设置；评测入口 scripts/nav_vlvm.sh [hm3d|mp3d|both]
+  # 策略参数（GD/gd_calib/recheck/explore）全部在 config/experiments/vlvm_objectnav_hm3d.yaml，无 env
 EOF
 if [[ $DO_SETUP -eq 1 ]]; then
   if [[ -d "$CUDA_HINT" ]]; then

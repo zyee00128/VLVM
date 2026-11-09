@@ -9,8 +9,8 @@
 #
 #      | 机器 | GPU / CUDA | conda 环境 | 工作区 $WS | 关键差异 |
 #      | :-- | :-- | :-- | :-- | :-- |
-#      | 旧机（当前实验机） | RTX 3090 / cu113 | `vlfm` | `/root/autodl-tmp` | torch 1.12.1 |
-#      | 新机（机器 3） | RTX 5080 / cu128 | `vlvm`   | `/home/iair/vlvm` | torch 2.8.0 |
+#      | 旧机（历史，A/B 对照用） | RTX 3090 / cu113 | `vlfm` | `/root/autodl-tmp` | torch 1.12.1 |
+#      | 新机（**最终实验机**） | RTX 5080 / cu128 | `vlvm`   | `/home/iair/vlvm` | torch 2.8.0 |
 #
 #      差异仅：torch / torchvision 安装源、mmcv 构建方式、mmengine 版本（其余共用）。
 #   2. `vlvm_env_export.yml` 是旧 RTX 3090/cu113 的历史快照；RTX 5080 不可原样恢复。
@@ -85,9 +85,13 @@ hydra-core==1.3.4
 omegaconf==2.3.1
 tensorboard==2.8.0
 PyYAML==6.0.3
+    # 策略参数唯一来源：config/experiments/vlvm_objectnav_hm3d.yaml
+    # （准入 / gd_calib / 生命周期 / STOP 门 / explore 双模 / recheck 均为 Hydra 超参，无 env）
 
-# --- 7. Grounding-DINO 本地源码（editable）-----------------------------------
+# --- 7. Grounding-DINO 本地源码（editable，导航主线依赖）--------------------
 GroundingDINO @ file://$VLVM/GroundingDINO                   # PATH
+    # 不再只是备选：gd-only 近场补召 + gd-tsp 正向仲裁常开，服务端口 12181；
+    # 权重 data/groundingdino_swint_ogc.pth 必须就位。
 addict==2.4.0
 yapf==0.43.0
 supervision==0.6.0

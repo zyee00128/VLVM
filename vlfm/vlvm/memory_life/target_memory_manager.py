@@ -91,7 +91,7 @@ class MemoryManagerConfig:
     # S5-S2 lifecycle.  Unmatched candidates may create a memory only when
     # the independent provisional gate supplies an initial state.
     confirmed_to_stable_misses: int = 3
-    provisional_to_stable_misses: int = 2
+    provisional_to_stable_misses: int = 3
     # S5 runtime upgrade: a provisional entry that is re-observed up close
     # becomes stop-eligible.  Evidence, not confidence, drives the promotion.
     # S6gd1: the only ordinary upgrade criterion is evidence count.  The
@@ -100,7 +100,7 @@ class MemoryManagerConfig:
     upgrade_min_obs: int = 4
 
     # S6: merge evidence gate + `stable` deletion pool.
-    enable_stable_pool: bool = False      # master switch for the S6 lifecycle
+    enable_stable_pool: bool = True       # master switch for the S6 lifecycle
     merge_into_stable: bool = False       # never absorb evidence into a `stable` entry
     # S6 GD pool: gd-only has its own state and is never deleted; gd-tsp is a
     # confirmed entry.  No TTL or TTL-shadow mechanism.
@@ -109,8 +109,8 @@ class MemoryManagerConfig:
     merge_new_info_yaw: float = 10.0      # yaw delta (deg) that counts as a new observation
     merge_new_info_steps: int = 3         # step gap that counts as a new observation
     stable_stale_purge: int = 60          # frames since the last match -> delete
-    stable_miss_delete: int = 3           # consecutive near-field misses inside `stable`
-    stable_total_miss: int = 6            # cumulative near-field misses (a revive does not reset it)
+    stable_miss_delete: int = 5           # consecutive near-field misses inside `stable`
+    stable_total_miss: int = 8            # cumulative near-field misses (a revive does not reset it)
     stable_revive_radius: float = 0.8     # revive radius (m)
     stable_revive_window: int = 20        # revive window (frames since the last match)
     stable_revive_min_sigma: float = 0.50 # revive candidate sigma_c floor

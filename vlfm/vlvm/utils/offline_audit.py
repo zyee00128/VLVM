@@ -13,7 +13,18 @@ Sections
 3. ``fp``          : ``false_positive`` split by the same ladder + lock metadata.
 4. ``never_saw``   : stairs-required vs feasible, candidate volume, trajectory coverage.
 5. ``thresholds``  : per-class ``sigma_c`` calibration on candidate-level TP/FP labels.
-6. ``fusion``      : recompute the S8 section-3 AUC claim (``c_raw`` vs ``c_fused_*``).
+6. ``admission_funnel``: occ -> S-penalty -> provisional gate 的候选级漏斗。
+7. ``s_penalty_branches``: post-occ 三分支（covered-high/low/uncovered）× 是否准入。
+8. ``score_distributions``: raw conf / ``sigma_c`` / ``S`` 的分位与分箱（post-occ）。
+9. ``episode_threshold_coverage``: 各阈值下有 TP / 有 FP / 仅 TP 的 episode 数。
+10. ``lifecycle`` : 事件构成、delete 原因、transition、upgrade ``num_obs``。
+11. ``selection`` : tier / sigma band / distance bucket / switch reason 分布。
+12. ``gd_funnel`` : GD 提案密度、路由与关联命中率。
+13. ``parameter_calibration``: single-run counterfactual curves for the thresholds
+                     that are argued from logs instead of A/B runs: ``sigma_tar``,
+                     ``t_S``, occ gate, GD association geometry, ``stop_gate_turns``,
+                     ``recheck_arrive_steps``, ``explore_sem_value_min`` and the
+                     stop radius sanity check.
 
 Data contract (see ``vlfm/utils/episode_stats_logger.py``)
 ----------------------------------------------------------
@@ -24,17 +35,21 @@ Data contract (see ``vlfm/utils/episode_stats_logger.py``)
                         admission flag after the provisional gate.
 * ``memory_events.jsonl`` ``memory_uid`` -> ``tp`` (memory-level identity label).
 * ``nav_goals.jsonl``    selected goal per step; ``tp`` labels the selected centroid.
-* ``stop_shadow.jsonl``  per-step STOP-rule re-evaluation; ``stop_eligible_current``.
 * ``gd_frames.jsonl``    per-frame robot pose (streamed; only xy/z kept).
-* ``fusion_field.jsonl`` ``fusion_candidate`` rows are **row-aligned** with the
-                        ``candidates.jsonl`` rows that carry ``c_raw`` (same order).
+* ``gd_proposals.jsonl`` one row per GD proposal（``tp`` 供 `gd_funnel` 关联用）。
+* ``gd_decisions.jsonl`` one row per GD proposal/merge decision, with ``match_*``
+                        geometry (dist_xy / dist_3d / iau / containment).
+* ``stop_gate.jsonl``   one row per navigate frame inside ``stop_gate_confirm_radius``.
+* ``explore_mode.jsonl`` per explore step: ``mode`` / ``sem_s`` / ``n_blacklisted``.
+* ``candidate_admission.jsonl`` per-episode ``n_det`` + per-detection admission rows;
+  older runs name it ``s4_sp1_detections.jsonl``（作为回退读取）。
 
 Usage
 -----
     PYTHONPATH=$PWD python -m vlfm.vlvm.utils.offline_audit \
-        --run-dir outputs/s8_fusion_shadow_3scene_2026-11-04_215549 \
-        --json-out outputs/s8_fusion_shadow_3scene_2026-11-04_215549/offline_audit.json \
-        --md-out /tmp/offline_audit.md
+        --run-dir outputs/hm3d_full_2026-11-09_162836_final3 \
+        --json-out outputs/hm3d_full_2026-11-09_162836_final3/offline_audit.json \
+        --md-out outputs/hm3d_full_2026-11-09_162836_final3/offline_audit.md
 """
 from __future__ import annotations
 
@@ -185,12 +200,10 @@ def build_episode_index(
     candidates: List[Dict[str, Any]],
     nav_goals: List[Dict[str, Any]],
     memory_events: List[Dict[str, Any]],
-    stop_shadow: List[Dict[str, Any]],
 ) -> Dict[EpKey, Dict[str, Any]]:
     cand_by = group_by_episode(candidates)
     nav_by = group_by_episode(nav_goals)
     mem_by = group_by_episode(memory_events)
-    stop_by = group_by_episode(stop_shadow)
 
     index: Dict[EpKey, Dict[str, Any]] = {}
     for row in episodes:
@@ -198,11 +211,11 @@ def build_episode_index(
         cands = cand_by.get(key, [])
         navs = sorted(nav_by.get(key, []), key=lambda r: int(r.get("step") or 0))
         mems = mem_by.get(key, [])
-        stops = stop_by.get(key, [])
 
         tp_cands = [c for c in cands if c.get("tp")]
         tp_admitted = [c for c in tp_cands if c.get("admitted")]
         tp_navs = [g for g in navs if g.get("tp")]
+        eligible_navs = [g for g in navs if g.get("stop_eligible")]
         tp_mems = {str(m.get("memory_uid")) for m in mems if m.get("tp") and m.get("memory_uid")}
 
         final_nav = navs[-1] if navs else None
@@ -220,9 +233,9 @@ def build_episode_index(
             "n_nav_goals": len(navs),
             "final_nav": final_nav,
             "first_nav": navs[0] if navs else None,
-            "stop_eligible_ever": any(bool(s.get("stop_eligible_current")) for s in stops),
-            "stop_goal_tp_ever": any(bool(s.get("goal_tp")) for s in stops),
-            "n_stop_shadow": len(stops),
+            "stop_eligible_ever": bool(eligible_navs),
+            "stop_goal_tp_ever": any(bool(g.get("tp")) for g in eligible_navs),
+            "n_stop_eligible_rows": len(eligible_navs),
         }
     return index
 
@@ -768,47 +781,549 @@ def threshold_calibration(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# section 6: fusion AUC recomputation
+# parameter calibration (single-run, log-only counterfactuals)
 # ---------------------------------------------------------------------------
 
 
-def fusion_recheck(candidates: List[Dict[str, Any]], fusion_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    cand_with_raw = [c for c in candidates if c.get("c_raw") is not None]
-    fusion_cands = [r for r in fusion_rows if r.get("kind") == "fusion_candidate"]
-    n = min(len(cand_with_raw), len(fusion_cands))
-    aligned = 0
-    for a, b in zip(cand_with_raw[:n], fusion_cands[:n]):
-        if (
-            a.get("scene") == b.get("scene")
-            and int(a.get("episode_id")) == int(b.get("episode_id"))
-            and int(a.get("step") or 0) == int(b.get("step") or 0)
-            and abs(float(a["c_raw"]) - float(b["c_raw"])) < 1e-9
-        ):
-            aligned += 1
+def _quant(values: Sequence[float], q: float) -> Optional[float]:
+    data = sorted(float(v) for v in values if v is not None and math.isfinite(float(v)))
+    if not data:
+        return None
+    return data[min(len(data) - 1, int(len(data) * q))]
 
-    labels = [bool(a.get("tp")) for a in cand_with_raw[:n]]
 
-    def score(field: str) -> Optional[float]:
-        pos = [float(b[field]) for b, l in zip(fusion_cands[:n], labels) if l and b.get(field) is not None]
-        neg = [float(b[field]) for b, l in zip(fusion_cands[:n], labels) if not l and b.get(field) is not None]
-        return auc(pos, neg)
+def parameter_calibration(
+    det: str,
+    episodes: List[Dict[str, Any]],
+    candidates: List[Dict[str, Any]],
+    nav_goals: List[Dict[str, Any]],
+    memory_events: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Threshold curves computed from one run's logs (no simulator needed).
 
-    neg_rows = [r for r in fusion_rows if r.get("kind") == "fusion_negative"]
-    return {
-        "n_candidates_with_raw": len(cand_with_raw),
-        "n_fusion_candidates": len(fusion_cands),
-        "row_aligned": aligned,
-        "aligned_ratio": rate(aligned, n),
-        "auc": {
-            "c_raw": score("c_raw"),
-            "c_vol_pts": score("c_vol_pts"),
-            "c_vol_box": score("c_vol_box"),
-            "c_active": score("c_active"),
-        },
-        "n_fusion_negative_rows": len(neg_rows),
-        "neg_triggered_candidates": sum(1 for r in fusion_cands if r.get("neg_triggered")),
-        "neg_triggered_negative_rows": sum(1 for r in neg_rows if r.get("neg_triggered")),
+    Covers the parameters whose value can be argued from behaviour logs:
+    ``sigma_tar`` / ``t_S`` / occ gate (admission), ``gd_calib.merge_*``
+    (association geometry), ``stop_gate_turns`` / ``pointnav_stop_radius``,
+    ``recheck_arrive_steps`` and ``explore_sem_value_min``.
+    """
+    out: Dict[str, Any] = {}
+    occ = [c for c in candidates if c.get("occ_passed")]
+
+    # ---- admission: sigma_tar / t_S / occ ----
+    def admit_rows(rows: List[Dict[str, Any]], sigma_thr: float, t_s: Optional[float]):
+        tp = fp = 0
+        for row in rows:
+            c = float(row.get("conf") or 0.0)
+            if t_s is None:
+                sigma = float(row.get("conf_amp") or 0.0)
+            else:
+                s = row.get("s")
+                s = 0.0 if s is None else float(s)
+                w = 1.0 if s <= 0.0 else min(1.0, max(s, 0.07) / t_s)
+                sigma = c * w
+            if sigma >= sigma_thr:
+                if row.get("tp"):
+                    tp += 1
+                else:
+                    fp += 1
+        return {"tp": tp, "fp": fp, "precision": (tp / (tp + fp)) if tp + fp else None}
+
+    out["sigma_tar_sweep"] = {
+        str(t): admit_rows(occ, t, None) for t in (0.55, 0.58, 0.60, 0.62, 0.65)
     }
+    out["t_s_sweep"] = {
+        str(t): admit_rows(occ, 0.60, t) for t in (0.10, 0.12, 0.14, 0.16, 0.18)
+    }
+    out["occ_gate_sweep"] = {
+        "min_ratio": {
+            str(t): admit_rows(
+                [r for r in occ if (r.get("occ_ratio") or 0) >= t], 0.60, None
+            )
+            for t in (0.001, 0.005, 0.01, 0.02, 0.03)
+        },
+        "min_voxels": {
+            str(t): admit_rows(
+                [r for r in occ if (r.get("occ_num_occ") or 0) >= t], 0.60, None
+            )
+            for t in (8, 16, 32, 64, 128)
+        },
+    }
+
+    # ---- GD association geometry ----
+    gd = load_jsonl(os.path.join(det, "gd_decisions.jsonl"))
+    same = [r for r in gd if r.get("match_same_object")]
+    diff = [r for r in gd if not r.get("match_same_object")]
+    out["gd_association"] = {
+        "rows": len(gd),
+        "same_object": len(same),
+        "matched_dist_xy": {
+            "same_p50": _quant([r.get("match_dist_xy") for r in same], 0.5),
+            "same_p90": _quant([r.get("match_dist_xy") for r in same], 0.9),
+            "diff_p10": _quant([r.get("match_dist_xy") for r in diff], 0.1),
+            "diff_p50": _quant([r.get("match_dist_xy") for r in diff], 0.5),
+        },
+        "matched_iau": {
+            "same_p50": _quant([r.get("match_iau") for r in same], 0.5),
+            "diff_p90": _quant([r.get("match_iau") for r in diff], 0.9),
+        },
+        # Gate replay: keep the logged iau / containment thresholds, sweep dist.
+        "merge_dist_sweep": {
+            str(t): {
+                "rows": sum(
+                    1
+                    for r in gd
+                    if (r.get("match_dist_xy") or 1e9) <= t
+                    and (r.get("match_iau") or 0.0) >= 0.3
+                    and (r.get("match_containment") or 0.0) >= 0.8
+                ),
+                "same": sum(
+                    1
+                    for r in same
+                    if (r.get("match_dist_xy") or 1e9) <= t
+                    and (r.get("match_iau") or 0.0) >= 0.3
+                    and (r.get("match_containment") or 0.0) >= 0.8
+                ),
+            }
+            for t in (0.3, 0.5, 0.7, 1.0)
+        },
+    }
+
+    # ---- STOP gate: rho at stop / look-around turns ----
+    gate = load_jsonl(os.path.join(det, "stop_gate.jsonl"))
+    stops = [r for r in gate if r.get("stop_ok") and (r.get("rho") or 1e9) <= 3.0]
+    out["stop_gate"] = {
+        "rows": len(gate),
+        "stop_ok_rows": len(stops),
+        "rho_at_stop_p50": _quant([r.get("rho") for r in stops], 0.5),
+        "rho_at_stop_p90": _quant([r.get("rho") for r in stops], 0.9),
+        "turns_p50": _quant([r.get("turns") for r in gate], 0.5),
+        "turns_p90": _quant([r.get("turns") for r in gate], 0.9),
+    }
+
+    # ---- recheck arrival budget ----
+    rc = [r for r in memory_events if r.get("event") == "recheck_result"]
+    arrived = [r.get("steps_used") for r in rc if r.get("outcome") == "arrived"]
+    timeouts = [r for r in rc if r.get("outcome") == "arrive_timeout"]
+    out["recheck"] = {
+        "results": len(rc),
+        "arrived": len(arrived),
+        "steps_p90": _quant(arrived, 0.9),
+        "steps_max": max(arrived) if arrived else None,
+        "timeouts": len(timeouts),
+        "timeout_steps_max": max(
+            [r.get("steps_used") or 0 for r in timeouts], default=None
+        ),
+    }
+
+    # ---- merge new_info gate replay (dist / yaw / steps margins) ----
+    per_mem: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+    for row in memory_events:
+        if row.get("event") in ("merge", "gd_tsp_merge", "gd_only_merge"):
+            per_mem[str(row.get("memory_uid"))].append(row)
+    d_yaw: List[float] = []
+    d_steps: List[float] = []
+    d_dist: List[float] = []
+    for seq in per_mem.values():
+        seq.sort(key=lambda r: r.get("step") or 0)
+        for prev, cur in zip(seq, seq[1:]):
+            y0, y1 = prev.get("robot_yaw"), cur.get("robot_yaw")
+            if y0 is not None and y1 is not None:
+                delta = abs(math.degrees(float(y1)) - math.degrees(float(y0))) % 360.0
+                d_yaw.append(min(delta, 360.0 - delta))
+            if prev.get("step") is not None and cur.get("step") is not None:
+                d_steps.append(float(cur["step"]) - float(prev["step"]))
+            c0, c1 = prev.get("centroid"), cur.get("centroid")
+            if c0 and c1 and len(c0) == len(c1):
+                d_dist.append(
+                    math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(c0, c1)))
+                )
+    out["merge_new_info"] = {
+        "rows": len(d_yaw),
+        "d_yaw_p50": _quant(d_yaw, 0.5),
+        "d_yaw_p90": _quant(d_yaw, 0.9),
+        "d_steps_p50": _quant(d_steps, 0.5),
+        "d_centroid_shift_p50": _quant(d_dist, 0.5),
+        "share_yaw_ge_10": (
+            sum(1 for v in d_yaw if v >= 10.0) / len(d_yaw) if d_yaw else None
+        ),
+        "share_steps_ge_3": (
+            sum(1 for v in d_steps if v >= 3.0) / len(d_steps) if d_steps else None
+        ),
+    }
+
+    # ---- explore mode gate ----
+    em = load_jsonl(os.path.join(det, "explore_mode.jsonl"))
+    sem = [r.get("sem_s") for r in em]
+    out["explore_mode"] = {
+        "rows": len(em),
+        "sem_s_p50": _quant(sem, 0.5),
+        "sem_s_p75": _quant(sem, 0.75),
+        "sem_s_p90": _quant(sem, 0.9),
+        "nearest_share": (
+            sum(1 for r in em if r.get("mode") != "semantic") / len(em)
+            if em
+            else None
+        ),
+        "blacklisted_p50": _quant([r.get("n_blacklisted") for r in em], 0.5),
+    }
+
+    # ---- distance to the selected nav point (stop-radius sanity) ----
+    per_ep: Dict[EpKey, float] = {}
+    known_eps = {ep_key(r) for r in episodes}
+    for row in nav_goals:
+        key = ep_key(row)
+        if key not in known_eps:
+            continue
+        dist = row.get("distance")
+        if dist is None:
+            continue
+        if key not in per_ep or float(dist) < per_ep[key]:
+            per_ep[key] = float(dist)
+    succ_eps = {ep_key(r) for r in episodes if r.get("success")}
+    succ = [v for k, v in per_ep.items() if k in succ_eps]
+    out["goal_distance"] = {
+        "episodes": len(per_ep),
+        "min_dist_p50": _quant(list(per_ep.values()), 0.5),
+        "succ_min_dist_p50": _quant(succ, 0.5),
+        "succ_min_dist_p90": _quant(succ, 0.9),
+    }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# lifecycle / selection / GD / admission evidence
+# ---------------------------------------------------------------------------
+
+
+def _counter_rows(counter: collections.Counter, tp_counter: collections.Counter) -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": str(name),
+            "n": n,
+            "tp": tp_counter.get(name, 0),
+            "tp_rate": (tp_counter.get(name, 0) / n) if n else None,
+        }
+        for name, n in counter.most_common()
+    ]
+
+
+def lifecycle_stats(memory_events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """State-machine evidence: event mix, delete reasons, transitions, upgrades."""
+    events = collections.Counter()
+    events_tp = collections.Counter()
+    deletes = collections.Counter()
+    deletes_tp = collections.Counter()
+    transitions = collections.Counter()
+    transitions_tp = collections.Counter()
+    upgrade_obs: List[float] = []
+    revive_rows = 0
+    for row in memory_events:
+        name = str(row.get("event"))
+        events[name] += 1
+        if row.get("tp"):
+            events_tp[name] += 1
+        if name == "delete":
+            reason = str(row.get("reason") or row.get("delete_reason"))
+            deletes[reason] += 1
+            if row.get("tp"):
+                deletes_tp[reason] += 1
+        elif name == "transition":
+            reason = f"{row.get('from_state')}->{row.get('to_state') or row.get('reason')}"
+            transitions[reason] += 1
+            if row.get("tp"):
+                transitions_tp[reason] += 1
+        elif name == "upgrade" and row.get("num_obs") is not None:
+            upgrade_obs.append(float(row["num_obs"]))
+        if row.get("revive_count"):
+            revive_rows += 1
+    return {
+        "events": _counter_rows(events, events_tp),
+        "delete_reasons": _counter_rows(deletes, deletes_tp),
+        "transitions": _counter_rows(transitions, transitions_tp),
+        "upgrade_num_obs": quantiles(upgrade_obs),
+        "upgrade_rows": len(upgrade_obs),
+        "rows_with_revive_history": revive_rows,
+    }
+
+
+def selection_stats(nav_goals: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Selection evidence: tier / sigma band / distance bucket / switch reason."""
+    tiers = collections.Counter()
+    tiers_tp = collections.Counter()
+    bands = collections.Counter()
+    buckets = collections.Counter()
+    switches = collections.Counter()
+    eligible = 0
+    eligible_tp = 0
+    per_ep: Dict[EpKey, int] = collections.Counter()
+    for row in nav_goals:
+        tier = str(row.get("selection_tier_name"))
+        tiers[tier] += 1
+        if row.get("tp"):
+            tiers_tp[tier] += 1
+        if row.get("sigma_band") is not None:
+            bands[str(row["sigma_band"])] += 1
+        if row.get("distance_bucket") is not None:
+            buckets[str(row["distance_bucket"])] += 1
+        switches[str(row.get("switch_reason"))] += 1
+        if row.get("stop_eligible"):
+            eligible += 1
+            if row.get("tp"):
+                eligible_tp += 1
+        per_ep[ep_key(row)] += 1
+    return {
+        "rows": len(nav_goals),
+        "tiers": _counter_rows(tiers, tiers_tp),
+        "sigma_bands": [
+            {"name": k, "n": n} for k, n in sorted(bands.items(), key=lambda kv: kv[0])
+        ],
+        "distance_buckets": [
+            {"name": k, "n": n}
+            for k, n in sorted(buckets.items(), key=lambda kv: float(kv[0]))
+        ],
+        "switch_reasons": _counter_rows(switches, collections.Counter()),
+        "stop_eligible_rows": eligible,
+        "stop_eligible_tp_rate": (eligible_tp / eligible) if eligible else None,
+        "goals_per_episode": quantiles([float(v) for v in per_ep.values()]),
+    }
+
+
+def gd_funnel(
+    gd_proposals: List[Dict[str, Any]],
+    gd_decisions: List[Dict[str, Any]],
+    n_frames: int,
+) -> Dict[str, Any]:
+    """GD 补召与仲裁的证据链：提案密度、路由分布、关联命中率。"""
+    tp_by_proposal: Dict[Tuple[str, Any, str], bool] = {}
+    for row in gd_proposals:
+        tp_by_proposal[
+            (str(row.get("scene")), row.get("episode_id"), str(row.get("proposal_id")))
+        ] = bool(row.get("tp"))
+    routes = collections.Counter()
+    routes_tp = collections.Counter()
+    assoc = collections.Counter()
+    assoc_tp = collections.Counter()
+    same = 0
+    for row in gd_decisions:
+        key = (str(row.get("scene")), row.get("episode_id"), str(row.get("proposal_id")))
+        tp = tp_by_proposal.get(key, False)
+        route = str(row.get("route"))
+        routes[route] += 1
+        if tp:
+            routes_tp[route] += 1
+        a = str(row.get("association"))
+        assoc[a] += 1
+        if tp:
+            assoc_tp[a] += 1
+        if row.get("match_same_object"):
+            same += 1
+    props_per_ep: Dict[EpKey, int] = collections.Counter()
+    for row in gd_proposals:
+        props_per_ep[ep_key(row)] += 1
+    dec_per_ep: Dict[EpKey, int] = collections.Counter()
+    for row in gd_decisions:
+        dec_per_ep[ep_key(row)] += 1
+    conf = [float(r.get("conf") or 0.0) for r in gd_proposals]
+    return {
+        "frames": n_frames,
+        "proposals": len(gd_proposals),
+        "decisions": len(gd_decisions),
+        "proposals_per_100_frames": (
+            (100.0 * len(gd_proposals) / n_frames) if n_frames else None
+        ),
+        "proposals_per_episode": quantiles([float(v) for v in props_per_ep.values()]),
+        "decisions_per_episode": quantiles([float(v) for v in dec_per_ep.values()]),
+        "proposal_conf": quantiles(conf),
+        "routes": _counter_rows(routes, routes_tp),
+        "associations": _counter_rows(assoc, assoc_tp),
+        "match_same_object_rows": same,
+    }
+
+
+def admission_funnel(
+    candidates: List[Dict[str, Any]],
+    admission_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """occ -> S-penalty -> provisional gate 的准入漏斗（候选级）。"""
+    stages: List[Dict[str, Any]] = []
+
+    def _append(name: str, rows: List[Dict[str, Any]]) -> None:
+        tp = sum(1 for r in rows if r.get("tp"))
+        stages.append(
+            {
+                "stage": name,
+                "n": len(rows),
+                "tp": tp,
+                "fp": len(rows) - tp,
+                "precision": (tp / len(rows)) if rows else None,
+            }
+        )
+
+    _append("all_candidates", candidates)
+    occ_rej = [r for r in candidates if r.get("reject") == "occ"]
+    _append("occ_rejected", occ_rej)
+    post_occ = [r for r in candidates if r.get("reject") != "occ"]
+    _append("post_occ", post_occ)
+    s_adm = [r for r in post_occ if r.get("s_penalty_admitted")]
+    _append("s_penalty_admitted", s_adm)
+    gate_rej = [
+        r
+        for r in candidates
+        if r.get("provisional_gate_outcome") == "rejected"
+        and r.get("reject") != "occ"
+    ]
+    _append("provisional_gate_rejected", gate_rej)
+    merged = [
+        r for r in candidates if r.get("provisional_gate_outcome") == "merge_existing"
+    ]
+    _append("merge_existing", merged)
+    admitted = [r for r in candidates if r.get("admitted")]
+    _append("admitted_final", admitted)
+    counts = collections.Counter(ep_key(r) for r in candidates)
+    checked = 0
+    mismatched = 0
+    for row in admission_rows:
+        if row.get("n_det") is None:
+            continue
+        checked += 1
+        if int(row.get("n_det")) != counts.get(ep_key(row), 0):
+            mismatched += 1
+    return {
+        "stages": stages,
+        "admission_rows": len(admission_rows),
+        "episodes_checked": checked,
+        "episodes_with_n_det_mismatch": mismatched,
+    }
+
+
+def s_penalty_branches(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """post-occ 的三种 S 分支 × 是否准入，回答“闸门在哪一层生效”。"""
+    post_occ = [r for r in candidates if r.get("reject") != "occ"]
+    total_tp = sum(1 for r in post_occ if r.get("tp"))
+    rows: List[Dict[str, Any]] = []
+    order = ["covered-high", "covered-low", "uncovered"]
+    branches = collections.Counter()
+    for r in post_occ:
+        branches[str(r.get("branch"))] += 1
+    for name in order + [b for b in branches if b not in order]:
+        sub = [r for r in post_occ if str(r.get("branch")) == name]
+        if not sub:
+            continue
+        tp = sum(1 for r in sub if r.get("tp"))
+        adm = [r for r in sub if r.get("admitted")]
+        adm_tp = sum(1 for r in adm if r.get("tp"))
+        rows.append(
+            {
+                "branch": name,
+                "n": len(sub),
+                "tp": tp,
+                "fp": len(sub) - tp,
+                "precision": rate(tp, len(sub)),
+                "tp_recall": rate(tp, total_tp),
+                "admitted": len(adm),
+                "admitted_tp": adm_tp,
+                "admitted_fp": len(adm) - adm_tp,
+                "admitted_precision": rate(adm_tp, len(adm)),
+            }
+        )
+    return {"n_post_occ": len(post_occ), "branches": rows}
+
+
+_SCORE_BIN_EDGES = {
+    "conf": [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85],
+    "sigma_c": [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80],
+    "s": [0.0, 0.095, 0.10, 0.11, 0.12, 0.13, 0.14, 0.16, 0.18, 0.20, 0.40],
+}
+
+
+def score_distributions(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """raw conf / sigma_c / S 的分位与分箱（post-occ）。"""
+    post_occ = [r for r in candidates if r.get("reject") != "occ"]
+    table: List[Dict[str, Any]] = []
+    bins_out: Dict[str, List[Dict[str, Any]]] = {}
+    for score in ("conf", "sigma_c", "s"):
+        subs = {
+            "all": post_occ,
+            "tp": [r for r in post_occ if r.get("tp")],
+            "fp": [r for r in post_occ if not r.get("tp")],
+        }
+        for subset, rows in subs.items():
+            vals = [float(r[score]) for r in rows if r.get(score) is not None]
+            if not vals:
+                continue
+            q = quantiles(vals)
+            table.append(
+                {
+                    "score": score,
+                    "subset": subset,
+                    "n": q["n"],
+                    "mean": statistics.mean(vals),
+                    "p10": q["p10"],
+                    "p50": q["p50"],
+                    "p90": q["p90"],
+                    "min": min(vals),
+                    "max": q["max"],
+                }
+            )
+        edges = _SCORE_BIN_EDGES[score]
+        bins: List[Dict[str, Any]] = []
+        for lo, hi in zip(edges, edges[1:]):
+            rows = [
+                r
+                for r in post_occ
+                if r.get(score) is not None and lo <= float(r[score]) < hi
+            ]
+            tp = sum(1 for r in rows if r.get("tp"))
+            bins.append(
+                {
+                    "lo": lo,
+                    "hi": hi,
+                    "n": len(rows),
+                    "tp": tp,
+                    "fp": len(rows) - tp,
+                    "precision": rate(tp, len(rows)),
+                }
+            )
+        bins_out[score] = bins
+    return {"quantiles": table, "bins": bins_out}
+
+
+def episode_threshold_coverage(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """每个阈值下“有 TP 集 / 有 FP 集 / 仅 TP 集”的 episode 级覆盖。"""
+    per_ep: Dict[EpKey, Dict[str, List[float]]] = collections.defaultdict(
+        lambda: {"conf_tp": [], "conf_fp": [], "sigma_tp": [], "sigma_fp": []}
+    )
+    for row in candidates:
+        if row.get("reject") == "occ":
+            continue
+        key = ep_key(row)
+        target = "tp" if row.get("tp") else "fp"
+        for score, tag in (("conf", "conf"), ("sigma_c", "sigma")):
+            value = row.get(score)
+            if value is not None:
+                per_ep[key][f"{tag}_{target}"].append(float(value))
+    grid = [0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for tag in ("conf", "sigma"):
+        rows = []
+        for t in grid:
+            with_tp = with_fp = only_tp = 0
+            for _, d in per_ep.items():
+                tp_hit = any(v >= t for v in d[f"{tag}_tp"])
+                fp_hit = any(v >= t for v in d[f"{tag}_fp"])
+                with_tp += int(tp_hit)
+                with_fp += int(fp_hit)
+                only_tp += int(tp_hit and not fp_hit)
+            rows.append(
+                {
+                    "t": t,
+                    "ep_with_tp": with_tp,
+                    "ep_with_fp": with_fp,
+                    "ep_only_tp": only_tp,
+                }
+            )
+        out[tag] = rows
+    return {"n_episodes": len(per_ep), "grid": grid, "rows": out}
 
 
 # ---------------------------------------------------------------------------
@@ -822,12 +1337,17 @@ def audit_run(run_dir: str, content_dir: Optional[str] = None) -> Dict[str, Any]
     candidates = load_jsonl(os.path.join(det, "candidates.jsonl"))
     nav_goals = load_jsonl(os.path.join(det, "nav_goals.jsonl"))
     memory_events = load_jsonl(os.path.join(det, "memory_events.jsonl"))
-    stop_shadow = load_jsonl(os.path.join(det, "stop_shadow.jsonl"))
-    fusion_rows = load_jsonl(os.path.join(det, "fusion_field.jsonl"))
+    gd_decision_rows = load_jsonl(os.path.join(det, "gd_decisions.jsonl"))
+    stop_gate_rows = load_jsonl(os.path.join(det, "stop_gate.jsonl"))
+    gd_proposal_rows = load_jsonl(os.path.join(det, "gd_proposals.jsonl"))
+    gd_frame_rows = load_jsonl(os.path.join(det, "gd_frames.jsonl"))
+    admission_rows = load_jsonl(os.path.join(det, "candidate_admission.jsonl"))
+    if not admission_rows:
+        admission_rows = load_jsonl(os.path.join(det, "s4_sp1_detections.jsonl"))
     traj = _trajectory_stats(run_dir)
     content = load_objectnav_content(content_dir) if content_dir else {}
 
-    index = build_episode_index(episodes, candidates, nav_goals, memory_events, stop_shadow)
+    index = build_episode_index(episodes, candidates, nav_goals, memory_events)
     return {
         "run_dir": os.path.abspath(run_dir),
         "rows": {
@@ -835,8 +1355,11 @@ def audit_run(run_dir: str, content_dir: Optional[str] = None) -> Dict[str, Any]
             "candidates": len(candidates),
             "nav_goals": len(nav_goals),
             "memory_events": len(memory_events),
-            "stop_shadow": len(stop_shadow),
-            "fusion_field": len(fusion_rows),
+            "gd_frames": len(gd_frame_rows),
+            "gd_proposals": len(gd_proposal_rows),
+            "gd_decisions": len(gd_decision_rows),
+            "stop_gate": len(stop_gate_rows),
+            "candidate_admission": len(admission_rows),
             "trajectories": len(traj),
             "content_scenes": len(content),
         },
@@ -846,7 +1369,16 @@ def audit_run(run_dir: str, content_dir: Optional[str] = None) -> Dict[str, Any]
         "never_saw": never_saw_autopsy(index, traj),
         "floor_split": floor_split(index, content),
         "thresholds": threshold_calibration(candidates),
-        "fusion": fusion_recheck(candidates, fusion_rows),
+        "admission_funnel": admission_funnel(candidates, admission_rows),
+        "s_penalty_branches": s_penalty_branches(candidates),
+        "score_distributions": score_distributions(candidates),
+        "episode_threshold_coverage": episode_threshold_coverage(candidates),
+        "lifecycle": lifecycle_stats(memory_events),
+        "selection": selection_stats(nav_goals),
+        "gd_funnel": gd_funnel(gd_proposal_rows, gd_decision_rows, len(gd_frame_rows)),
+        "parameter_calibration": parameter_calibration(
+            det, episodes, candidates, nav_goals, memory_events
+        ),
     }
 
 
@@ -1033,12 +1565,161 @@ def render_markdown(report: Dict[str, Any]) -> str:
         )
     add("")
 
-    fu = report["fusion"]
-    add("## 6. 复核 S8 §3 融合 AUC\n")
-    add(f"- 对齐: {fu['row_aligned']}/{fu['n_fusion_candidates']}（ratio {_fmt(fu['aligned_ratio'])}）")
-    for name, value in fu["auc"].items():
-        add(f"- AUC(`{name}`) = {_fmt(value)}")
-    add(f"\n- `fusion_negative` 行 {fu['n_fusion_negative_rows']}，其中 `neg_triggered` {fu['neg_triggered_negative_rows']}")
+    af = report["admission_funnel"]
+    add("## 6. 候选准入阶段\n")
+    add(f"- 与 `candidate_admission.jsonl` 的 `n_det` 不一致集数：{af['episodes_with_n_det_mismatch']}")
+    add("| 阶段 | n | TP | FP | precision |")
+    add("| :--- | ---: | ---: | ---: | ---: |")
+    for r in af["stages"]:
+        add(f"| `{r['stage']}` | {r['n']} | {r['tp']} | {r['fp']} | {_fmt(r['precision'])} |")
+    add("")
+
+    sp = report["s_penalty_branches"]
+    add("## 7. S-penalty 分支 × 准入（post-occ）\n")
+    add("| 分支 | n | TP | FP | precision | TP recall | admitted | admitted TP/FP | admitted precision |")
+    add("| :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- | ---: |")
+    for r in sp["branches"]:
+        add(
+            f"| `{r['branch']}` | {r['n']} | {r['tp']} | {r['fp']} | {_fmt(r['precision'])} | "
+            f"{_fmt(r['tp_recall'])} | {r['admitted']} | {r['admitted_tp']}/{r['admitted_fp']} | "
+            f"{_fmt(r['admitted_precision'])} |"
+        )
+    add("")
+
+    sd = report["score_distributions"]
+    add("## 8. 分数分布与分箱（post-occ）\n")
+    add("| 分数 | 子集 | n | mean | p10 | p50 | p90 | min | max |")
+    add("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for r in sd["quantiles"]:
+        add(
+            f"| `{r['score']}` | {r['subset']} | {r['n']} | {_fmt(r['mean'])} | {_fmt(r['p10'])} | "
+            f"{_fmt(r['p50'])} | {_fmt(r['p90'])} | {_fmt(r['min'])} | {_fmt(r['max'])} |"
+        )
+    add("")
+    for score, bins in sd["bins"].items():
+        add(f"| `{score}` 区间 | n | TP | FP | precision |")
+        add("| :--- | ---: | ---: | ---: | ---: |")
+        for b in bins:
+            add(f"| [{b['lo']:.2f}, {b['hi']:.2f}) | {b['n']} | {b['tp']} | {b['fp']} | {_fmt(b['precision'])} |")
+        add("")
+
+    ec = report["episode_threshold_coverage"]
+    add("## 9. episode 层阈值覆盖\n")
+    add(f"- 参与统计 {ec['n_episodes']} 集（post-occ）")
+    add("| 阈值 | raw c: 有 TP | raw c: 有 FP | raw c: 仅 TP | sigma_c: 有 TP | sigma_c: 有 FP | sigma_c: 仅 TP |")
+    add("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for a, b in zip(ec["rows"]["conf"], ec["rows"]["sigma"]):
+        add(
+            f"| {a['t']:.2f} | {a['ep_with_tp']} | {a['ep_with_fp']} | {a['ep_only_tp']} | "
+            f"{b['ep_with_tp']} | {b['ep_with_fp']} | {b['ep_only_tp']} |"
+        )
+    add("")
+
+    lf = report["lifecycle"]
+    add("## 10. 生命周期事件\n")
+    add("| event | n | TP | TP rate |")
+    add("| :--- | ---: | ---: | ---: |")
+    for r in lf["events"]:
+        add(f"| `{r['name']}` | {r['n']} | {r['tp']} | {_fmt(r['tp_rate'])} |")
+    add("")
+    add("| delete 原因 | n | TP | TP rate |")
+    add("| :--- | ---: | ---: | ---: |")
+    for r in lf["delete_reasons"]:
+        add(f"| `{r['name']}` | {r['n']} | {r['tp']} | {_fmt(r['tp_rate'])} |")
+    add("")
+    add("| transition | n | TP | TP rate |")
+    add("| :--- | ---: | ---: | ---: |")
+    for r in lf["transitions"]:
+        add(f"| `{r['name']}` | {r['n']} | {r['tp']} | {_fmt(r['tp_rate'])} |")
+    add("")
+    q = lf["upgrade_num_obs"]
+    if q:
+        add(f"- upgrade `num_obs`: n={q['n']}，p10 {_fmt(q['p10'], 1)} / p50 {_fmt(q['p50'], 1)} / p90 {_fmt(q['p90'], 1)}")
+    add(f"- 含 revive 历史的行：{lf['rows_with_revive_history']}\n")
+
+    se = report["selection"]
+    add("## 11. 目标选择\n")
+    add("| tier | n | TP | TP rate |")
+    add("| :--- | ---: | ---: | ---: |")
+    for r in se["tiers"]:
+        add(f"| `{r['name']}` | {r['n']} | {r['tp']} | {_fmt(r['tp_rate'])} |")
+    add("")
+    add("| sigma band | n | | distance bucket | n |")
+    add("| :--- | ---: | :--- | :--- | ---: |")
+    bands = se["sigma_bands"]
+    buckets = se["distance_buckets"]
+    for i in range(max(len(bands), len(buckets))):
+        b = bands[i] if i < len(bands) else {"name": "-", "n": "-"}
+        d = buckets[i] if i < len(buckets) else {"name": "-", "n": "-"}
+        add(f"| {b['name']} | {b['n']} | | {d['name']} | {d['n']} |")
+    add("")
+    add("| switch_reason | n |")
+    add("| :--- | ---: |")
+    for r in se["switch_reasons"]:
+        add(f"| `{r['name']}` | {r['n']} |")
+    add("")
+    add(
+        f"- stop_eligible 行 {se['stop_eligible_rows']}，"
+        f"其中 TP rate {_fmt(se['stop_eligible_tp_rate'])}"
+    )
+    q = se["goals_per_episode"]
+    if q:
+        add(f"- 每集 nav goal 行数: p10 {_fmt(q['p10'], 1)} / p50 {_fmt(q['p50'], 1)} / p90 {_fmt(q['p90'], 1)}")
+    add("")
+
+    gf = report["gd_funnel"]
+    add("## 12. GD 提案与仲裁\n")
+    add(
+        f"- 提案 {gf['proposals']} 条 / 决策 {gf['decisions']} 条 / GD 帧 {gf['frames']}，"
+        f"每 100 帧 {_fmt(gf['proposals_per_100_frames'], 1)} 条提案"
+    )
+    q = gf["proposals_per_episode"]
+    if q:
+        add(f"- 每集提案: p10 {_fmt(q['p10'], 1)} / p50 {_fmt(q['p50'], 1)} / p90 {_fmt(q['p90'], 1)}")
+    add(f"- `match_same_object` 行：{gf['match_same_object_rows']}\n")
+    add("| route | n | TP | TP rate |")
+    add("| :--- | ---: | ---: | ---: |")
+    for r in gf["routes"]:
+        add(f"| `{r['name']}` | {r['n']} | {r['tp']} | {_fmt(r['tp_rate'])} |")
+    add("")
+    add("| association | n | TP | TP rate |")
+    add("| :--- | ---: | ---: | ---: |")
+    for r in gf["associations"]:
+        add(f"| `{r['name']}` | {r['n']} | {r['tp']} | {_fmt(r['tp_rate'])} |")
+    add("")
+
+    pc = report["parameter_calibration"]
+    add("## 13. 参数重扫（单 run 反事实）\n")
+    add("| sigma_tar | TP | FP | precision |")
+    add("| ---: | ---: | ---: | ---: |")
+    for t, r in pc["sigma_tar_sweep"].items():
+        add(f"| {t} | {r['tp']} | {r['fp']} | {_fmt(r['precision'])} |")
+    add("")
+    add("| t_S | TP | FP | precision |")
+    add("| ---: | ---: | ---: | ---: |")
+    for t, r in pc["t_s_sweep"].items():
+        add(f"| {t} | {r['tp']} | {r['fp']} | {_fmt(r['precision'])} |")
+    add("")
+    sg = pc["stop_gate"]
+    add(
+        f"- stop_gate: rows {sg['rows']}，stop_ok {sg['stop_ok_rows']}，"
+        f"rho@stop p50 {_fmt(sg['rho_at_stop_p50'], 2)}，turns p90 {_fmt(sg['turns_p90'], 1)}"
+    )
+    rc = pc["recheck"]
+    add(
+        f"- recheck: results {rc['results']}，arrived {rc['arrived']}（p90 {_fmt(rc['steps_p90'], 1)} / "
+        f"max {rc['steps_max']}），timeout {rc['timeouts']}"
+    )
+    em = pc["explore_mode"]
+    add(
+        f"- explore: rows {em['rows']}，S p50 {_fmt(em['sem_s_p50'], 3)} / p90 {_fmt(em['sem_s_p90'], 3)}，"
+        f"nearest share {_fmt(em['nearest_share'])}，blacklisted p50 {_fmt(em['blacklisted_p50'], 1)}"
+    )
+    mn = pc["merge_new_info"]
+    add(
+        f"- merge new_info: rows {mn['rows']}，Δyaw p90 {_fmt(mn['d_yaw_p90'], 1)}°，"
+        f"Δsteps p50 {_fmt(mn['d_steps_p50'], 1)}，质心漂移 p50 {_fmt(mn['d_centroid_shift_p50'], 3)} m"
+    )
     add("")
     return "\n".join(out)
 

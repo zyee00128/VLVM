@@ -415,6 +415,7 @@ class BaseITMPolicy(TSP3DObjectNavPolicy):
             sem_goal=sem_goal,
             near_goal=near_goal,
             value_with_h1=top_value,
+            n_blacklisted=len(getattr(self, "_explore_frontier_blacklist", []) or []),
         )
         return self._pointnav(best_frontier, stop=False)
 

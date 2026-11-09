@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
@@ -46,6 +46,31 @@ from vlfm.vlvm.utils.three_points import three_point_fields_for
 
 
 PROMPT_SEPARATOR = "|"
+GD_CALIB_DEFAULTS: Dict[str, Any] = {
+    "every_n": 1,
+    "record_every_n": 1,
+    "box_thr": 0.40,
+    "max_boxes": 4,
+    "port": 12181,
+    "caption_style": "vocab",
+    "min_dist": 1.0,
+    "erode_iters": 5,
+    "min_pixels": 256,
+    "rand_subarray": 5000,
+    "dbscan_eps": 0.2,
+    "dbscan_min_points": 100,
+    "merge_dist": 0.5,
+    "merge_iau": 0.3,
+    "merge_containment": 0.8,
+    "new_info_dist": 0.2,
+    "new_info_yaw_deg": 10.0,
+    "new_info_steps": 3,
+    "max_fails": 2,
+    "save_points": False,
+    "max_points_saved": 64,
+    "save_images": False,
+    "image_dir": None,
+}
 
 class TSP3DObjectNavPolicy(
     PolicyInitMixin,
@@ -70,15 +95,15 @@ class TSP3DObjectNavPolicy(
             init_turn_steps: int = 12,
             min_depth: float = 0.5,
             max_depth: float = 5.0,
-            om_style: str = "obstacle",
-            voxel_size: float = 0.01,
-            min_obstacle_height: float = 0.05,
+            om_style: str = "probabilistic",
+            voxel_size: float = 0.05,
+            min_obstacle_height: float = 0.15,
             max_obstacle_height: float = 1.50,
             agent_radius: float = 0.18,
-            nav_slice_height: float = 0.35,
+            nav_slice_height: float = 0.30,
             agent_height: float = 0.88,
             hole_area_thresh: int = 100000,
-            obstacle_map_area_threshold: float = 3,
+            obstacle_map_area_threshold: float = 1.5,
             log_odds_occ: float = 2.0,
             log_odds_free: float = -2.0,
             occ_threshold: float = 0.0,
@@ -91,7 +116,7 @@ class TSP3DObjectNavPolicy(
             # TSP3D query
             sigma_sce: float = 0.15,
             sigma_tar: float = 0.60,
-            sigma_prop: Optional[float] = None,
+            sigma_prop: Optional[float] = 0.45,
             tau: float = 0.15,
             near_field_dist: float = 1.0,
             near_field_sigma_scale: float = 0.8,
@@ -102,7 +127,7 @@ class TSP3DObjectNavPolicy(
             wm_min_view_yaw: float = 15.0,
             wm_max_voxels: int = 400000,
             wm_max_frames: Optional[int] = 8, 
-            wm_near_refresh_radius: Optional[float] = None,
+            wm_near_refresh_radius: Optional[float] = 3.0,
             wm_near_refresh_value: bool = True,
             distance_sample: bool = True,
             near_dist: float = 1.5,
@@ -124,7 +149,7 @@ class TSP3DObjectNavPolicy(
             merge_dist_thresh: float = 0.5,
             ema_weight_old: float = 0.8,
             enable_provisional_gate: bool = True,
-            provisional_sigma: float = 0.50,
+            provisional_sigma: float = 0.55,
             provisional_min_dist: float = 1.0,
             provisional_max_dist: float = 4.0,
             provisional_s_min: float = 0.07,
@@ -148,10 +173,11 @@ class TSP3DObjectNavPolicy(
             lock_exempt: bool = True,
             lock_exempt_identity: bool = True,
             # GD query
-            enable_gd_mechanism: bool = False,
+            enable_gd_mechanism: bool = True,
             gd_conf_min: float = 0.40,
             gd_max_dist: float = 5.0,
             gd_only_classes: str = "",
+            gd_calib: Optional[Dict[str, Any]] = None,
             # Recheck & Explore mode
             explore_stuck_steps: int = 15,
             explore_stuck_move_m: float = 0.05,
@@ -302,6 +328,7 @@ class TSP3DObjectNavPolicy(
             conf_min=gd_conf_min,
             max_dist=gd_max_dist,
             gd_only_classes=gd_only_classes,
+            calib=gd_calib,
         )
         # TSP3D client
         self._tsp3d_client = TSP3DClient(port=int(os.environ.get("TSP3D_PORT", "12186")))
@@ -765,6 +792,9 @@ class TSP3DObjectNavPolicy(
                             record["mechanism"] = mechanism_record
                             events = mechanism_record.get("events", []) or []
                             self._log_memory_events(events)
+                            self._log_gd_decisions(
+                                mechanism_record.get("decisions", []) or []
+                            )
                             self._gd_mech_last_step = int(self._num_steps)
                         except BaseException as exc:  # noqa: BLE001 - GD must not kill nav
                             if self._gd_mech_error is None:
@@ -1180,6 +1210,19 @@ class TSP3DObjectNavPolicy(
             ).reshape(-1)[:2]
             heading = float(self._observations_cache.get("robot_heading", 0.0))
             rho, _ = rho_theta(robot_xy2d, heading, goal_3d[:2])
+            self._log_stop_gate(
+                memory_id=self._last_goal_memory_id,
+                rho=rho,
+                stop_ok=stop_ok,
+                turns=int(
+                    self._stop_confirm_counts.get(
+                        str(self._last_goal_memory_id), 0
+                    )
+                ),
+                sigma_c=float(getattr(self, "_last_goal_score", 0.0) or 0.0),
+                lifecycle_state=getattr(self, "_last_goal_state", None),
+                origin=getattr(self, "_last_goal_origin", None),
+            )
             if stop_ok:
                 self._stop_confirm_counts.pop(str(self._last_goal_memory_id), None)
                 self._lookaround_trace = []
@@ -1322,8 +1365,8 @@ class VLVMConfig:
     pointnav_stop_radius: float = 0.90  # Final S5 stop distance (m).
 
     # Phase 3a: 3D Mapping & Occupancy Grid
-    om_style: str = "obstacle"
-    voxel_size: float = 0.01                 # Voxel grid resolution (m); smaller = finer map but more memory/compute.
+    om_style: str = "probabilistic"
+    voxel_size: float = 0.05                 # Voxel grid resolution (m); smaller = finer map but more memory/compute.
     min_obstacle_height: float = 0.15        # Lower height bound (m) for obstacle voxels; too low includes floor noise, too high misses low obstacles.
     max_obstacle_height: float = 1.50        # Upper height bound (m) for obstacle voxels; too low ignores tall obstacles.
     hole_area_thresh: int = 100000           # Hole area threshold (px) for depth gap filling; -1 disables filling (assume max depth).
@@ -1336,7 +1379,7 @@ class VLVMConfig:
     ## Dilation / structuring element 
     agent_radius: float = 0.18               # Robot physical radius (m) used for collision inflation; larger = more conservative navigation.
     agent_height: float = 0.88               # Robot height (m) for the 3D cylinder structuring element (dilation / collision).
-    nav_slice_height: float = 0.35           # Reference navigation height (m) for frontier slicing and visualization.
+    nav_slice_height: float = 0.30           # Reference navigation height (m) for frontier slicing and visualization.
 
     # Phase 4: 2.5D Semantic Value Plane (BEV)
     vm_style: str = "region"          # Semantic value mapping mode: "region" (V1) / "surface" (V2)
@@ -1350,7 +1393,7 @@ class VLVMConfig:
 
     # Phase 5a: TSP3D Perception & Visual Grounding
     sigma_tar: float = 0.60             # P0/P1 fixed raw/admission threshold (c_base); no longer controls service proposal supply when sigma_prop is set.
-    sigma_prop: Optional[float] = None   # TSP3D service return threshold; None inherits sigma_tar for exact legacy behaviour.
+    sigma_prop: Optional[float] = 0.45   # TSP3D service return threshold; None inherits sigma_tar for exact legacy behaviour.
     sigma_sce: float = 0.15             # TGP scene voxel retention threshold; higher = more aggressive pruning (fewer hallucinations, may miss targets).
     tau: float = 0.15                   # Soft-pruning temperature; higher = smoother/looser pruning, lower = harder thresholding.
     near_field_dist: float = 1.0        # Distance (m) below which near-field adaptive sigma scaling activates; larger = scaling kicks in earlier.
@@ -1374,7 +1417,7 @@ class VLVMConfig:
     wm_min_view_disp: float = 0.15                  # world: min displacement (m) to accept a frame into fusion
     wm_min_view_yaw: float = 15.0                   # world: min yaw change (deg) to accept a frame into fusion
     wm_near_refresh_radius: Optional[float] = 3.0   # world: near-field refresh radius (m). None=off (first-observation accounting); >0: re-observed near-field voxels are re-owned by the current frame (cam-style accounting, survives frame-window slide-out).
-    wm_near_refresh_value: bool = False             # world: also overwrite the stored point of refreshed near-field voxels with the current observation (cam-style sliding refresh of the value layer). False = value layer stays first.
+    wm_near_refresh_value: bool = True              # world: also overwrite the stored point of refreshed near-field voxels with the current observation (cam-style sliding refresh of the value layer). False = value layer stays first.
 
     # Phase 7: Mem-Life
     enable_occ_consistency: bool = True     # box must have occupied-voxel support in the 3D grid
@@ -1390,7 +1433,7 @@ class VLVMConfig:
     merge_dist_thresh: float = 0.5          # cross-view EMA merge distance threshold (m)
     ema_weight_old: float = 0.8             # cross-view EMA smoothing (old * w + new * (1 - w))
     enable_provisional_gate: bool = True    # Final S5: unmatched candidates use the provisional gate.
-    provisional_sigma: float = 0.50         # Provisional admission line.
+    provisional_sigma: float = 0.55         # Provisional admission line.
     provisional_min_dist: float = 1.0       # Provisional new-memory distance floor (m).
     provisional_max_dist: float = 4.0       # Provisional new-memory distance ceiling (m).
     provisional_s_min: float = 0.07         # Logging only; S does not gate provisional entries.
@@ -1420,10 +1463,11 @@ class VLVMConfig:
     goal_use_surface: bool = True           # navigate to the stored near-surface point (first-write fixed) instead of the centroid.
     det_log_dir: Optional[str] = None       # SP1 per-detection jsonl directory; None = off (logging only, no behaviour change).
 
-    enable_gd_mechanism: bool = False        # Enable GD-only/gd-tsp routing and writes.
+    enable_gd_mechanism: bool = True         # Enable GD-only/gd-tsp routing and writes.
     gd_conf_min: float = 0.40                # GD base-gate confidence (initial filter only).
     gd_max_dist: float = 5.0                 # GD base-gate robot distance (m).
     gd_only_classes: str = ""                # empty = all target classes; comma-separated otherwise.
+    gd_calib: Dict[str, Any] = field(default_factory=lambda: dict(GD_CALIB_DEFAULTS))  # GD proposal/association knobs; Hydra-only.
 
     # Recheck & Explore mode.
     recheck_enable: bool = True             # Master switch for the recheck queue.

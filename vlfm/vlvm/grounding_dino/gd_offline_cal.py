@@ -510,8 +510,8 @@ def main() -> None:
             "memory_events": len(memory_events),
             "nav_goals": len(nav_goals),
             "note": (
-                "GD is log-only.  Missing gd_*.jsonl means the run did not enable "
-                "GD_CALIB_ENABLE=1 or the logger was disabled after an error."
+                "GD is log-only.  Missing gd_*.jsonl means the run had "
+                "enable_gd_mechanism=false or the logger was disabled after an error."
             ),
         },
         "proposal_precision": proposal_tables(proposals),

@@ -237,12 +237,13 @@ class PolicyInitMixin:
         conf_min: float,
         max_dist: float,
         gd_only_classes: Any,
+        calib: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Initialise GD calibration and the GD mechanism.
 
-        ``enabled`` is the single binary switch for the GD mechanism.  The
-        calibration logger remains available log-only via ``GD_CALIB_ENABLE``
-        so offline GD calibration does not require the mechanism.
+        ``enabled`` is the single binary switch for the GD mechanism.  ``calib``
+        carries the Hydra ``gd_calib`` block and is the only source of the GD
+        proposal/association knobs (no ``GD_CALIB_*`` environment layer).
         """
         self._enable_gd_mechanism = bool(enabled)
         self._gd_conf_min = float(conf_min)
@@ -258,11 +259,7 @@ class PolicyInitMixin:
         self._gd_mech = None
         self._gd_mech_error: Optional[str] = None
         self._gd_mech_last_step: int = -1
-        calib_requested = (
-            os.environ.get("GD_CALIB_ENABLE", "0").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
-        if not bool(enabled) and not calib_requested:
+        if not bool(enabled):
             return
         try:
             from vlfm.vlvm.grounding_dino.calibration import (
@@ -270,9 +267,19 @@ class PolicyInitMixin:
                 GdCalibrationLogger,
             )
 
-            gd_cfg = GdCalibConfig.from_env()
+            base = GdCalibConfig()
+            merged = {
+                name: getattr(base, name)
+                for name in GdCalibConfig.__dataclass_fields__
+            }
+            for key, value in dict(calib or {}).items():
+                if key in merged:
+                    merged[key] = value
             if bool(enabled):
-                gd_cfg.enabled = True
+                merged["enabled"] = True
+            gd_cfg = GdCalibConfig(**merged)
+            gd_cfg.every_n = max(1, int(gd_cfg.every_n))
+            gd_cfg.max_boxes = max(1, int(gd_cfg.max_boxes))
             if gd_cfg.enabled:
                 self._gd_calib = GdCalibrationLogger(gd_cfg)
                 print(

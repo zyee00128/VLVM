@@ -26,18 +26,8 @@ What is recorded (all optional fields are populated when available):
     memory tracks (distance / 3D IaU / containment), new-information flag,
     track-level `gd_pos` and cumulative `gd_hits`.
 
-Enable with environment variables (no Hydra/YAML change):
-
-    GD_CALIB_ENABLE=1
-    GD_CALIB_EVERY_N=5
-    GD_CALIB_RECORD_EVERY_N=1
-    GD_CALIB_BOX_THR=0.4
-    GD_CALIB_MAX_BOXES=1
-    GD_CALIB_PORT=12181
-    GD_CALIB_MAX_FAILS=2          # disable GD logging after N consecutive no_gd
-    GD_CALIB_SAVE_POINTS=0        # 1 -> also store the world point cluster (capped)
-    GD_CALIB_SAVE_IMAGES=0        # 1 -> write RGB JPG + depth .npy per GD frame
-    GD_CALIB_IMAGE_DIR=<detections>/gd_images
+Configured exclusively through the Hydra ``gd_calib`` block (the online
+mechanism passes it in; there is no ``GD_CALIB_*`` environment layer).
 """
 
 from __future__ import annotations
@@ -56,29 +46,6 @@ from .types import CameraView, GdProposal
 
 
 # ---------------------------------------------------------------------------
-# env helpers
-# ---------------------------------------------------------------------------
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return default
-    return int(value)
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return default
-    return float(value)
-
-
 def _jsonable(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -140,10 +107,10 @@ def _depth_summary(
 @dataclass
 class GdCalibConfig:
     enabled: bool = False
-    every_n: int = 5
+    every_n: int = 1
     record_every_n: int = 1
     box_thr: float = 0.4
-    max_boxes: int = 1
+    max_boxes: int = 4
     port: int = 12181
     caption_style: str = "vocab"
     min_dist: float = 1.0
@@ -158,42 +125,11 @@ class GdCalibConfig:
     new_info_dist: float = 0.2
     new_info_yaw_deg: float = 10.0
     new_info_steps: int = 3
-    ttl_steps: int = 20
     max_fails: int = 2
     save_points: bool = False
     max_points_saved: int = 64
     save_images: bool = False
     image_dir: Optional[str] = None
-
-    @classmethod
-    def from_env(cls) -> "GdCalibConfig":
-        return cls(
-            enabled=_env_bool("GD_CALIB_ENABLE", False),
-            every_n=max(1, _env_int("GD_CALIB_EVERY_N", 5)),
-            record_every_n=max(1, _env_int("GD_CALIB_RECORD_EVERY_N", 1)),
-            box_thr=_env_float("GD_CALIB_BOX_THR", 0.4),
-            max_boxes=max(1, _env_int("GD_CALIB_MAX_BOXES", 1)),
-            port=_env_int("GD_CALIB_PORT", 12181),
-            caption_style=os.environ.get("GD_CALIB_CAPTION_STYLE", "vocab"),
-            min_dist=_env_float("GD_CALIB_MIN_DIST", 1.0),
-            erode_iters=_env_int("GD_CALIB_ERODE_ITERS", 5),
-            min_pixels=_env_int("GD_CALIB_MIN_PIXELS", 256),
-            rand_subarray=_env_int("GD_CALIB_RAND_SUBARRAY", 5000),
-            dbscan_eps=_env_float("GD_CALIB_DBSCAN_EPS", 0.2),
-            dbscan_min_points=_env_int("GD_CALIB_DBSCAN_MIN_POINTS", 100),
-            merge_dist=_env_float("GD_CALIB_MERGE_DIST", 0.5),
-            merge_iau=_env_float("GD_CALIB_MERGE_IAU", 0.3),
-            merge_containment=_env_float("GD_CALIB_MERGE_CONTAINMENT", 0.8),
-            new_info_dist=_env_float("GD_CALIB_NEW_INFO_DIST", 0.2),
-            new_info_yaw_deg=_env_float("GD_CALIB_NEW_INFO_YAW_DEG", 10.0),
-            new_info_steps=_env_int("GD_CALIB_NEW_INFO_STEPS", 3),
-            ttl_steps=_env_int("GD_CALIB_TTL_STEPS", 20),
-            max_fails=max(1, _env_int("GD_CALIB_MAX_FAILS", 2)),
-            save_points=_env_bool("GD_CALIB_SAVE_POINTS", False),
-            max_points_saved=_env_int("GD_CALIB_MAX_POINTS_SAVED", 64),
-            save_images=_env_bool("GD_CALIB_SAVE_IMAGES", False),
-            image_dir=os.environ.get("GD_CALIB_IMAGE_DIR") or None,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +139,7 @@ class GdCalibrationLogger:
     """Per-step, no-op-on-the-policy GD logger."""
 
     def __init__(self, config: Optional[GdCalibConfig] = None) -> None:
-        self.cfg = config or GdCalibConfig.from_env()
+        self.cfg = config or GdCalibConfig()
         self.proposer = GdProposer(
             GdProposalConfig(
                 enabled=True,
@@ -767,7 +703,8 @@ class GdCalibrationLogger:
         }
 
     def _expire_buffer(self, step: int) -> None:
-        ttl = int(self.cfg.ttl_steps)
+        """Drop buffer entries whose last hit is older than the fixed window (20 steps)."""
+        ttl = 20
         for key in list(self._buffer.keys()):
             if int(step) - int(self._buffer[key]["last_step"]) > ttl:
                 del self._buffer[key]

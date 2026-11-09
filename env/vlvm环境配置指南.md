@@ -49,7 +49,7 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple <包名>
 | MinkowskiEngine 0.5.4 | GitHub `NVIDIA/MinkowskiEngine` tag `v0.5.4`（或 PyPI 源码包） | `$WS/MinkowskiEngine/` | 打补丁 → 编译 wheel → 安装（§2.2） |
 | mmcv 2.1.0 | GitHub `open-mmlab/mmcv` tag `v2.1.0` | `$WS/mmcv/` | 编译 wheel → 安装（§2.3） |
 | frontier_exploration / depth_camera_filtering | GitHub `naokiyokoyama/frontier_exploration`、`naokiyokoyama/depth_camera_filtering` | `$WS/frontier_exploration/`、`$WS/depth_camera_filtering/` | `pip install -e .`（§1.5） |
-| GroundingDINO（GD 辅助源） | 已随本仓库提供（`$VLVM/GroundingDINO/`） | — | `pip install -e .`（§1.5） |
+| GroundingDINO（GD 提议源，导航主线） | 已随本仓库提供（`$VLVM/GroundingDINO/`） | — | `pip install -e .`（§1.5） |
 
 > `$WS` = 工作区根，`$VLVM` = 本仓库根（`$WS/vlvm`）。
 
@@ -312,9 +312,11 @@ pip install mmdet==3.2.0 mmdet3d==1.4.0 mmengine==0.10.4
 
 ```bash
 cd $VLVM
+export TSP3D_DATA_PATH=$VLVM/data/tsp3d_models/
+export TSP3D_CHECKPOINT=$VLVM/data/vlvm_v1/vlvm_v1.pth
 python -c "from vlfm.tsp3d_models.bdetr import BeaUTyDETR; print('BeaUTyDETR OK')"
 python -m vlfm.vlm.tsp3d --port 12186
-# 期望: [TSP3D] Weights loaded from ...  / Running on http://localhost:12186
+# 期望: [TSP3D] Weights loaded from .../vlvm_v1.pth  / Running on http://localhost:12186
 ```
 
 ---
@@ -352,7 +354,8 @@ huggingface-cli download Zoe11111/VLVM tsp3d_scanrefer.pth --local-dir $VLVM/dat
 
 | 路径 | 体积 | 说明 | 来源 |
 |---|---|---|---|
-| `data/tsp3d_models/tsp3d_scanrefer.pth` | 669 MB | **TSP3D 主权重（scanrefer 档；三档 A/B 中的唯一适用档）** | HuggingFace `Zoe11111/VLVM` |
+| `data/vlvm_v1/vlvm_v1.pth` | 577 MB | **最终版 TSP3D 权重（S4 定稿，行为与文档 §3 一致）** | 本项目微调产物（R1 E3） |
+| `data/tsp3d_models/tsp3d_scanrefer.pth` | 669 MB | scanrefer 基线档（对照用） | HuggingFace `Zoe11111/VLVM` |
 | `data/tsp3d_models/ckpt_sr3d.pth` / `ckpt_nr3d.pth` | 各 668 MB | 备选档（sr3d 漏检 / nr3d 误检，历史判负） | 同上（可选） |
 | `data/tsp3d_models/{model.safetensors, config.json, merges.txt, dict.txt, README.md}` | 约 476 MB | TSP3D 文本分支（RoBERTa-base），`data_path` 直接指向此目录 | HF 同 repo 随附（或 `roberta-base`） |
 | `data/groundingdino_swint_ogc.pth` | 662 MB | GD 辅助提议源（端口 12181） | HF `ShilongLiu/GroundingDINO`（或 IDEA-Research GitHub release） |
@@ -360,27 +363,29 @@ huggingface-cli download Zoe11111/VLVM tsp3d_scanrefer.pth --local-dir $VLVM/dat
 | `data/dummy_policy.pth` | 52 KB | habitat-baselines eval 占位（缺失直接 exit） | VLFM 官方资源 / 项目内备份 |
 | `data/bert-base-uncased/` | — | LAVIS（BLIP-2）的 BERT 目录（可选） | HF `bert-base-uncased`；不放置则走 HF 缓存 |
 
-> ⚠️ **权重名已改为自动探测（2026-09-18）**：`scripts/launch_vlm_servers.sh` 与
-> `vlfm/vlm/tsp3d.py` 不再写死档名，按在位文件依次探测
-> `tsp3d_scanrefer.pth → ckpt_sr3d.pth → ckpt_nr3d.pth`：
-> - 机器 A（RTX 3090）：在位 `tsp3d_scanrefer.pth` → 命中第一个（与历史实验一致，行为不变）
-> - 机器 B（RTX 5080）：在位 `ckpt_sr3d.pth` → 回退命中第二个
+> **权重已锁定最终版**：`scripts/launch_vlm_servers.sh` 默认导出
+> `TSP3D_CHECKPOINT=$VLVM/data/vlvm_v1/vlvm_v1.pth`（S4 定稿权重），不再按档名探测。
+> 对照实验需显式覆盖：`export TSP3D_CHECKPOINT=$VLVM/data/tsp3d_models/tsp3d_scanrefer.pth`。
+> `env/vlvm_setup_env.sh` §3 会打印实际命中的权重，未命中 vlvm_v1 时给出提醒。
 >
-> 需要切换档位时显式导出：`export TSP3D_CHECKPOINT=$VLVM/data/tsp3d_models/ckpt_nr3d.pth`。
-> `vlvm_setup_env.sh` §3 会打印实际命中的档名，不命中时提示手动指定。
->
-> **权重即模型配置**：TSP3D 主权重由 `TSP3D_CHECKPOINT` 指定；GD 辅助机制（V7.3 引入）以
-> `gdp_enable / gdp_every_n=5 / gdp_max_boxes=1` 控制，属**辅助提议源**，不改变 TSP3D 的主模型地位。
-> 换权重只改环境变量或 YAML，不动代码。
+> **GD 已并入导航主线**：`vlfm/vlvm/grounding_dino/` 的 gd-only 近场补召与 gd-tsp 正向仲裁
+> 由 YAML `enable_gd_mechanism` 控制，参数全部在 `gd_calib` 块内，
+> **不再有 `GD_CALIB_*` 环境变量**；`data/groundingdino_swint_ogc.pth` 必须就位（服务端口 12181）。
+> 换权重只改 `TSP3D_CHECKPOINT`，调参数只改 YAML，不动代码。
 
 ## 3.3 数据集（下载与软链）
 
 数据集**不进仓库**：实体放数据盘（记为 `<DATA_ROOT>`），仓库 `data/` 下只建软链。
 
 ```bash
-# ① ObjectNav 任务数据（episode JSON）
+# ① ObjectNav 任务数据（episode JSON）——HM3D
 mkdir -p $VLVM/data/datasets/objectnav/hm3d
-ln -s <DATA_ROOT>/objectnav_hm3d_v2 $VLVM/data/datasets/objectnav/hm3d/v1
+ln -s <DATA_ROOT>/objectnav_hm3d_v1 $VLVM/data/datasets/objectnav/hm3d/v1
+
+# ①' ObjectNav 任务数据——MP3D（仅 MP3D 评测需要，官方 zip 解压即可，路径注意是 m3d 不是 mp3d）
+wget https://dl.fbaipublicfiles.com/habitat/data/datasets/objectnav/m3d/v1/objectnav_mp3d_v1.zip -P /tmp
+unzip -q /tmp/objectnav_mp3d_v1.zip -d $VLVM/data/datasets/objectnav/mp3d
+# 解压得到 $VLVM/data/datasets/objectnav/mp3d/v1/{train,val,val_mini}
 
 # ② HM3D 场景（val 必需、train 可选；episode 内路径以 hm3d_v0.2/ 开头，必须保留该目录名）
 mkdir -p $VLVM/data/scene_datasets/hm3d_v0.2
@@ -388,16 +393,21 @@ ln -s <DATA_ROOT>/hm3d-train-habitat-v0.2 $VLVM/data/scene_datasets/hm3d_v0.2/tr
 ln -s <DATA_ROOT>/hm3d-val-habitat-v0.2   $VLVM/data/scene_datasets/hm3d_v0.2/val
 cd $VLVM/data/scene_datasets && ln -s hm3d_v0.2 hm3d
 
-# ③ MP3D（可选，仅 MP3D 相关实验需要）
+# ③ MP3D 场景（MP3D 评测必需）
 ln -s <DATA_ROOT>/mp3d_habitat/mp3d $VLVM/data/scene_datasets/mp3d
 
 # ④ LAVIS BERT（可选；不建则 BLIP-2 走 HF 缓存）
 ln -s <DATA_ROOT>/bert-base-uncased $VLVM/data/bert-base-uncased
 ```
 
+> **`val.json.gz` 是空壳（`episodes=[]`）不是数据损坏**：`scripts/nav_vlvm.sh` 与评测配置按
+> `val/content/*.json.gz` 合并出真实集数（HM3D val = 20 场景 / 2000 集，MP3D val = 11 场景 / 2195 集）。
+> 数据完整性检查按 `val.json.gz` + `val/content/` 同时存在判定。
+>
 > 下载源：HM3D 与 ObjectNav 数据从 AI Habitat 官方数据页（https://aihabitat.org/datasets/）获取；
-> MP3D 按 pointnav 数据页的许可条款获取。**只装 val 场景 + ObjectNav v2 即可跑评测**。
-> `vlvm_setup_env.sh` 会自动校验这些软链（含断链检测，两机布局均兼容）。
+> MP3D 按 pointnav 数据页的许可条款获取。**跑 HM3D 只需 val 场景 + HM3D ObjectNav v1；
+> 跑 MP3D 还需上述 objectnav_mp3d_v1 zip + mp3d 场景**。`vlvm_setup_env.sh` 会自动校验这些
+> 路径（含断链检测，两机布局均兼容）。
 
 ## 3.4 环境变量（运行前必须设置）
 
@@ -405,15 +415,31 @@ ln -s <DATA_ROOT>/bert-base-uncased $VLVM/data/bert-base-uncased
 |---|---|---|
 | `PYTHONPATH` | `$VLVM` | 保证 `import vlfm` 命中项目内源码 |
 | `HF_ENDPOINT` | `https://hf-mirror.com` | HuggingFace 镜像（模型下载） |
-| `TSP3D_DATA_PATH` | `$VLVM/data/tsp3d_models/` | TSP3D 权重目录（服务端） |
-| `TSP3D_CHECKPOINT` | 自动探测（见 §3.2） | 切换权重用；不设时按候选名探测 |
+| `TSP3D_DATA_PATH` | `$VLVM/data/tsp3d_models/` | TSP3D 文本分支（RoBERTa）目录 |
+| `TSP3D_CHECKPOINT` | `$VLVM/data/vlvm_v1/vlvm_v1.pth` | 最终版权重；`launch_vlm_servers.sh` 已默认导出 |
 | `LAVIS_BERT_MODEL_PATH` | 可选（按在位探测） | 有 `data/bert-base-uncased` 才注入；无则 LAVIS 走 HF 缓存 |
 | `TSP3D_PORT` / `BLIP2ITM_PORT` / `GROUNDING_DINO_PORT` | `12186` / `12182` / `12181` | 三个 VLM 服务端口（客户端代码默认值） |
 | `EGL_PLATFORM` | `surfaceless` | habitat headless 渲染 |
 | `MAGNUM_LOG` / `MAGNUM_GPU_VALIDATION` | `quiet` / `OFF` | 抑制 magnum 日志 |
-| `TURN_LEFT_WIDE_TURNS` | 自动派生 | `run.py` 按 `panoramic_turn_steps` 计算写入，**不要手工设** |
 
-`scripts/my_eval.sh` 与 `scripts/launch_vlm_servers.sh` 已内置上述设置（含 `unset DISPLAY`、`CUDA_VISIBLE_DEVICES=0`）。
+> **策略参数不走环境变量**：准入阈值、GD（`gd_calib`）、生命周期、STOP 门、explore 双模、recheck
+> 全部是 Hydra 超参，唯一来源 `config/experiments/vlvm_objectnav_hm3d.yaml`；
+> 旧的 `GD_CALIB_*`、`RECHECK_*`、`FIELD_*` 已删除。改行为只改 YAML 或加命令行 override。
+
+**启动与评测顺序**
+
+```bash
+# 1) 三个 VLM 服务（tmux 常驻；默认权重 = vlvm_v1.pth）
+bash $VLVM/scripts/launch_vlm_servers.sh
+
+# 2) 全量评测（HM3D / MP3D / 两套都跑），结果落在 outputs/<dataset>_full_<时间>_<label>/
+bash $VLVM/scripts/nav_vlvm.sh both
+# 单集冒烟：LIMIT=1 LABEL=smoke bash $VLVM/scripts/nav_vlvm.sh mp3d
+```
+
+`scripts/nav_vlvm.sh` 会写入 `resolved_config.yaml`（含实际生效的全部超参）、`eval.log`、
+`detections/*.jsonl`、`tb/`；`scripts/launch_vlm_servers.sh` 已内置上述环境变量
+（含 `unset DISPLAY`、`CUDA_VISIBLE_DEVICES`）。
 
 
 ## 3.5 一键配置 / 清理 / 校验
@@ -437,7 +463,7 @@ bash $VLVM/env/vlvm_setup_env.sh --clean --dry-run   # 预演：只列出将删�
 | §0 | 路径/环境探测：python 版本、仓库结构、GPU、磁盘 |
 | §1 | editable 包重定向（`--setup` 时按当前路径重装；否则只校验指向） |
 | §2 | 关键包**导入 + 版本**双重校验（torch/CUDA、numpy、transformers、ME、mmcv 系、habitat 系、vlfm.run、TSP3D 模型） |
-| §3 | 权重与数据：6 个权重文件 + 2 个备选权重 + 5 条数据软链（含断链检测） |
+| §3 | 权重与数据：5 个固定权重 + 主权重探测（`vlvm_v1.pth` 优先）+ 6 条数据路径（含断链检测） |
 | §4 | 清理残余 pip 包（`--clean`） |
 | §5 | 清理仓库构建残留（`--clean`） |
 | §6–§7 | 环境变量提示、三个 VLM 服务端口状态 |

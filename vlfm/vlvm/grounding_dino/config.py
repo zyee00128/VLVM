@@ -15,7 +15,7 @@ class GdProposalConfig:
     port: int = 12181
     box_thr: float = 0.4              # VLFM non-COCO logits threshold (GD scale)
     caption_style: str = "vocab"      # "vocab" = class list caption / "target" = target classes only
-    max_boxes: int = 2                # proposals built per frame (cost guard)
+    max_boxes: int = 4                # proposals built per frame (cost guard)
 
     # ---- 2D box -> 3D region (VLFM `_extract_object_cloud` chain) ----
     erode_iters: int = 5              # VLFM `object_map_erosion_size`
